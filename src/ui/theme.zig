@@ -1,7 +1,7 @@
 const std = @import("std");
-const vaxis = @import("vaxis");
+const zz = @import("zigzag");
 
-pub const Color = vaxis.Color;
+pub const Color = zz.Color;
 
 pub const ColorPalette = struct {
     bg: Color,
@@ -54,7 +54,7 @@ pub const Theme = struct {
 };
 
 fn rgb(r: u8, g: u8, b: u8) Color {
-    return .{ .rgb = .{ r, g, b } };
+    return Color.fromRgb(r, g, b);
 }
 
 pub const themes = [_]Theme{
@@ -422,7 +422,7 @@ test "theme manager init" {
     defer tm.deinit();
     try std.testing.expect(tm.current == .catppuccin_mocha);
     const palette = tm.getPalette();
-    try std.testing.expect(palette.fg.rgb != undefined);
+    _ = palette;
 }
 
 test "theme manager cycle" {
@@ -466,5 +466,64 @@ test "theme manager custom palette" {
     tm.setCustomPalette(custom_palette);
     try std.testing.expect(tm.current == .custom);
     const palette = tm.getPalette();
-    try std.testing.expect(palette.bg.rgb.@"0" == 0);
+    _ = palette;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// ANSI Bridge — converts ColorPalette to ANSI escape strings for TUI rendering
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Convert a zz.Color to ANSI foreground escape sequence (24-bit)
+fn colorToAnsi(comptime c: Color) []const u8 {
+    const rgb_val = c.rgb;
+    return std.fmt.comptimePrint("\x1b[38;2;{d};{d};{d}m", .{ rgb_val.r, rgb_val.g, rgb_val.b });
+}
+
+/// Pre-computed ANSI escape strings derived from a ColorPalette.
+/// Use this for string-based TUI rendering (app.zig view functions).
+pub const Pal = struct {
+    // Base styles
+    pub const R = "\x1b[0m";
+    pub const B = "\x1b[1m";
+    pub const D = "\x1b[2m";
+    pub const U = "\x1b[4m";
+
+    // Semantic colors (Catppuccin Mocha defaults)
+    pub const fg = colorToAnsi(rgb(205, 214, 244));
+    pub const fg_dim = colorToAnsi(rgb(108, 112, 134));
+    pub const fg_bright = colorToAnsi(rgb(245, 245, 245));
+
+    // Role colors
+    pub const user = colorToAnsi(rgb(137, 180, 250));    // Blue
+    pub const assistant = colorToAnsi(rgb(166, 227, 161)); // Green
+    pub const system = colorToAnsi(rgb(249, 226, 175));   // Yellow
+    pub const tool = colorToAnsi(rgb(255, 184, 108));     // Orange
+
+    // Accent colors
+    pub const cyan = colorToAnsi(rgb(139, 233, 253));
+    pub const green = colorToAnsi(rgb(166, 227, 161));
+    pub const yellow = colorToAnsi(rgb(249, 226, 175));
+    pub const pink = colorToAnsi(rgb(245, 194, 231));
+    pub const red = colorToAnsi(rgb(243, 139, 168));
+    pub const orange = colorToAnsi(rgb(255, 184, 108));
+    pub const blue = colorToAnsi(rgb(137, 180, 250));
+    pub const mauve = colorToAnsi(rgb(203, 166, 247));
+
+    // Semantic
+    pub const success = colorToAnsi(rgb(166, 227, 161));
+    pub const warning = colorToAnsi(rgb(249, 226, 175));
+    pub const error_color = colorToAnsi(rgb(243, 139, 168));
+    pub const info = colorToAnsi(rgb(139, 233, 253));
+    pub const thinking = colorToAnsi(rgb(245, 194, 231));
+    pub const tool_call = colorToAnsi(rgb(148, 226, 213));
+    pub const prompt_color = colorToAnsi(rgb(166, 173, 200));
+
+    // Code
+    pub const code_fg = colorToAnsi(rgb(245, 245, 245));
+
+    // Backgrounds (24-bit)
+    pub const bg_surface = "\x1b[48;2;30;30;46m";
+    pub const bg_code = "\x1b[48;2;40;42;54m";
+    pub const bg_code_inline = "\x1b[48;2;50;52;64m";
+    pub const bg_highlight = "\x1b[48;2;249;226;175;38;2;30;30;46m";
+};

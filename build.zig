@@ -11,51 +11,39 @@ pub fn build(b: *std.Build) void {
     });
     const c_mod = translate_c.createModule();
 
-    // ── ZigZag-based TUI (Elm Architecture) ──────────────────────────
+    // ── ZigZag dependency ─────────────────────────────────────────────
     const zigzag_dep = b.dependency("zigzag", .{
         .target = target,
         .optimize = optimize,
     });
 
-    const zz_mod = b.addModule("zeepseek", .{
-        .root_source_file = b.path("src/ui/app.zig"),
+    // ── Single root module at src/ level ──────────────────────────────
+    // This lets all subdirectories (ui, dispatch, net, cache, utils,
+    // storage, tools, skills, etc.) cross-import via relative paths.
+    const root_mod = b.addModule("zeepseek", .{
+        .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    zz_mod.addImport("c", c_mod);
-    zz_mod.addImport("zigzag", zigzag_dep.module("zigzag"));
+    root_mod.addImport("c", c_mod);
+    root_mod.addImport("zigzag", zigzag_dep.module("zigzag"));
 
-    // Expose net modules for streaming integration
-    const http_client_file = b.createModule(.{
-        .root_source_file = b.path("src/net/http_client.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    zz_mod.addImport("http_client", http_client_file);
-
-    const stream_client_file = b.createModule(.{
-        .root_source_file = b.path("src/net/stream_client.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    zz_mod.addImport("stream_client", stream_client_file);
-
-    const zz_exe = b.addExecutable(.{
+    const exe = b.addExecutable(.{
         .name = "zeepseek",
-        .root_module = zz_mod,
+        .root_module = root_mod,
     });
-    b.installArtifact(zz_exe);
+    b.installArtifact(exe);
 
-    const zz_run = b.addRunArtifact(zz_exe);
-    zz_run.step.dependOn(b.getInstallStep());
+    const run = b.addRunArtifact(exe);
+    run.step.dependOn(b.getInstallStep());
     if (b.args) |args| {
-        zz_run.addArgs(args);
+        run.addArgs(args);
     }
-    const zz_step = b.step("run", "Run zeepseek TUI");
-    zz_step.dependOn(&zz_run.step);
+    const run_step = b.step("run", "Run zeepseek TUI");
+    run_step.dependOn(&run.step);
 
-    // ── Tests (single test runner imports all modules) ─────────────────
+    // ── Tests ─────────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_runner.zig"),
         .target = target,

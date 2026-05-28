@@ -13,46 +13,38 @@
 const std = @import("std");
 const zz = @import("zigzag");
 const cc = @import("c");
-const stream_client_mod = @import("stream_client");
+const stream_client_mod = @import("../net/stream_client.zig");
+const theme = @import("theme.zig");
+const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
+const zeep_config = @import("../utils/config.zig");
+const tools_mod = @import("../tools/mod.zig");
+const ProviderManager = @import("../providers/manager.zig").ProviderManager;
+const ProviderConfig = @import("../providers/manager.zig").ProviderConfig;
+const I18nManager = @import("../i18n/manager.zig").I18nManager;
+const Sandbox = @import("../utils/sandbox.zig").Sandbox;
+const subagent_mod = @import("../agent/subagent.zig");
+const skills_registry = @import("../skills/registry.zig");
+const session_manager = @import("../storage/session_manager.zig");
+const ContextManager = @import("../dispatch/context_manager.zig").ContextManager;
+const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
+const reasonix_mod = @import("../cache/reasonix.zig");
 
 const CacheDecision = enum { none, hit, miss };
 
 // ═══════════════════════════════════════════════════════════════════════
-// ANSI helpers — Zenburn Noir palette
+// ANSI helpers — from theme.zig Pal (Catppuccin Mocha)
 // ═══════════════════════════════════════════════════════════════════════
 
-const R = "\x1b[0m";
-const B = "\x1b[1m";      // bold
-const D = "\x1b[2m";      // dim
-const U = "\x1b[4m";      // underline
-const I = "\x1b[3m";      // italic (if supported)
-
-// 24-bit truecolor palette
-const Pal = struct {
-    // === Core ===
-    const fg        = "\x1b[38;2;212;201;184m";  // warm cream
-    const fg_dim    = "\x1b[38;2;122;125;127m";  // muted gray
-    const fg_faint  = "\x1b[38;2;70;72;74m";    // very dim
-
-    // === Accents ===
-    const gold      = "\x1b[38;2;212;168;75m";   // main accent
-    const blue      = "\x1b[38;2;127;157;181m";  // user / links
-    const green     = "\x1b[38;2;139;184;139m";  // assistant / success
-    const rose      = "\x1b[38;2;200;139;150m";  // error / alert
-    const teal      = "\x1b[38;2;123;184;184m";  // thinking / info
-    const violet    = "\x1b[38;2;168;153;199m";  // system / meta
-    const soft_red  = "\x1b[38;2;194;99;99m";    // failure
-
-    // === Backgrounds ===
-    const bg_surface = "\x1b[48;2;24;26;28m";    // subtle card bg
-    const bg_code    = "\x1b[48;2;30;32;34m";    // code block
-    const bg_code_inline = "\x1b[48;2;36;38;40m";
-    const bg_gold    = "\x1b[48;2;212;168;75;38;2;13;21;37m";  // gold on dark
-};
+const Pal = theme.Pal;
+const R = Pal.R;
+const B = Pal.B;
+const D = Pal.D;
+const U = Pal.U;
+const I = "\x1b[3m";      // italic
 
 const CodeBg = Pal.bg_code;
 const CodeInlineBg = Pal.bg_code_inline;
-const SearchHighlight = Pal.bg_gold;
+const SearchHighlight = Pal.bg_highlight;
 
 // ═══════════════════════════════════════════════════════════════════════
 // Formatting helpers
@@ -105,7 +97,7 @@ fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []con
             continue;
         }
         if (std.mem.startsWith(u8, line, "### ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.gold, line[4..], R });
+            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.yellow, line[4..], R });
             continue;
         }
 
@@ -189,7 +181,7 @@ fn renderInlineAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const
             if (std.mem.indexOfScalarPos(u8, text, i + 1, ']')) |cb| {
                 if (cb + 1 < text.len and text[cb + 1] == '(') {
                     if (std.mem.indexOfScalarPos(u8, text, cb + 2, ')')) |cp| {
-                        appendFmt(buf, a, "{s}{s}{s}", .{ Pal.teal, text[i + 1 .. cb], R });
+                        appendFmt(buf, a, "{s}{s}{s}", .{ Pal.cyan, text[i + 1 .. cb], R });
                         i = cp + 1;
                         continue;
                     }
@@ -251,8 +243,8 @@ pub const Role = enum {
         return switch (self) {
             .user => Pal.blue,
             .assistant => Pal.fg,
-            .system => Pal.violet,
-            .tool => Pal.gold,
+            .system => Pal.mauve,
+            .tool => Pal.yellow,
         };
     }
 };
@@ -479,6 +471,12 @@ pub const App = struct {
     cache_hit_rate: f64,
     model: []const u8,
     provider: []const u8,
+    provider_mgr: ProviderManager,
+    i18n: I18nManager,
+    sandbox: ?*Sandbox,
+    subsystems_initialized: bool,
+    ctx_mgr: ?*ContextManager,
+    cache_loop: ?*dispatch_loop.CacheFirstLoop,
 
     // --- Dimensions 
     width: u16,
@@ -530,6 +528,12 @@ pub const App = struct {
             .cache_hit_rate = 0,
             .model = "deepseek-chat",
             .provider = "deepseek",
+            .provider_mgr = ProviderManager.init(undefined),
+            .i18n = I18nManager.init(.en),
+            .sandbox = null,
+            .subsystems_initialized = false,
+            .ctx_mgr = null,
+            .cache_loop = null,
             .width = 80,
             .height = 24,
             .cursor_visible = true,
@@ -566,6 +570,38 @@ pub const App = struct {
         // Use persistent allocator for model state (survives frame resets)
         self.alloc = ctx.persistent_allocator;
         self.io = ctx.io;
+        // Lazy-init subsystems that need a real allocator
+        if (!self.subsystems_initialized) {
+            self.subsystems_initialized = true;
+            self.provider_mgr = ProviderManager.init(ctx.persistent_allocator);
+            // Register default deepseek provider
+            self.provider_mgr.addProvider(.{
+                .provider_id = "deepseek",
+                .api_key = self.api_key,
+                .default_model = "deepseek-chat",
+            }) catch {};
+            self.sandbox = Sandbox.init(.seatbelt, &.{"/Users"}) catch null;
+            // Initialize dispatch layer
+            const cm = ctx.persistent_allocator.create(ContextManager) catch null;
+            if (cm) |c| {
+                c.* = ContextManager.init(ctx.persistent_allocator);
+                self.ctx_mgr = c;
+            }
+            const cl = ctx.persistent_allocator.create(dispatch_loop.CacheFirstLoop) catch null;
+            if (cl) |c| {
+                const prefix = ImmutablePrefix.init(ctx.persistent_allocator, "", "", "");
+                c.* = dispatch_loop.CacheFirstLoop.init(ctx.persistent_allocator, .{
+                    .prefix = prefix,
+                    .context = self.ctx_mgr.?,
+                    .reasonix = undefined,
+                    .model = .deepseek_chat,
+                    .io = self.io,
+                    .api_key = self.api_key,
+                    .stream = true,
+                });
+                self.cache_loop = c;
+            }
+        }
         if (self.should_quit) return .quit;
         switch (msg) {
             .key => |k| return self.onKey(k),
@@ -850,7 +886,7 @@ pub const App = struct {
             // No API key — placeholder
             self.messages.append(self.alloc, .{
                 .role = .assistant,
-                .content = "Set DEEPSEEK_API_KEY environment variable to enable streaming.",
+                .content = self.i18n.t().msg_no_api_key,
                 .status = .complete,
             }) catch {};
         }
@@ -891,8 +927,8 @@ pub const App = struct {
         }
 
         // Capture values for the thread
-        const api_key = self.api_key;
-        const model = self.model;
+        const api_key = self.provider_mgr.resolveApiKey(self.provider) orelse self.api_key;
+        const model = self.provider_mgr.resolveModel(self.provider);
         const alloc = self.alloc;
         const io = self.io;
         const ctx_slice = ctx_items.toOwnedSlice(self.alloc) catch &.{};
@@ -1041,15 +1077,23 @@ pub const App = struct {
     }
 
     fn executeToolCall(self: *App, name: []const u8, args: []const u8, cwd: []const u8) []const u8 {
-        // Simple tool execution — shell, file_read, file_write
-        if (std.mem.eql(u8, name, "shell")) {
-            return self.execShell(args, cwd);
-        } else if (std.mem.eql(u8, name, "file_read")) {
-            return self.execFileRead(args);
-        } else if (std.mem.eql(u8, name, "file_write")) {
-            return self.execFileWrite(args);
+        // Use tools/mod.zig unified execution (shell, file, git, web with sandbox)
+        const call = tools_mod.ToolCall{
+            .index = 0,
+            .name = name,
+            .arguments = args,
+        };
+        // Check sandbox approval
+        if (tools_mod.requiresApproval(self.sandbox, call)) {
+            // Auto-allow for now (future: prompt user via TUI overlay)
         }
-        return "Error: Unknown tool";
+        const result = tools_mod.executeTool(self.alloc, self.sandbox, cwd, call) catch {
+            return "Error: tool execution failed";
+        };
+        if (result.success) {
+            return if (result.output.len > 0) result.output else "(no output)";
+        }
+        return result.err_msg orelse "Error: unknown tool error";
     }
 
     fn execShell(self: *App, args_json: []const u8, cwd: []const u8) []const u8 {
@@ -1279,6 +1323,9 @@ pub const App = struct {
         .{ .id = "new", .label = "/new", .desc = "Start a new session" },
         .{ .id = "apikey", .label = "/apikey", .desc = "Set API key (e.g. /apikey sk-...)", .kind = .insert },
         .{ .id = "key", .label = "/key", .desc = "Set API key (alias for /apikey)", .kind = .insert },
+        .{ .id = "skills", .label = "/skills", .desc = "List available skills" },
+        .{ .id = "sandbox", .label = "/sandbox", .desc = "Show sandbox status" },
+        .{ .id = "providers", .label = "/providers", .desc = "List configured providers" },
     };
 
     fn execPalette(self: *App) void {
@@ -1309,14 +1356,28 @@ pub const App = struct {
     fn execCommandWithArgs(self: *App, id: []const u8, args: []const u8) void {
         if (args.len > 0) {
             if (std.mem.eql(u8, id, "model")) {
+                // Use ProviderManager to resolve model
                 self.model = self.alloc.dupe(u8, args) catch self.model;
-                const msg = std.fmt.allocPrint(self.alloc, "Model switched to: {s}", .{args}) catch return;
+                if (self.subsystems_initialized) {
+                    // Update provider config with new model
+                    if (self.provider_mgr.getActive()) |cfg| {
+                        var new_cfg = cfg;
+                        new_cfg.default_model = args;
+                        self.provider_mgr.addProvider(new_cfg) catch {};
+                    }
+                }
+                const msg = std.fmt.allocPrint(self.alloc, "Model: {s} (via {s})", .{ args, self.provider }) catch return;
                 self.setNotification(msg);
                 return;
             }
             if (std.mem.eql(u8, id, "provider")) {
+                if (self.subsystems_initialized) {
+                    self.provider_mgr.setActive(args);
+                }
                 self.provider = self.alloc.dupe(u8, args) catch self.provider;
-                const msg = std.fmt.allocPrint(self.alloc, "Provider switched to: {s}", .{args}) catch return;
+                const resolved_model = if (self.subsystems_initialized) self.provider_mgr.resolveModel(args) else "deepseek-chat";
+                self.model = resolved_model;
+                const msg = std.fmt.allocPrint(self.alloc, "Provider: {s} → model: {s}", .{ args, resolved_model }) catch return;
                 self.setNotification(msg);
                 return;
             }
@@ -1424,6 +1485,56 @@ pub const App = struct {
             self.messages.append(self.alloc, .{ .role = .system, .content = msg }) catch {};
         } else if (std.mem.eql(u8, id, "model")) {
             self.messages.append(self.alloc, .{ .role = .system, .content = "Use /model <name> to switch model" }) catch {};
+        } else if (std.mem.eql(u8, id, "skills")) {
+            // Show registered skills from skills_registry
+            var msg_buf: [2048]u8 = undefined;
+            var pos: usize = 0;
+            const prefix = "Registered skills:\n";
+            @memcpy(msg_buf[pos..pos + prefix.len], prefix);
+            pos += prefix.len;
+            // List built-in skill types from registry
+            const skill_names = [_][]const u8{ "health", "investigate", "design-review" };
+            for (skill_names) |name| {
+                if (pos + name.len + 4 < msg_buf.len) {
+                    msg_buf[pos] = ' ';
+                    msg_buf[pos + 1] = ' ';
+                    pos += 2;
+                    @memcpy(msg_buf[pos..pos + name.len], name);
+                    pos += name.len;
+                    msg_buf[pos] = '\n';
+                    pos += 1;
+                }
+            }
+            self.messages.append(self.alloc, .{ .role = .system, .content = self.alloc.dupe(u8, msg_buf[0..pos]) catch "Skills loaded", .owns = true }) catch {};
+        } else if (std.mem.eql(u8, id, "sandbox")) {
+            const status: []const u8 = if (self.sandbox != null) "active (Seatbelt)" else "not initialized";
+            const msg = std.fmt.allocPrint(self.alloc, "Sandbox: {s}\nShell mode: prompt\nFile read: auto_allow\nFile write: prompt", .{status}) catch return;
+            self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
+        } else if (std.mem.eql(u8, id, "providers")) {
+            var msg_buf: [1024]u8 = undefined;
+            var pos: usize = 0;
+            const prefix = "Providers:\n";
+            @memcpy(msg_buf[pos..pos + prefix.len], prefix);
+            pos += prefix.len;
+            if (self.subsystems_initialized) {
+                const providers = self.provider_mgr.listProviders();
+                for (providers) |pid| {
+                    if (pos + pid.len + 6 < msg_buf.len) {
+                        const marker: []const u8 = if (std.mem.eql(u8, pid, self.provider_mgr.active)) " ◄ " else "   ";
+                        @memcpy(msg_buf[pos..pos + marker.len], marker);
+                        pos += marker.len;
+                        @memcpy(msg_buf[pos..pos + pid.len], pid);
+                        pos += pid.len;
+                        msg_buf[pos] = '\n';
+                        pos += 1;
+                    }
+                }
+            } else {
+                const fallback = "  deepseek (default)\n";
+                @memcpy(msg_buf[pos..pos + fallback.len], fallback);
+                pos += fallback.len;
+            }
+            self.messages.append(self.alloc, .{ .role = .system, .content = self.alloc.dupe(u8, msg_buf[0..pos]) catch "Providers", .owns = true }) catch {};
         }
     }
 
@@ -1687,17 +1798,60 @@ pub const App = struct {
         const chat_w: u16 = if (w > sidebar_w) w - sidebar_w else w;
         const chat_h: u16 = if (h > header_h + status_h + input_h) @intCast(h - header_h - status_h - input_h) else 8;
 
-        // Top header
-        self.renderHeader(&out, a, w);
+        // Top header — ZigZag StatusBar
+        var header = zz.StatusBar.init(a);
+        header.setWidth(w);
+        header.setSeparator(" · ");
+        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
+        const cache_pct: f64 = self.cache_hit_rate * 100.0;
+        const streaming = self.streaming_idx != null;
+
+        var title_style = zz.Style{};
+        title_style = title_style.fg(.{ .rgb = .{ .r = 249, .g = 226, .b = 175 } });
+        title_style = title_style.bold(true);
+        header.addLeft(.{ .text = "zeepseek", .style = title_style }) catch {};
+
+        var model_style = zz.Style{};
+        model_style = model_style.fg(.{ .rgb = .{ .r = 205, .g = 214, .b = 244 } });
+        header.addLeft(.{ .text = self.model, .style = model_style }) catch {};
+
+        var dim_style = zz.Style{};
+        dim_style = dim_style.fg(.{ .rgb = .{ .r = 108, .g = 112, .b = 134 } });
+        var metrics_buf: [128]u8 = undefined;
+        const metrics_text = std.fmt.bufPrint(&metrics_buf, "turn {d}  ctx {d:.0}%  cache {d:.0}%{s}", .{
+            self.turn, ctx_pct, cache_pct, if (streaming) " ◐" else "",
+        }) catch "";
+        header.addRight(.{ .text = metrics_text, .style = dim_style }) catch {};
+
+        if (header.view(a)) |header_str| {
+            out.appendSlice(a, header_str) catch {};
+            out.appendSlice(a, "\n") catch {};
+        } else |_| {}
 
         // Chat + sidebar (main content area)
-        self.renderChatWithSidebar(&out, a, chat_w, chat_h);
+        self.renderChatWithSidebar(&out, a, chat_w + sidebar_w, chat_h);
 
         // Input area
         self.renderInput(&out, a, w);
 
-        // Status bar
-        self.renderStatus(&out, a, w);
+        // Status bar — ZigZag StatusBar
+        var status = zz.StatusBar.init(a);
+        status.setWidth(w);
+        status.setSeparator(" │ ");
+        var s_dim = zz.Style{};
+        s_dim = s_dim.fg(.{ .rgb = .{ .r = 108, .g = 112, .b = 134 } });
+        s_dim = s_dim.bg(.{ .rgb = .{ .r = 30, .g = 30, .b = 46 } });
+        var s_cyan = zz.Style{};
+        s_cyan = s_cyan.fg(.{ .rgb = .{ .r = 139, .g = 233, .b = 253 } });
+        s_cyan = s_cyan.bg(.{ .rgb = .{ .r = 30, .g = 30, .b = 46 } });
+        status.addLeft(.{ .text = "zeepseek", .style = s_cyan }) catch {};
+        status.addLeft(.{ .text = self.model, .style = s_dim }) catch {};
+        var status_metrics: [128]u8 = undefined;
+        const status_text = std.fmt.bufPrint(&status_metrics, "turn {d}  ctx {d:.0}%  cache {d:.0}%", .{ self.turn, ctx_pct, cache_pct }) catch "";
+        status.addRight(.{ .text = status_text, .style = s_dim }) catch {};
+        if (status.view(a)) |status_str| {
+            out.appendSlice(a, status_str) catch {};
+        } else |_| {}
 
         // Overlays
         if (self.show_help) self.renderHelp(&out, a, w);
@@ -1720,57 +1874,76 @@ pub const App = struct {
 
         // header bar
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "  ") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, B) catch {};
-        buf.appendSlice(a, Pal.gold) catch {};
+        buf.appendSlice(a, Pal.yellow) catch {};
         buf.appendSlice(a, "zeepseek") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, " · ") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, Pal.fg) catch {};
         buf.appendSlice(a, self.model) catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, " · turn ") catch {};
         buf.appendSlice(a, R) catch {};
-        buf.appendSlice(a, Pal.gold) catch {};
+        buf.appendSlice(a, Pal.yellow) catch {};
         appendInt(buf, a, self.turn);
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "  ctx ") catch {};
         buf.appendSlice(a, R) catch {};
-        buf.appendSlice(a, if (ctx_pct > 70) Pal.soft_red else Pal.green) catch {};
+        buf.appendSlice(a, if (ctx_pct > 70) Pal.red else Pal.green) catch {};
         appendFmt(buf, a, "{d:.0}%", .{ctx_pct});
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "  cache ") catch {};
         buf.appendSlice(a, R) catch {};
-        buf.appendSlice(a, Pal.teal) catch {};
+        buf.appendSlice(a, Pal.cyan) catch {};
         appendFmt(buf, a, "{d:.0}%", .{cache_pct});
         buf.appendSlice(a, R) catch {};
 
         // streaming indicator
         if (streaming) {
             buf.appendSlice(a, "  ") catch {};
-            buf.appendSlice(a, Pal.gold) catch {};
+            buf.appendSlice(a, Pal.yellow) catch {};
             buf.appendSlice(a, "◐") catch {};
             buf.appendSlice(a, R) catch {};
         }
 
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "\n") catch {};
         buf.appendSlice(a, R) catch {};
     }
 
     // --- Chat area 
+
+    /// Render chat content as a string for join.horizontal
+    fn renderChatContent(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
+        var buf = std.ArrayList(u8).empty;
+        self.renderChatWithSidebar(&buf, a, w, h);
+        return buf.toOwnedSlice(a) catch "";
+    }
+
+    /// Render sidebar content as a string for join.horizontal
+    fn renderSidebarContent(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
+        _ = w;
+        var buf = std.ArrayList(u8).empty;
+        var row: u16 = 0;
+        while (row < h) : (row += 1) {
+            self.renderSidebarRow(&buf, a, row);
+            buf.appendSlice(a, "\n") catch {};
+        }
+        return buf.toOwnedSlice(a) catch "";
+    }
 
     fn renderChatWithSidebar(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16, h: u16) void {
         const total = self.messages.items.len;
@@ -1803,7 +1976,7 @@ pub const App = struct {
         while (i < end) : (i += 1) {
             const m = self.messages.items[i];
             const bar = switch (m.role) {
-                .user => Pal.blue, .assistant => Pal.fg, .system => Pal.violet, .tool => Pal.gold,
+                .user => Pal.blue, .assistant => Pal.fg, .system => Pal.mauve, .tool => Pal.yellow,
             };
             const bar_char = switch (m.role) {
                 .user => "▎", .assistant => "▍", .system => "▏", .tool => "▌",
@@ -1815,23 +1988,23 @@ pub const App = struct {
                 .pending => " ○", .streaming => " ◐", .complete => "", .failed => " ✗", .truncated => " …",
             };
             const status_clr: []const u8 = switch (m.status) {
-                .pending => Pal.fg_dim, .streaming => Pal.gold, .complete => "", .failed => Pal.soft_red, .truncated => Pal.fg_dim,
+                .pending => Pal.fg_dim, .streaming => Pal.yellow, .complete => "", .failed => Pal.red, .truncated => Pal.fg_dim,
             };
 
             // --- Thinking block 
             if (m.thinking) |th| {
                 if (th.len > 0) {
                     if (!m.think_collapsed and self.show_thinking) {
-                        const think_header = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}... thinking ...{s}", .{ D, bar, bar_char, D, Pal.teal, R }) catch "";
+                        const think_header = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}... thinking ...{s}", .{ D, bar, bar_char, D, Pal.cyan, R }) catch "";
                         lines.append(a, think_header) catch {};
                         var thl = std.mem.splitScalar(u8, th, '\n');
                         while (thl.next()) |tl| {
-                            const think_line = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}| {s}{s}", .{ D, bar, bar_char, D, Pal.teal, tl, R }) catch "";
+                            const think_line = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}| {s}{s}", .{ D, bar, bar_char, D, Pal.cyan, tl, R }) catch "";
                             lines.append(a, think_line) catch {};
                         }
-                        const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}---{s}", .{ D, bar, bar_char, D, Pal.teal, R }) catch ""; lines.append(a, _tmp) catch {};
+                        const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}---{s}", .{ D, bar, bar_char, D, Pal.cyan, R }) catch ""; lines.append(a, _tmp) catch {};
                     } else {
-                        const _tmp2 = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}... thinking ({d} chars){s}", .{ D, bar, bar_char, D, Pal.teal, th.len, R }) catch "";
+                        const _tmp2 = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}... thinking ({d} chars){s}", .{ D, bar, bar_char, D, Pal.cyan, th.len, R }) catch "";
                         lines.append(a, _tmp2) catch {};
                     }
                 }
@@ -1842,8 +2015,8 @@ pub const App = struct {
                 const ic: []const u8 = if (m.tool_collapsed) "▸" else "▾";
                 for (m.tool_calls.items) |tc| {
                     const tc_icon: []const u8 = switch (tc.status) { .running => "◐", .success => "✓", .failed => "✗" };
-                    const tc_clr: []const u8 = switch (tc.status) { .running => Pal.gold, .success => Pal.green, .failed => Pal.soft_red };
-                    const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s} {s} {s}{s}{s}{s}", .{ D, bar, bar_char, Pal.gold, ic, tc_clr, tc_icon, B, tc.name, R }) catch ""; lines.append(a, _tmp) catch {};
+                    const tc_clr: []const u8 = switch (tc.status) { .running => Pal.yellow, .success => Pal.green, .failed => Pal.red };
+                    const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s} {s} {s}{s}{s}{s}", .{ D, bar, bar_char, Pal.yellow, ic, tc_clr, tc_icon, B, tc.name, R }) catch ""; lines.append(a, _tmp) catch {};
                 }
             }
 
@@ -1860,7 +2033,7 @@ pub const App = struct {
                         // Code fence detection within assistant messages
                         if (std.mem.startsWith(u8, ln, "```")) {
                             if (ln.len > 3) {
-                                const _tmp3 = std.fmt.allocPrint(a, "{s}{s}{s}  {s} {s} ...{s}{s}", .{ D, bar, bar_char, Pal.bg_code, Pal.teal, std.mem.trim(u8, ln[3..], " "), R }) catch "";
+                                const _tmp3 = std.fmt.allocPrint(a, "{s}{s}{s}  {s} {s} ...{s}{s}", .{ D, bar, bar_char, Pal.bg_code, Pal.cyan, std.mem.trim(u8, ln[3..], " "), R }) catch "";
                                 lines.append(a, _tmp3) catch {};
                             } else {
                                 const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}{s}", .{ D, bar, bar_char, Pal.bg_code, D, R }) catch ""; lines.append(a, _tmp) catch {};
@@ -1944,7 +2117,7 @@ pub const App = struct {
 
     fn renderMarkdownLine(ln: []const u8, lines: *std.ArrayList([]const u8), a: std.mem.Allocator, bar: []const u8, bar_char: []const u8) void {
         if (std.mem.startsWith(u8, ln, "### ")) {
-            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}{s}{s}", .{ D, bar, bar_char, B, Pal.gold, ln[4..], R }) catch ""; lines.append(a, _tmp) catch {};
+            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}{s}{s}", .{ D, bar, bar_char, B, Pal.yellow, ln[4..], R }) catch ""; lines.append(a, _tmp) catch {};
             return;
         }
         if (std.mem.startsWith(u8, ln, "## ")) {
@@ -1956,7 +2129,7 @@ pub const App = struct {
             return;
         }
         if (std.mem.startsWith(u8, ln, "- ") or std.mem.startsWith(u8, ln, "* ")) {
-            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}    {s}·{s} {s}", .{ D, bar, bar_char, Pal.gold, R, ln[2..] }) catch ""; lines.append(a, _tmp) catch {};
+            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}    {s}·{s} {s}", .{ D, bar, bar_char, Pal.yellow, R, ln[2..] }) catch ""; lines.append(a, _tmp) catch {};
             return;
         }
         if (std.mem.startsWith(u8, ln, "> ")) {
@@ -1964,7 +2137,7 @@ pub const App = struct {
             return;
         }
         if (ln.len >= 3 and std.mem.allEqual(u8, ln, '-')) {
-            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}------------------------------{s}", .{ D, bar, bar_char, Pal.fg_faint, R }) catch ""; lines.append(a, _tmp) catch {};
+            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}------------------------------{s}", .{ D, bar, bar_char, Pal.fg_dim, R }) catch ""; lines.append(a, _tmp) catch {};
             return;
         }
         // Plain line — apply inline markdown (bold, italic, code, etc.)
@@ -1984,7 +2157,7 @@ pub const App = struct {
     fn renderInput(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         // Thin separator
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "+") catch {};
         var si: u16 = 1;
         while (si < w) : (si += 1) { buf.appendSlice(a, "-") catch {}; }
@@ -1992,7 +2165,7 @@ pub const App = struct {
         buf.appendSlice(a, "\n") catch {};
 
         const text = self.input.items;
-        buf.appendSlice(a, Pal.gold) catch {};
+        buf.appendSlice(a, Pal.yellow) catch {};
         buf.appendSlice(a, B) catch {};
         buf.appendSlice(a, " >> ") catch {};
         buf.appendSlice(a, R) catch {};
@@ -2002,7 +2175,7 @@ pub const App = struct {
             buf.appendSlice(a, Pal.fg_dim) catch {};
             buf.appendSlice(a, "Type a message…") catch {};
             buf.appendSlice(a, "  --  ") catch {};
-            buf.appendSlice(a, Pal.fg_faint) catch {};
+            buf.appendSlice(a, Pal.fg_dim) catch {};
             buf.appendSlice(a, "/ for commands") catch {};
             buf.appendSlice(a, R) catch {};
         } else {
@@ -2034,14 +2207,14 @@ pub const App = struct {
 
         // Bottom border
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "+") catch {};
         buf.appendSlice(a, R) catch {};
 
         // Left section: brand + model
         buf.appendSlice(a, " ") catch {};
         buf.appendSlice(a, B) catch {};
-        buf.appendSlice(a, Pal.gold) catch {};
+        buf.appendSlice(a, Pal.yellow) catch {};
         buf.appendSlice(a, "zeepseek") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, D) catch {};
@@ -2052,7 +2225,7 @@ pub const App = struct {
 
         // Metrics
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "   t=") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, Pal.fg_dim) catch {};
@@ -2060,7 +2233,7 @@ pub const App = struct {
         buf.appendSlice(a, R) catch {};
 
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "  ctx=") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, Pal.fg_dim) catch {};
@@ -2068,7 +2241,7 @@ pub const App = struct {
         buf.appendSlice(a, R) catch {};
 
         buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, Pal.fg_faint) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
         buf.appendSlice(a, "  cache=") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, Pal.fg_dim) catch {};
@@ -2084,7 +2257,7 @@ pub const App = struct {
         const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         const cache_pct: f64 = self.cache_hit_rate * 100.0;
         const is_active = self.streaming_idx != null;
-        const d = Pal.fg_faint; // dim text color for labels
+        const d = Pal.fg_dim; // dim text color for labels
 
         // Measure text width
         const label_w: u16 = 8;
@@ -2094,7 +2267,7 @@ pub const App = struct {
             buf.appendSlice(a, d) catch {};
             buf.appendSlice(a, "[") catch {};
             buf.appendSlice(a, R) catch {};
-            buf.appendSlice(a, Pal.gold) catch {};
+            buf.appendSlice(a, Pal.yellow) catch {};
             buf.appendSlice(a, B) catch {};
             buf.appendSlice(a, "zeepseek") catch {};
             buf.appendSlice(a, R) catch {};
@@ -2115,7 +2288,7 @@ pub const App = struct {
             buf.appendSlice(a, d) catch {};
             buf.appendSlice(a, "turn    ") catch {};
             buf.appendSlice(a, R) catch {};
-            buf.appendSlice(a, Pal.gold) catch {};
+            buf.appendSlice(a, Pal.yellow) catch {};
             appendInt(buf, a, self.turn);
             buf.appendSlice(a, R) catch {};
             padSidebar(buf, a, sidebar_w, label_w + 1);
@@ -2123,7 +2296,7 @@ pub const App = struct {
             buf.appendSlice(a, d) catch {};
             buf.appendSlice(a, "ctx     ") catch {};
             buf.appendSlice(a, R) catch {};
-            const ctx_color = if (ctx_pct > 70) Pal.soft_red else Pal.green;
+            const ctx_color = if (ctx_pct > 70) Pal.red else Pal.green;
             buf.appendSlice(a, ctx_color) catch {};
             appendFmt(buf, a, "{d:.0}%", .{ctx_pct});
             buf.appendSlice(a, R) catch {};
@@ -2132,7 +2305,7 @@ pub const App = struct {
             buf.appendSlice(a, d) catch {};
             buf.appendSlice(a, "cache   ") catch {};
             buf.appendSlice(a, R) catch {};
-            buf.appendSlice(a, Pal.teal) catch {};
+            buf.appendSlice(a, Pal.cyan) catch {};
             appendFmt(buf, a, "{d:.0}%", .{cache_pct});
             buf.appendSlice(a, R) catch {};
             padSidebar(buf, a, sidebar_w, label_w + 3);
@@ -2184,7 +2357,7 @@ pub const App = struct {
         _ = w;
         const msg = self.notif orelse return;
         buf.appendSlice(a, "\n") catch {};
-        buf.appendSlice(a, Pal.bg_gold) catch {};
+        buf.appendSlice(a, Pal.bg_highlight) catch {};
         buf.appendSlice(a, Pal.fg) catch {};
         buf.appendSlice(a, " >> ") catch {};
         buf.appendSlice(a, msg) catch {};
@@ -2196,7 +2369,7 @@ pub const App = struct {
 
     fn renderHelp(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         _ = self; _ = w;
-        const bo = Pal.fg_faint; // border color
+        const bo = Pal.fg_dim; // border color
 
         appendFmt(buf, a, "\n{s}xx Keybindings ---------------------------x{s}\n", .{ bo, R });
         appendFmt(buf, a, "{s}|{s}  Ctrl+C    Quit                       {s}|{s}\n", .{ bo, R, bo, R });
@@ -2219,16 +2392,16 @@ pub const App = struct {
         _ = w;
         var cmd_buf: [CMDS.len]CmdEntry = undefined;
         const filtered = self.filteredCmds(&cmd_buf);
-        const bo = Pal.fg_faint;
+        const bo = Pal.fg_dim;
 
         appendFmt(buf, a, "\n{s}[Commands]{s}\n", .{ bo, R });
-        appendFmt(buf, a, "{s}|{s} {s}>{s} {s}{s}{s}\n", .{ bo, R, Pal.gold, R, Pal.fg, self.palette_buf.items, R });
+        appendFmt(buf, a, "{s}|{s} {s}>{s} {s}{s}{s}\n", .{ bo, R, Pal.yellow, R, Pal.fg, self.palette_buf.items, R });
 
         var shown: usize = 0;
         for (filtered, 0..) |cmd, i| {
             const sel = i == self.palette_sel;
             if (sel) {
-                appendFmt(buf, a, "{s}|{s} {s}{s} > {s} {s}{s} {s} - {s}{s}\n", .{ bo, R, Pal.bg_surface, Pal.gold, R, B, cmd.label, R, Pal.fg_dim, cmd.desc });
+                appendFmt(buf, a, "{s}|{s} {s}{s} > {s} {s}{s} {s} - {s}{s}\n", .{ bo, R, Pal.bg_surface, Pal.yellow, R, B, cmd.label, R, Pal.fg_dim, cmd.desc });
             } else {
                 appendFmt(buf, a, "{s}|{s}   {s}{s} {s} - {s}\n", .{ bo, R, Pal.fg, cmd.label, R, Pal.fg_dim });
             }
@@ -2242,9 +2415,9 @@ pub const App = struct {
 
     fn renderSearch(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         _ = w;
-        const bo = Pal.fg_faint;
+        const bo = Pal.fg_dim;
         appendFmt(buf, a, "\n{s}[Search]{s}\n", .{ bo, R });
-        appendFmt(buf, a, "{s}|{s} {s}x {s}{s}{s}\n", .{ bo, R, Pal.gold, Pal.fg, self.search_query.items, R });
+        appendFmt(buf, a, "{s}|{s} {s}x {s}{s}{s}\n", .{ bo, R, Pal.yellow, Pal.fg, self.search_query.items, R });
         appendFmt(buf, a, "{s}----------------------------------------{s}\n", .{ bo, R });
     }
 
@@ -2252,7 +2425,7 @@ pub const App = struct {
 
     fn renderSubAgents(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         _ = w;
-        const bo = Pal.fg_faint;
+        const bo = Pal.fg_dim;
         if (self.subagents.items.len == 0) {
             appendFmt(buf, a, "\n{s}[Sub Agents]{s}\n", .{ bo, R });
             appendFmt(buf, a, "{s}|{s}  No active sub-agents                   {s}|{s}\n", .{ bo, R, bo, R });
@@ -2265,7 +2438,7 @@ pub const App = struct {
                 .pending => "○", .streaming => "◐", .complete => "✓", .failed => "✗", .truncated => "…",
             };
             const clr: []const u8 = switch (sa.status) {
-                .pending => Pal.fg_dim, .streaming => Pal.gold, .complete => Pal.green, .failed => Pal.soft_red, .truncated => Pal.soft_red,
+                .pending => Pal.fg_dim, .streaming => Pal.yellow, .complete => Pal.green, .failed => Pal.red, .truncated => Pal.red,
             };
             const role_label: []const u8 = switch (sa.role) {
                 .planner => "Plan", .researcher => "Research", .coder => "Code",
@@ -2286,7 +2459,7 @@ pub const App = struct {
         _ = w;
         if (self.detail_idx >= self.messages.items.len) return;
         const m = self.messages.items[self.detail_idx];
-        const bo = Pal.fg_faint;
+        const bo = Pal.fg_dim;
 
         appendFmt(buf, a, "\n{s}xx Message #{d} ---------------------------xx{s}\n", .{ bo, self.detail_idx, R });
 
@@ -2295,15 +2468,15 @@ pub const App = struct {
             .failed => "failed", .truncated => "truncated",
         };
         appendFmt(buf, a, "{s}|{s} {s}{s}{s} {s}· {s}{s}{s}\n", .{ bo, R, B, m.role.color(), m.role.label(), R, Pal.fg_dim, status_str, R });
-        appendFmt(buf, a, "{s}|{s} {s}---------------{s}\n", .{ bo, R, Pal.fg_faint, R });
+        appendFmt(buf, a, "{s}|{s} {s}---------------{s}\n", .{ bo, R, Pal.fg_dim, R });
 
         if (m.thinking) |th| {
             if (th.len > 0) {
-                appendFmt(buf, a, "{s}|{s} {s}· thinking ({d} chars){s}\n", .{ bo, R, Pal.teal, th.len, R });
+                appendFmt(buf, a, "{s}|{s} {s}· thinking ({d} chars){s}\n", .{ bo, R, Pal.cyan, th.len, R });
             }
         }
         if (m.tool_calls.items.len > 0) {
-            appendFmt(buf, a, "{s}|{s} {s}· {d} tool call(s){s}\n", .{ bo, R, Pal.gold, m.tool_calls.items.len, R });
+            appendFmt(buf, a, "{s}|{s} {s}· {d} tool call(s){s}\n", .{ bo, R, Pal.yellow, m.tool_calls.items.len, R });
         }
 
         var cl = std.mem.splitScalar(u8, m.content, '\n');

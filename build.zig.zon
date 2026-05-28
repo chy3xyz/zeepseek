@@ -4,10 +4,6 @@
     .minimum_zig_version = "0.17.0",
     .fingerprint = 0xd5ab6ede8e98f9ea,
     .dependencies = .{
-        .vaxis = .{
-            .url = "https://github.com/rockorager/libvaxis/archive/refs/heads/main.tar.gz",
-            .hash = "vaxis-0.6.0-BWNV_HHwCQCy33z_jb0RHLjoinqQ8tgQVZI9z2e5Yqdd",
-        },
         .zigzag = .{
             .url = "https://github.com/chy3xyz/zigzag/archive/refs/heads/main.tar.gz",
             .hash = "zigzag-0.1.2-YXwYS73qEQBeD8VBF4-h2aWZysZ-ELwC2gONo3qLuPhc",

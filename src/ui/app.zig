@@ -1827,75 +1827,85 @@ pub const App = struct {
         const w = ctx.width;
         const h = ctx.height;
 
-        const input_h: u16 = 2;   // prompt line + separator
-        const header_h: u16 = 1;  // top header bar
-        const status_h: u16 = 1;  // bottom status bar
-        const sidebar_w: u16 = 22; // right info panel
-        const chat_w: u16 = if (w > sidebar_w) w - sidebar_w else w;
-        const chat_h: u16 = if (h > header_h + status_h + input_h) @intCast(h - header_h - status_h - input_h) else 8;
+        const has_overlay = self.show_help or self.show_palette or self.search_active or self.detail_active or self.show_subagents or (self.notif != null);
+        const overlay_h: u16 = if (has_overlay) @min(@as(u16, @intCast(h / 2)), 15) else 0;
+        const input_h: u16 = 2;
+        const header_h: u16 = 1;
+        const status_h: u16 = 2;
+        const chat_h: u16 = if (h > header_h + status_h + input_h + overlay_h)
+            @intCast(h - header_h - status_h - input_h - overlay_h)
+        else 4;
 
-        // Top header — ZigZag StatusBar
-        var header = zz.StatusBar.init(a);
-        header.setWidth(w);
-        header.setSeparator(" · ");
+        // ── Top header ──
         const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         const cache_pct: f64 = self.cache_hit_rate * 100.0;
         const streaming = self.streaming_idx != null;
+        out.appendSlice(a, "  ") catch {};
+        out.appendSlice(a, B) catch {};
+        out.appendSlice(a, Pal.yellow) catch {};
+        out.appendSlice(a, "zeepseek") catch {};
+        out.appendSlice(a, R) catch {};
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, " · ") catch {};
+        out.appendSlice(a, Pal.fg) catch {};
+        out.appendSlice(a, self.model) catch {};
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, " · turn ") catch {};
+        appendInt(&out, a, self.turn);
+        out.appendSlice(a, "  ctx ") catch {};
+        out.appendSlice(a, if (ctx_pct > 70) Pal.red else Pal.green) catch {};
+        appendFmt(&out, a, "{d:.0}%", .{ctx_pct});
+        out.appendSlice(a, "  cache ") catch {};
+        out.appendSlice(a, Pal.cyan) catch {};
+        appendFmt(&out, a, "{d:.0}%", .{cache_pct});
+        out.appendSlice(a, R) catch {};
+        if (streaming) {
+            out.appendSlice(a, "  ") catch {};
+            out.appendSlice(a, Pal.yellow) catch {};
+            out.appendSlice(a, "◐") catch {};
+            out.appendSlice(a, R) catch {};
+        }
+        out.appendSlice(a, "\n") catch {};
 
-        var title_style = zz.Style{};
-        title_style = title_style.fg(.{ .rgb = .{ .r = 249, .g = 226, .b = 175 } });
-        title_style = title_style.bold(true);
-        header.addLeft(.{ .text = "zeepseek", .style = title_style }) catch {};
+        // ── Chat + sidebar ──
+        self.renderChatWithSidebar(&out, a, w, chat_h);
 
-        var model_style = zz.Style{};
-        model_style = model_style.fg(.{ .rgb = .{ .r = 205, .g = 214, .b = 244 } });
-        header.addLeft(.{ .text = self.model, .style = model_style }) catch {};
-
-        var dim_style = zz.Style{};
-        dim_style = dim_style.fg(.{ .rgb = .{ .r = 108, .g = 112, .b = 134 } });
-        var metrics_buf: [128]u8 = undefined;
-        const metrics_text = std.fmt.bufPrint(&metrics_buf, "turn {d}  ctx {d:.0}%  cache {d:.0}%{s}", .{
-            self.turn, ctx_pct, cache_pct, if (streaming) " ◐" else "",
-        }) catch "";
-        header.addRight(.{ .text = metrics_text, .style = dim_style }) catch {};
-
-        if (header.view(a)) |header_str| {
-            out.appendSlice(a, header_str) catch {};
-            out.appendSlice(a, "\n") catch {};
-        } else |_| {}
-
-        // Chat + sidebar (main content area)
-        self.renderChatWithSidebar(&out, a, chat_w + sidebar_w, chat_h);
-
-        // Input area
-        self.renderInput(&out, a, w);
-
-        // Status bar — ZigZag StatusBar
-        var status = zz.StatusBar.init(a);
-        status.setWidth(w);
-        status.setSeparator(" │ ");
-        var s_dim = zz.Style{};
-        s_dim = s_dim.fg(.{ .rgb = .{ .r = 108, .g = 112, .b = 134 } });
-        s_dim = s_dim.bg(.{ .rgb = .{ .r = 30, .g = 30, .b = 46 } });
-        var s_cyan = zz.Style{};
-        s_cyan = s_cyan.fg(.{ .rgb = .{ .r = 139, .g = 233, .b = 253 } });
-        s_cyan = s_cyan.bg(.{ .rgb = .{ .r = 30, .g = 30, .b = 46 } });
-        status.addLeft(.{ .text = "zeepseek", .style = s_cyan }) catch {};
-        status.addLeft(.{ .text = self.model, .style = s_dim }) catch {};
-        var status_metrics: [128]u8 = undefined;
-        const status_text = std.fmt.bufPrint(&status_metrics, "turn {d}  ctx {d:.0}%  cache {d:.0}%", .{ self.turn, ctx_pct, cache_pct }) catch "";
-        status.addRight(.{ .text = status_text, .style = s_dim }) catch {};
-        if (status.view(a)) |status_str| {
-            out.appendSlice(a, status_str) catch {};
-        } else |_| {}
-
-        // Overlays
+        // ── Overlays (in the middle, before input) ──
         if (self.show_help) self.renderHelp(&out, a, w);
         if (self.show_palette) self.renderPalette(&out, a, w);
         if (self.search_active) self.renderSearch(&out, a, w);
         if (self.detail_active) self.renderDetail(&out, a, w);
         if (self.show_subagents) self.renderSubAgents(&out, a, w);
         if (self.notif != null) self.renderNotification(&out, a, w);
+
+        // ── Input area ──
+        self.renderInput(&out, a, w);
+
+        // ── Bottom status bar ──
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, Pal.fg_dim) catch {};
+        out.appendSlice(a, "────────────────────────────────────────────────────────────────────────") catch {};
+        out.appendSlice(a, R) catch {};
+        out.appendSlice(a, "\n") catch {};
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, "│ ") catch {};
+        out.appendSlice(a, R) catch {};
+        out.appendSlice(a, Pal.cyan) catch {};
+        out.appendSlice(a, "zeepseek") catch {};
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, " │ ") catch {};
+        out.appendSlice(a, Pal.fg) catch {};
+        out.appendSlice(a, self.model) catch {};
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, " │ turn=") catch {};
+        appendInt(&out, a, self.turn);
+        out.appendSlice(a, " │ ctx=") catch {};
+        appendFmt(&out, a, "{d:.0}%", .{ctx_pct});
+        out.appendSlice(a, " │ cache=") catch {};
+        appendFmt(&out, a, "{d:.0}%", .{cache_pct});
+        out.appendSlice(a, " │") catch {};
+        out.appendSlice(a, R) catch {};
+        out.appendSlice(a, "\n") catch {};
 
         return out.toOwnedSlice(a) catch "render error";
     }
@@ -1982,13 +1992,15 @@ pub const App = struct {
     }
 
     fn renderChatWithSidebar(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16, h: u16) void {
+        const sidebar_w: u16 = 22;
+        const chat_w: u16 = if (w > sidebar_w) w - sidebar_w else w;
         const total = self.messages.items.len;
         if (total == 0) {
             // Empty state — show sidebar on right side
             var line: u16 = 0;
             while (line < h) : (line += 1) {
                 var p: u16 = 0;
-                while (p < w) : (p += 1) { buf.appendSlice(a, " ") catch {}; }
+                while (p < chat_w) : (p += 1) { buf.appendSlice(a, " ") catch {}; }
                 self.renderSidebarRow(buf, a, line);
                 buf.appendSlice(a, "\n") catch {};
             }
@@ -2115,11 +2127,11 @@ pub const App = struct {
             if (vi < lines.items.len) {
                 const l = lines.items[vi];
                 const lvis = ansiVisibleLen(l);
-                if (lvis > @as(usize, @intCast(w))) {
+                if (lvis > @as(usize, @intCast(chat_w))) {
                     var byte_pos: usize = 0;
                     var vis_count: usize = 0;
                     var in_esc = false;
-                    while (byte_pos < l.len and vis_count < w) {
+                    while (byte_pos < l.len and vis_count < chat_w) {
                         if (l[byte_pos] == 0x1b) in_esc = true;
                         if (in_esc) {
                             if (l[byte_pos] == 'm') in_esc = false;
@@ -2133,13 +2145,13 @@ pub const App = struct {
                     buf.appendSlice(a, l) catch {};
                 }
                 // Pad to chat width
-                const vis_len: u16 = @intCast(@min(ansiVisibleLen(l), @as(usize, w)));
+                const vis_len: u16 = @intCast(@min(ansiVisibleLen(l), @as(usize, chat_w)));
                 var pad: u16 = vis_len;
-                while (pad < w) : (pad += 1) { buf.appendSlice(a, " ") catch {}; }
+                while (pad < chat_w) : (pad += 1) { buf.appendSlice(a, " ") catch {}; }
             } else {
                 // Empty chat line
                 var pad: u16 = 0;
-                while (pad < w) : (pad += 1) { buf.appendSlice(a, " ") catch {}; }
+                while (pad < chat_w) : (pad += 1) { buf.appendSlice(a, " ") catch {}; }
             }
 
             // Sidebar column (right)
@@ -2226,7 +2238,7 @@ pub const App = struct {
                 if (self.cursor + 1 < text.len) buf.appendSlice(a, text[self.cursor+1..]) catch {};
             } else {
                 buf.appendSlice(a, U) catch {};
-                if (self.cursor_visible) { buf.appendSlice(a, "x") catch {}; } else { buf.appendSlice(a, " ") catch {}; }
+                if (self.cursor_visible) { buf.appendSlice(a, "█") catch {}; } else { buf.appendSlice(a, " ") catch {}; }
                 buf.appendSlice(a, R) catch {};
             }
             buf.appendSlice(a, R) catch {};
@@ -2565,4 +2577,264 @@ pub fn main(init: std.process.Init) !void {
     var program = zz.Program(App).init(init.gpa, init.io, init.environ_map);
     defer program.deinit();
     try program.run();
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Unit Tests — test core logic without terminal
+// ═══════════════════════════════════════════════════════════════════════
+
+fn makeTestApp(alloc: std.mem.Allocator) App {
+    var app: App = undefined;
+    app.messages = .empty;
+    app.alloc = alloc;
+    app.scroll_offset = 0;
+    app.auto_scroll = true;
+    app.streaming_idx = null;
+    app.input = .empty;
+    app.cursor = 0;
+    app.show_help = false;
+    app.show_palette = false;
+    app.palette_buf = .empty;
+    app.palette_sel = 0;
+    app.show_thinking = true;
+    app.search_active = false;
+    app.search_query = .empty;
+    app.search_cursor = 0;
+    app.detail_active = false;
+    app.detail_idx = 0;
+    app.detail_scroll = 0;
+    app.show_subagents = false;
+    app.subagents = .empty;
+    app.stream_state = null;
+    app.stream_thread = null;
+    app.api_key = "";
+    app.io = undefined;
+    app.session_id = "test";
+    app.session_dir = "";
+    app.should_quit = false;
+    app.turn = 0;
+    app.tokens_used = 0;
+    app.ctx_max = 64000;
+    app.cache_hit_rate = 0;
+    app.model = "deepseek-chat";
+    app.provider = "deepseek";
+    app.provider_mgr = ProviderManager.init(alloc);
+    app.i18n = I18nManager.init(.en);
+    app.sandbox = null;
+    app.subsystems_initialized = false;
+    app.ctx_mgr = null;
+    app.cache_loop = null;
+    app.width = 80;
+    app.height = 24;
+    app.cursor_visible = true;
+    app.notif = null;
+    app.notif_tick = 0;
+    return app;
+}
+
+test "app init has zero messages" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer app.messages.deinit(alloc);
+    defer app.input.deinit(alloc);
+    defer app.palette_buf.deinit(alloc);
+    defer app.search_query.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), app.messages.items.len);
+}
+
+test "submit adds user message" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Type "hello"
+    try app.input.appendSlice(alloc, "hello");
+    app.cursor = 5;
+
+    // Submit
+    app.submit();
+
+    // Should have 2 messages: user + assistant (no API key)
+    try std.testing.expectEqual(@as(usize, 2), app.messages.items.len);
+    try std.testing.expectEqual(Role.user, app.messages.items[0].role);
+    try std.testing.expectEqualStrings("hello", app.messages.items[0].content);
+    try std.testing.expectEqual(Role.assistant, app.messages.items[1].role);
+    // Input should be cleared
+    try std.testing.expectEqual(@as(usize, 0), app.input.items.len);
+    // Turn should increment
+    try std.testing.expectEqual(@as(u32, 1), app.turn);
+}
+
+test "submit slash command /help" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Type "/help"
+    try app.input.appendSlice(alloc, "/help");
+    app.cursor = 5;
+
+    // Submit
+    app.submit();
+
+    // Should set show_help = true, no messages added
+    try std.testing.expect(app.show_help);
+    try std.testing.expectEqual(@as(usize, 0), app.messages.items.len);
+    // Input should be cleared
+    try std.testing.expectEqual(@as(usize, 0), app.input.items.len);
+}
+
+test "submit slash command /clear" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Add a message first
+    try app.messages.append(alloc, .{ .role = .user, .content = "old", .owns = false });
+
+    // Type "/clear"
+    try app.input.appendSlice(alloc, "/clear");
+    app.cursor = 6;
+
+    // Submit
+    app.submit();
+
+    // Messages should be cleared
+    try std.testing.expectEqual(@as(usize, 0), app.messages.items.len);
+}
+
+test "submit slash command /exit" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Type "/exit"
+    try app.input.appendSlice(alloc, "/exit");
+    app.cursor = 5;
+
+    // Submit
+    app.submit();
+
+    // should_quit should be true
+    try std.testing.expect(app.should_quit);
+}
+
+test "submit unknown command" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Type "/foobar"
+    try app.input.appendSlice(alloc, "/foobar");
+    app.cursor = 7;
+
+    // Submit
+    app.submit();
+
+    // Should have 1 system message: "Unknown command"
+    try std.testing.expectEqual(@as(usize, 1), app.messages.items.len);
+    try std.testing.expectEqual(Role.system, app.messages.items[0].role);
+    try std.testing.expect(std.mem.indexOf(u8, app.messages.items[0].content, "Unknown") != null);
+}
+
+test "submit empty input does nothing" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Submit with empty input
+    app.submit();
+
+    // Nothing should change
+    try std.testing.expectEqual(@as(usize, 0), app.messages.items.len);
+    try std.testing.expectEqual(@as(u32, 0), app.turn);
+}
+
+test "view produces non-empty output" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+
+    // Create a mock context
+    var ctx = zz.Context{
+        .allocator = alloc,
+        .persistent_allocator = alloc,
+        .home_dir = "/tmp",
+        .io = undefined,
+        .width = 80,
+        .height = 24,
+        .frame = 0,
+        .elapsed = 0,
+        .delta = 0,
+        .true_color = true,
+        .color_256 = false,
+        .color_profile = .true_color,
+        .is_dark_background = true,
+        .unicode_width_strategy = .wcwidth,
+        .terminal_mode_2027 = false,
+        .kitty_text_sizing = false,
+        .theme = undefined,
+        ._terminal = null,
+    };
+
+    // View with no messages
+    const output = app.view(&ctx);
+    try std.testing.expect(output.len > 0);
+
+    // View with a message
+    try app.messages.append(alloc, .{ .role = .user, .content = "test message", .owns = false });
+    const output2 = app.view(&ctx);
+    try std.testing.expect(output2.len > 0);
+    // Should contain the message text
+    try std.testing.expect(std.mem.indexOf(u8, output2, "test message") != null);
 }

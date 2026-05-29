@@ -566,6 +566,42 @@ pub const App = struct {
         }
     }
 
+    pub fn deinit(self: *App) void {
+        // Free stream state
+        if (self.stream_state) |ss| {
+            ss.deinit();
+            self.alloc.destroy(ss);
+        }
+        if (self.stream_thread) |t| t.join();
+
+        // Free messages and their content
+        self.clearMessages();
+        self.messages.deinit(self.alloc);
+
+        // Free input buffers
+        self.input.deinit(self.alloc);
+        self.palette_buf.deinit(self.alloc);
+        self.search_query.deinit(self.alloc);
+
+        // Free subsystems
+        if (self.subsystems_initialized) {
+            self.provider_mgr.deinit();
+            if (self.ctx_mgr) |cm| {
+                cm.deinit();
+                self.alloc.destroy(cm);
+            }
+            if (self.cache_loop) |cl| {
+                cl.deinit();
+                self.alloc.destroy(cl);
+            }
+        }
+
+        // Free API key if page-allocated
+        if (self.api_key.len > 0) {
+            std.heap.page_allocator.free(self.api_key);
+        }
+    }
+
     pub fn update(self: *App, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
         // Use persistent allocator for model state (survives frame resets)
         self.alloc = ctx.persistent_allocator;

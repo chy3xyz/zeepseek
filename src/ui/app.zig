@@ -1385,7 +1385,7 @@ pub const App = struct {
         .{ .id = "clear", .label = "/clear", .desc = "Clear conversation history" },
         .{ .id = "exit", .label = "/exit", .desc = "Quit the application" },
         .{ .id = "model", .label = "/model", .desc = "Switch model (e.g. /model deepseek-v4)", .kind = .insert },
-        .{ .id = "provider", .label = "/provider", .desc = "Switch API provider", .kind = .insert },
+        .{ .id = "provider", .label = "/provider", .desc = "Switch API provider and set key" },
         .{ .id = "models", .label = "/models", .desc = "List available models" },
         .{ .id = "save", .label = "/save", .desc = "Save current session" },
         .{ .id = "load", .label = "/load", .desc = "Load a session from file" },
@@ -1571,6 +1571,16 @@ pub const App = struct {
             self.messages.append(self.alloc, .{ .role = .system, .content = msg }) catch {};
         } else if (std.mem.eql(u8, id, "model")) {
             self.messages.append(self.alloc, .{ .role = .system, .content = "Use /model <name> to switch model" }) catch {};
+        } else if (std.mem.eql(u8, id, "provider")) {
+            // /provider without args → prompt for key setup
+            self.pending_action = .await_api_key;
+            const msg = std.fmt.allocPrint(self.alloc,
+                \\Current provider: {s}
+                \\Current model: {s}
+                \\
+                \\Enter your API key:
+            , .{ self.provider, self.model }) catch return;
+            self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
         } else if (std.mem.eql(u8, id, "skills")) {
             // Show registered skills from skills_registry
             var msg_buf: [2048]u8 = undefined;

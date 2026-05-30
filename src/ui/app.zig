@@ -791,8 +791,8 @@ pub const App = struct {
             return .none;
         }
 
-        // --- / opens palette only when input is empty ──
-        if (k == .char and k.char == '/' and self.input.items.len == 0) {
+        // --- / opens palette (always available) ──
+        if (k == .char and k.char == '/') {
             self.show_palette = true;
             self.palette_sel = 0;
             self.palette_buf.clearRetainingCapacity();

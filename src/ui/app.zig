@@ -1416,15 +1416,13 @@ pub const App = struct {
         if (filtered.len == 0 or self.palette_sel >= filtered.len) { self.palette_buf.clearRetainingCapacity(); return; }
         const cmd = filtered[self.palette_sel];
         if (cmd.kind == .insert) {
-            // Insert command text into input so user can add arguments
+            // Insert full command with "/" prefix so submit() recognizes it
             self.input.clearRetainingCapacity();
             self.cursor = 0;
-            // Copy the label without leading "/"
-            for (cmd.label[1..]) |ch| {
+            for (cmd.label) |ch| {
                 self.input.append(self.alloc, ch) catch {};
                 self.cursor += 1;
             }
-            // Add trailing space for argument
             self.input.append(self.alloc, ' ') catch {};
             self.cursor += 1;
         } else {

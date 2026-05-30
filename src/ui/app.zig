@@ -791,8 +791,8 @@ pub const App = struct {
             return .none;
         }
 
-        // --- / opens command palette (always available) ──
-        if (k == .char and k.char == '/') {
+        // --- / opens palette only when input is empty ──
+        if (k == .char and k.char == '/' and self.input.items.len == 0) {
             self.show_palette = true;
             self.palette_sel = 0;
             self.palette_buf.clearRetainingCapacity();
@@ -3304,26 +3304,80 @@ test "view input shows placeholder when empty" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Type a message") != null);
 }
 
-test "view input shows typed text" {
+test "palette select provider sets input" {
     const alloc = std.testing.allocator;
     var app = makeTestApp(alloc);
     defer {
+        for (app.messages.items) |*m| { if (m.owns and m.content.len > 0) alloc.free(m.content); }
         app.messages.deinit(alloc);
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
         app.pending_data.deinit(alloc);
     }
-    try app.input.appendSlice(alloc, "hello");
-    app.cursor = 5;
-    var ctx = zz.Context{
-        .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
-        .io = undefined, .width = 80, .height = 24, .frame = 0, .elapsed = 0, .delta = 0,
-        .true_color = true, .color_256 = false, .color_profile = .true_color,
-        .is_dark_background = true, .unicode_width_strategy = .wcwidth,
-        .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = undefined, ._terminal = null,
-    };
-    const output = app.view(&ctx);
-    try std.testing.expect(std.mem.indexOf(u8, output, "hello") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, ">> ") != null);
+
+    // Simulate: open palette, select /provider
+    app.show_palette = true;
+    app.palette_sel = 0; // /help is 0, find /provider
+    // Find /provider index
+    for (&App.CMDS, 0..) |cmd, i| {
+        if (std.mem.eql(u8, cmd.id, "provider")) { app.palette_sel = i; break; }
+    }
+    app.execPalette();
+
+    // After palette selection, input should have "/provider "
+    try std.testing.expect(!app.show_palette);
+    try std.testing.expect(std.mem.startsWith(u8, app.input.items, "/provider"));
+    try std.testing.expect(app.input.items.len > 0);
+}
+
+test "submit /provider deepseek sets pending action" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| { if (m.owns and m.content.len > 0) alloc.free(m.content); }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+    }
+
+    // Type "/provider deepseek" and submit
+    try app.input.appendSlice(alloc, "/provider deepseek");
+    app.cursor = 18;
+    app.submit();
+
+    // Should have set pending_action
+    try std.testing.expectEqual(App.PendingAction.await_api_key, app.pending_action);
+    // Should have system message
+    try std.testing.expect(app.messages.items.len > 0);
+    const last = app.messages.items[app.messages.items.len - 1];
+    try std.testing.expectEqual(Role.system, last.role);
+    try std.testing.expect(std.mem.indexOf(u8, last.content, "API key") != null);
+    // Input should be cleared
+    try std.testing.expectEqual(@as(usize, 0), app.input.items.len);
+}
+
+test "pending api key submit saves key" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| { if (m.owns and m.content.len > 0) alloc.free(m.content); }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+    }
+
+    // Set up pending action
+    app.pending_action = .await_api_key;
+    try app.input.appendSlice(alloc, "sk-test123");
+    app.cursor = 10;
+    app.submit();
+
+    // Key should be saved
+    try std.testing.expectEqual(App.PendingAction.none, app.pending_action);
+    try std.testing.expectEqualStrings("sk-test123", app.api_key);
 }

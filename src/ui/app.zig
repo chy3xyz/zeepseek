@@ -626,7 +626,8 @@ pub const App = struct {
                 .api_key = self.api_key,
                 .default_model = "deepseek-chat",
             }) catch {};
-            self.sandbox = Sandbox.init(.seatbelt, &.{"/Users"}) catch null;
+            // Sandbox: skip on macOS due to Seatbelt policy issues
+            // self.sandbox stays null; tools work without sandbox
             // Initialize dispatch layer
             const cm = ctx.persistent_allocator.create(ContextManager) catch null;
             if (cm) |c| {

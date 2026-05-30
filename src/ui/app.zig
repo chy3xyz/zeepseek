@@ -1436,8 +1436,15 @@ pub const App = struct {
                 self.provider = self.alloc.dupe(u8, args) catch self.provider;
                 const resolved_model = if (self.subsystems_initialized) self.provider_mgr.resolveModel(args) else "deepseek-chat";
                 self.model = resolved_model;
-                const msg = std.fmt.allocPrint(self.alloc, "Provider: {s} → model: {s}", .{ args, resolved_model }) catch return;
-                self.setNotification(msg);
+                const msg = std.fmt.allocPrint(self.alloc,
+                    \\Switched to provider: {s}
+                    \\Model: {s}
+                    \\
+                    \\Set your API key:
+                    \\  /apikey sk-your-key-here
+                    \\  or set DEEPSEEK_API_KEY env var
+                , .{ args, resolved_model }) catch return;
+                self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
                 return;
             }
             if (std.mem.eql(u8, id, "apikey") or std.mem.eql(u8, id, "key")) {
@@ -2046,97 +2053,76 @@ pub const App = struct {
         var i: usize = start;
         while (i < end) : (i += 1) {
             const m = self.messages.items[i];
-            const bar = switch (m.role) {
-                .user => Pal.blue, .assistant => Pal.fg, .system => Pal.mauve, .tool => Pal.yellow,
+            const role_color = switch (m.role) {
+                .user => Pal.blue, .assistant => Pal.green, .system => Pal.mauve, .tool => Pal.yellow,
             };
-            const bar_char = switch (m.role) {
-                .user => "▎", .assistant => "▍", .system => "▏", .tool => "▌",
-            };
-            const role_icon: []const u8 = switch (m.role) {
-                .user => "●", .assistant => "◆", .system => "△", .tool => "◇",
+            const role_label: []const u8 = switch (m.role) {
+                .user => "You", .assistant => "Zeep", .system => "Sys", .tool => "Tool",
             };
             const status_icon: []const u8 = switch (m.status) {
                 .pending => " ○", .streaming => " ◐", .complete => "", .failed => " ✗", .truncated => " …",
             };
-            const status_clr: []const u8 = switch (m.status) {
-                .pending => Pal.fg_dim, .streaming => Pal.yellow, .complete => "", .failed => Pal.red, .truncated => Pal.fg_dim,
-            };
 
-            // --- Thinking block 
+            // --- Thinking block (collapsed by default) ──
             if (m.thinking) |th| {
                 if (th.len > 0) {
                     if (!m.think_collapsed and self.show_thinking) {
-                        const think_header = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}... thinking ...{s}", .{ D, bar, bar_char, D, Pal.cyan, R }) catch "";
-                        lines.append(a, think_header) catch {};
+                        lines.append(a, std.fmt.allocPrint(a, "{s}  ┌─ thinking ─{s}", .{ D, R }) catch "") catch {};
                         var thl = std.mem.splitScalar(u8, th, '\n');
                         while (thl.next()) |tl| {
-                            const think_line = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}| {s}{s}", .{ D, bar, bar_char, D, Pal.cyan, tl, R }) catch "";
-                            lines.append(a, think_line) catch {};
+                            lines.append(a, std.fmt.allocPrint(a, "{s}  │ {s}{s}", .{ D, tl, R }) catch "") catch {};
                         }
-                        const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}---{s}", .{ D, bar, bar_char, D, Pal.cyan, R }) catch ""; lines.append(a, _tmp) catch {};
+                        lines.append(a, std.fmt.allocPrint(a, "{s}  └──{s}", .{ D, R }) catch "") catch {};
                     } else {
-                        const _tmp2 = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}... thinking ({d} chars){s}", .{ D, bar, bar_char, D, Pal.cyan, th.len, R }) catch "";
-                        lines.append(a, _tmp2) catch {};
+                        lines.append(a, std.fmt.allocPrint(a, "{s}  … thinking ({d} chars){s}", .{ D, th.len, R }) catch "") catch {};
                     }
                 }
             }
 
-            // --- Tool calls 
+            // --- Tool calls (collapsed by default) ──
             if (m.tool_calls.items.len > 0) {
                 const ic: []const u8 = if (m.tool_collapsed) "▸" else "▾";
                 for (m.tool_calls.items) |tc| {
                     const tc_icon: []const u8 = switch (tc.status) { .running => "◐", .success => "✓", .failed => "✗" };
                     const tc_clr: []const u8 = switch (tc.status) { .running => Pal.yellow, .success => Pal.green, .failed => Pal.red };
-                    const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s} {s} {s}{s}{s}{s}", .{ D, bar, bar_char, Pal.yellow, ic, tc_clr, tc_icon, B, tc.name, R }) catch ""; lines.append(a, _tmp) catch {};
+                    lines.append(a, std.fmt.allocPrint(a, "{s}  {s}{s} {s} {s}{s}{s}", .{ D, ic, R, tc_clr, tc_icon, tc.name, R }) catch "") catch {};
                 }
             }
 
-            // --- Message header 
-            var hdr: [256]u8 = undefined;
-            const header = std.fmt.bufPrint(&hdr, "{s}{s}{s} {s}{s}{s}{s}{s}{s}", .{ B, bar, bar_char, bar, role_icon, m.role.label(), status_clr, status_icon, R }) catch "";
-            lines.append(a, header) catch {};
-
-            // --- Content 
+            // --- Message header: "You:" or "Zeep:" ──
             if (m.content.len > 0) {
-                if (m.role == .assistant) {
+                // User messages: "You: message" on one line
+                if (m.role == .user) {
+                    var cl = std.mem.splitScalar(u8, m.content, '\n');
+                    var first = true;
+                    while (cl.next()) |ln| {
+                        if (first) {
+                            lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s} {s}", .{ B, role_color, role_label, R, ln }) catch "") catch {};
+                            first = false;
+                        } else {
+                            lines.append(a, std.fmt.allocPrint(a, "    {s}", .{ln}) catch "") catch {};
+                        }
+                    }
+                } else if (m.role == .assistant) {
+                    // Assistant messages: "Zeep:" header + markdown content
+                    lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s}{s}", .{ B, role_color, role_label, status_icon, R }) catch "") catch {};
                     var cl = std.mem.splitScalar(u8, m.content, '\n');
                     while (cl.next()) |ln| {
-                        // Code fence detection within assistant messages
-                        if (std.mem.startsWith(u8, ln, "```")) {
-                            if (ln.len > 3) {
-                                const _tmp3 = std.fmt.allocPrint(a, "{s}{s}{s}  {s} {s} ...{s}{s}", .{ D, bar, bar_char, Pal.bg_code, Pal.cyan, std.mem.trim(u8, ln[3..], " "), R }) catch "";
-                                lines.append(a, _tmp3) catch {};
-                            } else {
-                                const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}{s}", .{ D, bar, bar_char, Pal.bg_code, D, R }) catch ""; lines.append(a, _tmp) catch {};
-                            }
-                            continue;
-                        }
-                        if (std.mem.startsWith(u8, ln, "```")) {
-                            const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}{s}backup{s}", .{ D, bar, bar_char, Pal.bg_code, D, R }) catch ""; lines.append(a, _tmp) catch {};
-                            continue;
-                        }
-                        renderMarkdownLine(ln, &lines, a, bar, bar_char);
+                        renderMarkdownLine(ln, &lines, a, D, " ");
+                    }
+                } else if (m.role == .system) {
+                    // System messages: dim italic
+                    var cl = std.mem.splitScalar(u8, m.content, '\n');
+                    while (cl.next()) |ln| {
+                        lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}", .{ D, ln, R }) catch "") catch {};
                     }
                 } else {
-                    var cl = std.mem.splitScalar(u8, m.content, '\n');
-                    var first_line = true;
-                    while (cl.next()) |ln| {
-                        if (first_line and m.role != .assistant) {
-                            // Append content to header line
-                            if (lines.items.len > 0) {
-                                var merged: [512]u8 = undefined;
-                                lines.items[lines.items.len - 1] = std.fmt.bufPrint(&merged, "{s}  {s}", .{ lines.items[lines.items.len - 1], ln }) catch "";
-                            }
-                        } else {
-                            if (ln.len > 0) {
-                                const _tmp = std.fmt.allocPrint(a, "{s}{s}{s}  {s}", .{ D, bar, bar_char, ln }) catch ""; lines.append(a, _tmp) catch {};
-                            } else {
-                                lines.append(a, "") catch {};
-                            }
-                        }
-                        first_line = false;
-                    }
+                    // Tool messages
+                    lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s} {s}", .{ B, role_color, role_label, R, m.content }) catch "") catch {};
                 }
+            } else {
+                // Empty content — just show header
+                lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s}{s}", .{ B, role_color, role_label, status_icon, R }) catch "") catch {};
             }
 
             // spacer between messages

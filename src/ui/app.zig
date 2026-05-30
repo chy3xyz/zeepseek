@@ -2838,3 +2838,113 @@ test "view produces non-empty output" {
     // Should contain the message text
     try std.testing.expect(std.mem.indexOf(u8, output2, "test message") != null);
 }
+
+test "view with help overlay contains keybindings" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| { if (m.owns and m.content.len > 0) alloc.free(m.content); }
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+    app.show_help = true;
+    var ctx = zz.Context{
+        .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
+        .io = undefined, .width = 80, .height = 24, .frame = 0, .elapsed = 0, .delta = 0,
+        .true_color = true, .color_256 = false, .color_profile = .true_color,
+        .is_dark_background = true, .unicode_width_strategy = .wcwidth,
+        .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = undefined, ._terminal = null,
+    };
+    const output = app.view(&ctx);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Keybindings") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Ctrl+C") != null);
+}
+
+test "view with palette shows commands" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+    app.show_palette = true;
+    var ctx = zz.Context{
+        .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
+        .io = undefined, .width = 80, .height = 24, .frame = 0, .elapsed = 0, .delta = 0,
+        .true_color = true, .color_256 = false, .color_profile = .true_color,
+        .is_dark_background = true, .unicode_width_strategy = .wcwidth,
+        .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = undefined, ._terminal = null,
+    };
+    const output = app.view(&ctx);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Commands") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "/help") != null);
+}
+
+test "view sidebar contains model and metrics" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+    var ctx = zz.Context{
+        .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
+        .io = undefined, .width = 80, .height = 24, .frame = 0, .elapsed = 0, .delta = 0,
+        .true_color = true, .color_256 = false, .color_profile = .true_color,
+        .is_dark_background = true, .unicode_width_strategy = .wcwidth,
+        .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = undefined, ._terminal = null,
+    };
+    const output = app.view(&ctx);
+    try std.testing.expect(std.mem.indexOf(u8, output, "deepseek-chat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "zeepseek") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "turn=") != null);
+}
+
+test "view input shows placeholder when empty" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+    var ctx = zz.Context{
+        .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
+        .io = undefined, .width = 80, .height = 24, .frame = 0, .elapsed = 0, .delta = 0,
+        .true_color = true, .color_256 = false, .color_profile = .true_color,
+        .is_dark_background = true, .unicode_width_strategy = .wcwidth,
+        .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = undefined, ._terminal = null,
+    };
+    const output = app.view(&ctx);
+    try std.testing.expect(std.mem.indexOf(u8, output, "Type a message") != null);
+}
+
+test "view input shows typed text" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        app.messages.deinit(alloc);
+        app.input.deinit(alloc);
+        app.palette_buf.deinit(alloc);
+        app.search_query.deinit(alloc);
+    }
+    try app.input.appendSlice(alloc, "hello");
+    app.cursor = 5;
+    var ctx = zz.Context{
+        .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
+        .io = undefined, .width = 80, .height = 24, .frame = 0, .elapsed = 0, .delta = 0,
+        .true_color = true, .color_256 = false, .color_profile = .true_color,
+        .is_dark_background = true, .unicode_width_strategy = .wcwidth,
+        .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = undefined, ._terminal = null,
+    };
+    const output = app.view(&ctx);
+    try std.testing.expect(std.mem.indexOf(u8, output, "hello") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, ">> ") != null);
+}

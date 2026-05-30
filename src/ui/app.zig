@@ -1878,88 +1878,386 @@ pub const App = struct {
         var out = std.ArrayList(u8).empty;
         const w = ctx.width;
         const h = ctx.height;
+        if (w == 0 or h == 0) return "";
 
-        const has_overlay = self.show_help or self.show_palette or self.search_active or self.detail_active or self.show_subagents or (self.notif != null);
-        const overlay_h: u16 = if (has_overlay) @min(@as(u16, @intCast(h / 2)), 15) else 0;
-        const input_h: u16 = 2;
-        const header_h: u16 = 1;
-        const status_h: u16 = 2;
-        const chat_h: u16 = if (h > header_h + status_h + input_h + overlay_h)
-            @intCast(h - header_h - status_h - input_h - overlay_h)
-        else 4;
+        const sidebar_w: u16 = 22;
+        const chat_w: u16 = if (w > sidebar_w) w - sidebar_w else w;
 
-        // ── Top header ──
+        // ── Pre-render each section into line arrays ──
+        var header_lines = std.ArrayList([]const u8).empty;
+        defer header_lines.deinit(a);
+        var chat_lines = std.ArrayList([]const u8).empty;
+        defer chat_lines.deinit(a);
+        var overlay_lines = std.ArrayList([]const u8).empty;
+        defer overlay_lines.deinit(a);
+        var input_lines = std.ArrayList([]const u8).empty;
+        defer input_lines.deinit(a);
+        var status_lines = std.ArrayList([]const u8).empty;
+        defer status_lines.deinit(a);
+
+        // Header (1 line)
+        self.renderHeaderLines(&header_lines, a);
+
+        // Chat + sidebar
+        self.renderChatLines(&chat_lines, a, chat_w, sidebar_w);
+
+        // Overlays
+        if (self.show_help) self.renderHelpLines(&overlay_lines, a);
+        if (self.show_palette) self.renderPaletteLines(&overlay_lines, a);
+        if (self.search_active) self.renderSearchLines(&overlay_lines, a);
+        if (self.detail_active) self.renderDetailLines(&overlay_lines, a);
+        if (self.show_subagents) self.renderSubAgentsLines(&overlay_lines, a);
+        if (self.notif != null) self.renderNotificationLines(&overlay_lines, a);
+
+        // Input (2 lines)
+        self.renderInputLines(&input_lines, a);
+
+        // Status bar (2 lines)
+        self.renderStatusLines(&status_lines, a);
+
+        // ── Compose exactly h rows ──
+        var row: u16 = 0;
+
+        // Header rows
+        var hi: usize = 0;
+        while (hi < header_lines.items.len and row < h) : (hi += 1) {
+            self.writeRow(&out, a, header_lines.items[hi], w);
+            row += 1;
+        }
+
+        // Chat rows (fill available space minus overlay/input/status)
+        const fixed_h: u16 = @intCast(overlay_lines.items.len + input_lines.items.len + status_lines.items.len);
+        const chat_target: u16 = if (h > fixed_h + 1) h - fixed_h - 1 else 1;
+        var ci: usize = 0;
+        while (row < chat_target + 1 and row < h) : (row += 1) {
+            if (ci < chat_lines.items.len) {
+                self.writeRow(&out, a, chat_lines.items[ci], w);
+                ci += 1;
+            } else {
+                self.writeEmptyRow(&out, a, w);
+            }
+        }
+
+        // Overlay rows
+        var oi: usize = 0;
+        while (oi < overlay_lines.items.len and row < h) : (oi += 1) {
+            self.writeRow(&out, a, overlay_lines.items[oi], w);
+            row += 1;
+        }
+
+        // Input rows
+        var ii: usize = 0;
+        while (ii < input_lines.items.len and row < h) : (ii += 1) {
+            self.writeRow(&out, a, input_lines.items[ii], w);
+            row += 1;
+        }
+
+        // Status rows (fill to h)
+        var si: usize = 0;
+        while (row < h) : (row += 1) {
+            if (si < status_lines.items.len) {
+                self.writeRow(&out, a, status_lines.items[si], w);
+                si += 1;
+            } else {
+                self.writeEmptyRow(&out, a, w);
+            }
+        }
+
+        return out.toOwnedSlice(a) catch "render error";
+    }
+
+    /// Write one row: content + padding to width + newline
+    fn writeRow(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, line: []const u8, w: u16) void {
+        _ = self;
+        out.appendSlice(a, line) catch {};
+        // Pad to fill width (line_clear_right in ZigZag handles this, but pad anyway)
+        const vis = ansiVisibleLen(line);
+        if (vis < w) {
+            var p: usize = vis;
+            while (p < w) : (p += 1) { out.appendSlice(a, " ") catch {}; }
+        }
+        out.appendSlice(a, "\n") catch {};
+    }
+
+    fn writeEmptyRow(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+        _ = self;
+        var p: u16 = 0;
+        while (p < w) : (p += 1) { out.appendSlice(a, " ") catch {}; }
+        out.appendSlice(a, "\n") catch {};
+    }
+
+    fn renderHeaderLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
         const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         const cache_pct: f64 = self.cache_hit_rate * 100.0;
         const streaming = self.streaming_idx != null;
-        out.appendSlice(a, "  ") catch {};
-        out.appendSlice(a, B) catch {};
-        out.appendSlice(a, Pal.yellow) catch {};
-        out.appendSlice(a, "zeepseek") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, " · ") catch {};
-        out.appendSlice(a, Pal.fg) catch {};
-        out.appendSlice(a, self.model) catch {};
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, " · turn ") catch {};
-        appendInt(&out, a, self.turn);
-        out.appendSlice(a, "  ctx ") catch {};
-        out.appendSlice(a, if (ctx_pct > 70) Pal.red else Pal.green) catch {};
-        appendFmt(&out, a, "{d:.0}%", .{ctx_pct});
-        out.appendSlice(a, "  cache ") catch {};
-        out.appendSlice(a, Pal.cyan) catch {};
-        appendFmt(&out, a, "{d:.0}%", .{cache_pct});
-        out.appendSlice(a, R) catch {};
+        var buf = std.ArrayList(u8).empty;
+        buf.appendSlice(a, "  ") catch {};
+        buf.appendSlice(a, B) catch {};
+        buf.appendSlice(a, Pal.yellow) catch {};
+        buf.appendSlice(a, "zeepseek") catch {};
+        buf.appendSlice(a, R) catch {};
+        buf.appendSlice(a, D) catch {};
+        buf.appendSlice(a, " · ") catch {};
+        buf.appendSlice(a, Pal.fg) catch {};
+        buf.appendSlice(a, self.model) catch {};
+        buf.appendSlice(a, D) catch {};
+        buf.appendSlice(a, " · turn ") catch {};
+        appendInt(&buf, a, self.turn);
+        buf.appendSlice(a, "  ctx ") catch {};
+        buf.appendSlice(a, if (ctx_pct > 70) Pal.red else Pal.green) catch {};
+        appendFmt(&buf, a, "{d:.0}%", .{ctx_pct});
+        buf.appendSlice(a, "  cache ") catch {};
+        buf.appendSlice(a, Pal.cyan) catch {};
+        appendFmt(&buf, a, "{d:.0}%", .{cache_pct});
+        buf.appendSlice(a, R) catch {};
         if (streaming) {
-            out.appendSlice(a, "  ") catch {};
-            out.appendSlice(a, Pal.yellow) catch {};
-            out.appendSlice(a, "◐") catch {};
-            out.appendSlice(a, R) catch {};
+            buf.appendSlice(a, "  ") catch {};
+            buf.appendSlice(a, Pal.yellow) catch {};
+            buf.appendSlice(a, "◐") catch {};
+            buf.appendSlice(a, R) catch {};
         }
-        out.appendSlice(a, "\n") catch {};
+        lines.append(a, buf.toOwnedSlice(a) catch "") catch {};
+    }
 
-        // ── Chat + sidebar ──
-        self.renderChatWithSidebar(&out, a, w, chat_h);
+    fn renderChatLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator, chat_w: u16, sidebar_w: u16) void {
+        _ = sidebar_w;
+        const total = self.messages.items.len;
+        if (total == 0) {
+            // Empty state
+            var buf = std.ArrayList(u8).empty;
+            var p: u16 = 0;
+            while (p < chat_w) : (p += 1) { buf.appendSlice(a, " ") catch {}; }
+            buf.appendSlice(a, " [zeepseek]        ") catch {};
+            lines.append(a, buf.toOwnedSlice(a) catch "") catch {};
+            return;
+        }
 
-        // ── Overlays (in the middle, before input) ──
-        if (self.show_help) self.renderHelp(&out, a, w);
-        if (self.show_palette) self.renderPalette(&out, a, w);
-        if (self.search_active) self.renderSearch(&out, a, w);
-        if (self.detail_active) self.renderDetail(&out, a, w);
-        if (self.show_subagents) self.renderSubAgents(&out, a, w);
-        if (self.notif != null) self.renderNotification(&out, a, w);
+        var i: usize = 0;
+        while (i < total) : (i += 1) {
+            const m = self.messages.items[i];
+            const role_color = switch (m.role) {
+                .user => Pal.blue, .assistant => Pal.green, .system => Pal.mauve, .tool => Pal.yellow,
+            };
+            const role_label: []const u8 = switch (m.role) {
+                .user => "You", .assistant => "Zeep", .system => "Sys", .tool => "Tool",
+            };
+            const status_icon: []const u8 = switch (m.status) {
+                .pending => " ○", .streaming => " ◐", .complete => "", .failed => " ✗", .truncated => " …",
+            };
 
-        // ── Input area ──
-        self.renderInput(&out, a, w);
+            // Thinking
+            if (m.thinking) |th| {
+                if (th.len > 0) {
+                    if (!m.think_collapsed and self.show_thinking) {
+                        lines.append(a, std.fmt.allocPrint(a, "{s}  ┌─ thinking ─{s}", .{ D, R }) catch "") catch {};
+                        var thl = std.mem.splitScalar(u8, th, '\n');
+                        while (thl.next()) |tl| {
+                            lines.append(a, std.fmt.allocPrint(a, "{s}  │ {s}{s}", .{ D, tl, R }) catch "") catch {};
+                        }
+                        lines.append(a, std.fmt.allocPrint(a, "{s}  └──{s}", .{ D, R }) catch "") catch {};
+                    } else {
+                        lines.append(a, std.fmt.allocPrint(a, "{s}  … thinking ({d} chars){s}", .{ D, th.len, R }) catch "") catch {};
+                    }
+                }
+            }
 
-        // ── Bottom status bar ──
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, Pal.fg_dim) catch {};
-        out.appendSlice(a, "────────────────────────────────────────────────────────────────────────") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, "\n") catch {};
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│ ") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, Pal.cyan) catch {};
-        out.appendSlice(a, "zeepseek") catch {};
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, " │ ") catch {};
-        out.appendSlice(a, Pal.fg) catch {};
-        out.appendSlice(a, self.model) catch {};
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, " │ turn=") catch {};
-        appendInt(&out, a, self.turn);
-        out.appendSlice(a, " │ ctx=") catch {};
-        appendFmt(&out, a, "{d:.0}%", .{ctx_pct});
-        out.appendSlice(a, " │ cache=") catch {};
-        appendFmt(&out, a, "{d:.0}%", .{cache_pct});
-        out.appendSlice(a, " │") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, "\n") catch {};
+            // Tool calls
+            if (m.tool_calls.items.len > 0) {
+                const ic: []const u8 = if (m.tool_collapsed) "▸" else "▾";
+                for (m.tool_calls.items) |tc| {
+                    const tc_icon: []const u8 = switch (tc.status) { .running => "◐", .success => "✓", .failed => "✗" };
+                    const tc_clr: []const u8 = switch (tc.status) { .running => Pal.yellow, .success => Pal.green, .failed => Pal.red };
+                    lines.append(a, std.fmt.allocPrint(a, "{s}  {s}{s} {s} {s}{s}{s}", .{ D, ic, R, tc_clr, tc_icon, tc.name, R }) catch "") catch {};
+                }
+            }
 
-        return out.toOwnedSlice(a) catch "render error";
+            // Content
+            if (m.content.len > 0) {
+                if (m.role == .user) {
+                    var cl = std.mem.splitScalar(u8, m.content, '\n');
+                    var first = true;
+                    while (cl.next()) |ln| {
+                        if (first) {
+                            lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s} {s}", .{ B, role_color, role_label, R, ln }) catch "") catch {};
+                            first = false;
+                        } else {
+                            lines.append(a, std.fmt.allocPrint(a, "    {s}", .{ln}) catch "") catch {};
+                        }
+                    }
+                } else if (m.role == .assistant) {
+                    lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s}{s}", .{ B, role_color, role_label, status_icon, R }) catch "") catch {};
+                    var cl = std.mem.splitScalar(u8, m.content, '\n');
+                    while (cl.next()) |ln| {
+                        renderMarkdownLine(ln, lines, a, D, " ");
+                    }
+                } else if (m.role == .system) {
+                    var cl = std.mem.splitScalar(u8, m.content, '\n');
+                    while (cl.next()) |ln| {
+                        lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}", .{ D, ln, R }) catch "") catch {};
+                    }
+                } else {
+                    lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s} {s}", .{ B, role_color, role_label, R, m.content }) catch "") catch {};
+                }
+            } else {
+                lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}:{s}{s}", .{ B, role_color, role_label, status_icon, R }) catch "") catch {};
+            }
+            // Spacer
+            lines.append(a, "") catch {};
+        }
+    }
+
+    fn renderInputLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        // Separator
+        var sep = std.ArrayList(u8).empty;
+        sep.appendSlice(a, D) catch {};
+        sep.appendSlice(a, Pal.fg_dim) catch {};
+        sep.appendSlice(a, "+") catch {};
+        sep.appendSlice(a, R) catch {};
+        lines.append(a, sep.toOwnedSlice(a) catch "") catch {};
+
+        // Input line
+        var buf = std.ArrayList(u8).empty;
+        buf.appendSlice(a, Pal.yellow) catch {};
+        buf.appendSlice(a, B) catch {};
+        if (self.pending_action == .await_api_key) {
+            buf.appendSlice(a, " 🔑 ") catch {};
+        } else {
+            buf.appendSlice(a, " >> ") catch {};
+        }
+        buf.appendSlice(a, R) catch {};
+
+        const text = self.input.items;
+        if (text.len == 0) {
+            buf.appendSlice(a, D) catch {};
+            buf.appendSlice(a, Pal.fg_dim) catch {};
+            if (self.pending_action == .await_api_key) {
+                buf.appendSlice(a, "Enter API key...") catch {};
+            } else {
+                buf.appendSlice(a, "Type a message… (/ for commands)") catch {};
+            }
+            buf.appendSlice(a, R) catch {};
+        } else {
+            buf.appendSlice(a, Pal.fg) catch {};
+            const before = text[0..@min(self.cursor, text.len)];
+            buf.appendSlice(a, before) catch {};
+            if (self.cursor < text.len) {
+                buf.appendSlice(a, U) catch {};
+                buf.appendSlice(a, text[self.cursor..self.cursor + 1]) catch {};
+                buf.appendSlice(a, R) catch {};
+                buf.appendSlice(a, Pal.fg) catch {};
+                if (self.cursor + 1 < text.len) buf.appendSlice(a, text[self.cursor + 1 ..]) catch {};
+            } else {
+                if (self.cursor_visible) {
+                    buf.appendSlice(a, "█") catch {};
+                } else {
+                    buf.appendSlice(a, " ") catch {};
+                }
+            }
+            buf.appendSlice(a, R) catch {};
+        }
+        lines.append(a, buf.toOwnedSlice(a) catch "") catch {};
+    }
+
+    fn renderStatusLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
+        // Separator
+        lines.append(a, D ++ Pal.fg_dim ++ "────────────────────────────────────────────────────────────────────────" ++ R) catch {};
+        // Status content
+        var buf = std.ArrayList(u8).empty;
+        buf.appendSlice(a, D) catch {};
+        buf.appendSlice(a, "│ ") catch {};
+        buf.appendSlice(a, R) catch {};
+        buf.appendSlice(a, Pal.cyan) catch {};
+        buf.appendSlice(a, "zeepseek") catch {};
+        buf.appendSlice(a, D) catch {};
+        buf.appendSlice(a, " │ ") catch {};
+        buf.appendSlice(a, Pal.fg) catch {};
+        buf.appendSlice(a, self.model) catch {};
+        buf.appendSlice(a, D) catch {};
+        buf.appendSlice(a, " │ turn=") catch {};
+        appendInt(&buf, a, self.turn);
+        buf.appendSlice(a, " │ ctx=") catch {};
+        appendFmt(&buf, a, "{d:.0}%", .{ctx_pct});
+        buf.appendSlice(a, " │ cache=") catch {};
+        appendFmt(&buf, a, "{d:.0}%", .{self.cache_hit_rate * 100.0});
+        buf.appendSlice(a, " │") catch {};
+        buf.appendSlice(a, R) catch {};
+        lines.append(a, buf.toOwnedSlice(a) catch "") catch {};
+    }
+
+    fn renderHelpLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        _ = self;
+        const bo = Pal.fg_dim;
+        lines.append(a, std.fmt.allocPrint(a, "\n{s}┌─ Keybindings ─────────────────────────┐{s}", .{ bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  Ctrl+C      Quit                   {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  Ctrl+F      Search                 {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  Ctrl+P      Command palette        {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  Ctrl+N      Toggle thinking        {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  Enter       Send message           {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  ↑↓          Scroll                 {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  F1/?        Toggle help             {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  Esc         Close overlay           {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}└────────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
+    }
+
+    fn renderPaletteLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        var cmd_buf: [CMDS.len]CmdEntry = undefined;
+        const filtered = self.filteredCmds(&cmd_buf);
+        const bo = Pal.fg_dim;
+        lines.append(a, std.fmt.allocPrint(a, "\n{s}┌─ Commands ─────────────────────────────┐{s}", .{ bo, R }) catch "") catch {};
+        // Filter input
+        if (self.palette_buf.items.len > 0) {
+            lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}/{s}{s}{s}{s}", .{ bo, R, Pal.yellow, R, Pal.fg, self.palette_buf.items, R }) catch "") catch {};
+        } else {
+            lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}/{s}", .{ bo, R, Pal.yellow, R }) catch "") catch {};
+        }
+        // Commands
+        var shown: usize = 0;
+        for (filtered, 0..) |cmd, i| {
+            const sel = i == self.palette_sel;
+            if (sel) {
+                lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}▸{s} {s}{s}{s} {s}{s}{s}", .{ bo, R, Pal.yellow, R, B, cmd.label, R, D, cmd.desc, R }) catch "") catch {};
+            } else {
+                lines.append(a, std.fmt.allocPrint(a, "{s}│{s}   {s}{s} {s}{s}{s}", .{ bo, R, Pal.fg, cmd.label, bo, cmd.desc, R }) catch "") catch {};
+            }
+            shown += 1;
+            if (shown >= 8) break;
+        }
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}Tab/↑↓{s} nav  {s}Enter{s} select  {s}Esc{s} close {s}│{s}", .{ bo, R, Pal.fg_dim, R, Pal.fg_dim, R, Pal.fg_dim, R, bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}└────────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
+    }
+
+    fn renderSearchLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        const bo = Pal.fg_dim;
+        lines.append(a, std.fmt.allocPrint(a, "\n{s}[Search]{s}", .{ bo, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}▸{s} {s}{s}{s}", .{ bo, R, Pal.yellow, R, Pal.fg, self.search_query.items, R }) catch "") catch {};
+        lines.append(a, std.fmt.allocPrint(a, "{s}────────────────────────────────────────{s}", .{ bo, R }) catch "") catch {};
+    }
+
+    fn renderDetailLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        if (self.detail_idx >= self.messages.items.len) return;
+        const m = self.messages.items[self.detail_idx];
+        const bo = Pal.fg_dim;
+        lines.append(a, std.fmt.allocPrint(a, "\n{s}[Detail] msg {d}/{d}{s}", .{ bo, self.detail_idx + 1, self.messages.items.len, R }) catch "") catch {};
+        var cl = std.mem.splitScalar(u8, m.content, '\n');
+        while (cl.next()) |ln| {
+            lines.append(a, std.fmt.allocPrint(a, "{s}{s}{s}", .{ D, ln, R }) catch "") catch {};
+        }
+        lines.append(a, std.fmt.allocPrint(a, "{s}────────────────────────────────────────{s}", .{ bo, R }) catch "") catch {};
+    }
+
+    fn renderSubAgentsLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        const bo = Pal.fg_dim;
+        lines.append(a, std.fmt.allocPrint(a, "\n{s}[Sub Agents]{s}", .{ bo, R }) catch "") catch {};
+        if (self.subagents.items.len == 0) {
+            lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  No active sub-agents  {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        }
+        lines.append(a, std.fmt.allocPrint(a, "{s}────────────────────────────────────────{s}", .{ bo, R }) catch "") catch {};
+    }
+
+    fn renderNotificationLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {
+        const msg = self.notif orelse return;
+        lines.append(a, std.fmt.allocPrint(a, "\n{s}{s} >> {s}{s}{s}", .{ B, Pal.yellow, R, msg, R }) catch "") catch {};
     }
 
     // --- Top header: x zeepseek · model · turn N  ctx 12% ---x ------

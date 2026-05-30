@@ -675,11 +675,27 @@ pub const App = struct {
         const k = key.key;
         const m = key.modifiers;
 
-        // --- Palette overlay 
+        // --- Palette overlay ──
         if (self.show_palette) {
-            if (k == .escape) { self.show_palette = false; return .none; }
+            if (k == .escape) { self.show_palette = false; self.palette_buf.clearRetainingCapacity(); return .none; }
             if (k == .enter) { self.execPalette(); return .none; }
-            if (k == .backspace) { if (self.palette_buf.items.len > 0) _ = self.palette_buf.pop(); return .none; }
+            if (k == .tab) {
+                // Tab cycles through filtered commands
+                var cmd_buf: [CMDS.len]CmdEntry = undefined;
+                const fc = self.filteredCmds(&cmd_buf);
+                if (fc.len > 0) self.palette_sel = (self.palette_sel + 1) % fc.len;
+                return .none;
+            }
+            if (k == .backspace) {
+                if (self.palette_buf.items.len > 0) {
+                    _ = self.palette_buf.pop();
+                    self.palette_sel = 0; // Reset selection on filter change
+                } else {
+                    // Empty filter + backspace = close palette
+                    self.show_palette = false;
+                }
+                return .none;
+            }
             if (k == .down or (m.ctrl and k == .char and k.char == 'n')) {
                 var cmd_buf: [CMDS.len]CmdEntry = undefined;
                 const fc = self.filteredCmds(&cmd_buf);
@@ -692,7 +708,14 @@ pub const App = struct {
                 if (fc.len > 0) self.palette_sel = if (self.palette_sel > 0) self.palette_sel - 1 else fc.len - 1;
                 return .none;
             }
-            if (k == .char) { self.palette_buf.append(self.alloc, @intCast(k.char)) catch {}; return .none; }
+            if (k == .char) {
+                if (m.ctrl or m.alt) return .none;
+                if (k.char >= 32) {
+                    self.palette_buf.append(self.alloc, @intCast(k.char)) catch {};
+                    self.palette_sel = 0; // Reset selection on filter change
+                }
+                return .none;
+            }
             return .none;
         }
 
@@ -757,8 +780,8 @@ pub const App = struct {
             return .none;
         }
 
-        // --- / for command palette (when input empty) 
-        if (k == .char and k.char == '/' and self.input.items.len == 0) {
+        // --- / opens command palette (always available) ──
+        if (k == .char and k.char == '/') {
             self.show_palette = true;
             self.palette_sel = 0;
             self.palette_buf.clearRetainingCapacity();
@@ -2442,21 +2465,53 @@ pub const App = struct {
         const filtered = self.filteredCmds(&cmd_buf);
         const bo = Pal.fg_dim;
 
-        appendFmt(buf, a, "\n{s}[Commands]{s}\n", .{ bo, R });
-        appendFmt(buf, a, "{s}|{s} {s}>{s} {s}{s}{s}\n", .{ bo, R, Pal.yellow, R, Pal.fg, self.palette_buf.items, R });
+        // Header with filter input
+        appendFmt(buf, a, "\n{s}┌─ Commands ─────────────────────────────┐{s}\n", .{ bo, R });
+        if (self.palette_buf.items.len > 0) {
+            appendFmt(buf, a, "{s}│{s} {s}/{s}{s}{s}{s}", .{ bo, R, Pal.yellow, R, Pal.fg, self.palette_buf.items, R });
+        } else {
+            appendFmt(buf, a, "{s}│{s} {s}/{s}", .{ bo, R, Pal.yellow, R });
+        }
+        // Pad to box width
+        const used: u16 = @intCast(2 + 1 + self.palette_buf.items.len);
+        var p: u16 = used;
+        while (p < 42) : (p += 1) { buf.appendSlice(a, " ") catch {}; }
+        appendFmt(buf, a, "{s}│{s}\n", .{ bo, R });
 
+        // Command list
         var shown: usize = 0;
         for (filtered, 0..) |cmd, i| {
             const sel = i == self.palette_sel;
             if (sel) {
-                appendFmt(buf, a, "{s}|{s} {s}{s} > {s} {s}{s} {s} - {s}{s}\n", .{ bo, R, Pal.bg_surface, Pal.yellow, R, B, cmd.label, R, Pal.fg_dim, cmd.desc });
+                appendFmt(buf, a, "{s}│{s} {s}▸{s} {s}{s}{s}", .{ bo, R, Pal.yellow, R, B, cmd.label, R });
             } else {
-                appendFmt(buf, a, "{s}|{s}   {s}{s} {s} - {s}\n", .{ bo, R, Pal.fg, cmd.label, R, Pal.fg_dim });
+                appendFmt(buf, a, "{s}│{s}   {s}{s}", .{ bo, R, Pal.fg, cmd.label });
             }
+            // Pad label to fixed width, then description
+            const label_pad: u16 = @intCast(@max(0, @as(i16, 12) - @as(i16, @intCast(cmd.label.len))));
+            var lp: u16 = 0;
+            while (lp < label_pad) : (lp += 1) { buf.appendSlice(a, " ") catch {}; }
+            if (sel) {
+                appendFmt(buf, a, "{s}{s}{s}", .{ D, cmd.desc, R });
+            } else {
+                appendFmt(buf, a, "{s}{s}{s}", .{ bo, cmd.desc, R });
+            }
+            // Pad to box width
+            const desc_used: u16 = @intCast(3 + cmd.label.len + @as(usize, label_pad) + cmd.desc.len);
+            var dp: u16 = desc_used;
+            while (dp < 42) : (dp += 1) { buf.appendSlice(a, " ") catch {}; }
+            appendFmt(buf, a, "{s}│{s}\n", .{ bo, R });
             shown += 1;
-            if (shown >= 10) break;
+            if (shown >= 8) break;
         }
-        appendFmt(buf, a, "{s}----------------------------------------{s}\n", .{ bo, R });
+
+        // Footer with hints
+        appendFmt(buf, a, "{s}│{s} {s}Tab/↑↓{s} navigate  {s}Enter{s} select  {s}Esc{s} close", .{ bo, R, Pal.fg_dim, R, Pal.fg_dim, R, Pal.fg_dim, R });
+        var fp: u16 = 42;
+        while (fp < 42) : (fp += 1) { buf.appendSlice(a, " ") catch {}; }
+        buf.appendSlice(a, "    ") catch {};
+        appendFmt(buf, a, "{s}│{s}\n", .{ bo, R });
+        appendFmt(buf, a, "{s}└────────────────────────────────────────┘{s}\n", .{ bo, R });
     }
 
     // --- Overlay: Search 

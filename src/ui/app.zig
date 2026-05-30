@@ -498,7 +498,6 @@ pub const App = struct {
     // --- Elm Interface 
 
     pub fn init(self: *App, ctx: *zz.Context) zz.Cmd(Msg) {
-        self.io = ctx.io;
         self.* = .{
             .messages = .empty,
             .alloc = undefined,
@@ -526,7 +525,7 @@ pub const App = struct {
                 const key_ptr = std.c.getenv("DEEPSEEK_API_KEY");
                 break :blk if (key_ptr) |k| std.mem.sliceTo(k, 0) else "";
             },
-            .io = undefined, // set above from ctx.io before struct init
+            .io = ctx.io,
             .session_id = "default",
             .session_dir = "",
             .should_quit = false,
@@ -536,7 +535,7 @@ pub const App = struct {
             .cache_hit_rate = 0,
             .model = "deepseek-chat",
             .provider = "deepseek",
-            .provider_mgr = ProviderManager.init(undefined),
+            .provider_mgr = ProviderManager.init(ctx.allocator),
             .i18n = I18nManager.init(.en),
             .sandbox = null,
             .subsystems_initialized = false,
@@ -2091,7 +2090,7 @@ pub const App = struct {
     }
 
     fn renderSidebarInline(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, row: u16) void {
-        const sidebar_w: u16 = 22;
+        const sidebar_w: u16 = 30;
         const d = D;
         const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         const cache_pct: f64 = self.cache_hit_rate * 100.0;
@@ -2118,7 +2117,7 @@ pub const App = struct {
                 out.appendSlice(a, Pal.fg) catch {};
                 out.appendSlice(a, if (self.model.len <= 10) self.model else self.model[0..10]) catch {};
                 out.appendSlice(a, R) catch {};
-                padTo(out, a, sidebar_w, 8 + @min(self.model.len, @as(usize, 10)));
+                padTo(out, a, sidebar_w, 18);
             },
             2 => {
                 out.appendSlice(a, d) catch {};
@@ -2178,7 +2177,7 @@ pub const App = struct {
                 out.appendSlice(a, Pal.fg_dim) catch {};
                 out.appendSlice(a, dir) catch {};
                 out.appendSlice(a, R) catch {};
-                padTo(out, a, sidebar_w, 8 + @min(dir.len, @as(usize, 12)));
+                padTo(out, a, sidebar_w, 20);
             },
             else => {
                 padTo(out, a, sidebar_w, 0);

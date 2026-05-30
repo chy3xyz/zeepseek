@@ -406,6 +406,10 @@ const StreamState = struct {
 // ═══════════════════════════════════════════════════════════════════════
 
 pub const App = struct {
+    pub const PendingAction = enum {
+        none,
+        await_api_key, // waiting for user to enter API key
+    };
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
         stream_content: []const u8,
@@ -487,6 +491,10 @@ pub const App = struct {
     notif: ?[]const u8 = null,
     notif_tick: u64 = 0,
 
+    // --- Pending interactive action ──
+    pending_action: PendingAction = .none,
+    pending_data: std.ArrayList(u8),
+
     // --- Elm Interface 
 
     pub fn init(self: *App, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -539,6 +547,8 @@ pub const App = struct {
             .cursor_visible = true,
             .notif = null,
             .notif_tick = 0,
+            .pending_action = .none,
+            .pending_data = .empty,
         };
         // Try loading saved API key from disk
         self.loadSavedApiKey();
@@ -582,6 +592,7 @@ pub const App = struct {
         self.input.deinit(self.alloc);
         self.palette_buf.deinit(self.alloc);
         self.search_query.deinit(self.alloc);
+        self.pending_data.deinit(self.alloc);
 
         // Free subsystems
         if (self.subsystems_initialized) {
@@ -893,6 +904,17 @@ pub const App = struct {
         if (self.input.items.len == 0) return;
 
         const text_slice = self.input.items;
+
+        // Handle pending interactive actions
+        if (self.pending_action == .await_api_key) {
+            const key = self.alloc.dupe(u8, text_slice) catch return;
+            self.setApiKey(key);
+            self.pending_action = .none;
+            self.pending_data.clearRetainingCapacity();
+            self.input.clearRetainingCapacity();
+            self.cursor = 0;
+            return;
+        }
 
         // Check for slash commands
         if (text_slice.len > 1 and text_slice[0] == '/') {
@@ -1436,13 +1458,13 @@ pub const App = struct {
                 self.provider = self.alloc.dupe(u8, args) catch self.provider;
                 const resolved_model = if (self.subsystems_initialized) self.provider_mgr.resolveModel(args) else "deepseek-chat";
                 self.model = resolved_model;
+                // Prompt for API key interactively
+                self.pending_action = .await_api_key;
                 const msg = std.fmt.allocPrint(self.alloc,
                     \\Switched to provider: {s}
                     \\Model: {s}
                     \\
-                    \\Set your API key:
-                    \\  /apikey sk-your-key-here
-                    \\  or set DEEPSEEK_API_KEY env var
+                    \\Enter your API key:
                 , .{ args, resolved_model }) catch return;
                 self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
                 return;
@@ -2224,16 +2246,24 @@ pub const App = struct {
         const text = self.input.items;
         buf.appendSlice(a, Pal.yellow) catch {};
         buf.appendSlice(a, B) catch {};
-        buf.appendSlice(a, " >> ") catch {};
+        if (self.pending_action == .await_api_key) {
+            buf.appendSlice(a, " 🔑 ") catch {};
+        } else {
+            buf.appendSlice(a, " >> ") catch {};
+        }
         buf.appendSlice(a, R) catch {};
 
         if (text.len == 0) {
             buf.appendSlice(a, D) catch {};
             buf.appendSlice(a, Pal.fg_dim) catch {};
-            buf.appendSlice(a, "Type a message…") catch {};
-            buf.appendSlice(a, "  --  ") catch {};
-            buf.appendSlice(a, Pal.fg_dim) catch {};
-            buf.appendSlice(a, "/ for commands") catch {};
+            if (self.pending_action == .await_api_key) {
+                buf.appendSlice(a, "Enter API key...") catch {};
+            } else {
+                buf.appendSlice(a, "Type a message…") catch {};
+                buf.appendSlice(a, "  --  ") catch {};
+                buf.appendSlice(a, Pal.fg_dim) catch {};
+                buf.appendSlice(a, "/ for commands") catch {};
+            }
             buf.appendSlice(a, R) catch {};
         } else {
             buf.appendSlice(a, Pal.fg) catch {};
@@ -2694,6 +2724,7 @@ test "submit adds user message" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Type "hello"
@@ -2725,6 +2756,7 @@ test "submit slash command /help" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Type "/help"
@@ -2752,6 +2784,7 @@ test "submit slash command /clear" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Add a message first
@@ -2776,6 +2809,7 @@ test "submit slash command /exit" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Type "/exit"
@@ -2800,6 +2834,7 @@ test "submit unknown command" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Type "/foobar"
@@ -2823,6 +2858,7 @@ test "submit empty input does nothing" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Submit with empty input
@@ -2844,6 +2880,7 @@ test "view produces non-empty output" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
 
     // Create a mock context
@@ -2889,6 +2926,7 @@ test "view with help overlay contains keybindings" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
     app.show_help = true;
     var ctx = zz.Context{
@@ -2911,6 +2949,7 @@ test "view with palette shows commands" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
     app.show_palette = true;
     var ctx = zz.Context{
@@ -2933,6 +2972,7 @@ test "view sidebar contains model and metrics" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
     var ctx = zz.Context{
         .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
@@ -2955,6 +2995,7 @@ test "view input shows placeholder when empty" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
     var ctx = zz.Context{
         .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
@@ -2975,6 +3016,7 @@ test "view input shows typed text" {
         app.input.deinit(alloc);
         app.palette_buf.deinit(alloc);
         app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
     }
     try app.input.appendSlice(alloc, "hello");
     app.cursor = 5;

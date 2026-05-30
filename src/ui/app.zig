@@ -1477,20 +1477,15 @@ pub const App = struct {
 
     fn setApiKey(self: *App, key: []const u8) void {
         if (key.len == 0) {
-            self.setNotification("Usage: /apikey sk-xxxxxxxxxxxx");
+            self.setNotification("Usage: /apikey <your-api-key>");
             return;
         }
-        if (key.len < 10 or !std.mem.startsWith(u8, key, "sk-")) {
-            self.setNotification("Invalid key format — expected sk-...");
+        if (key.len < 8) {
+            self.setNotification("Key too short — expected 8+ characters");
             return;
-        }
-        // Free old key if it was allocated by us
-        if (self.api_key.len > 0) {
-            // Check if it's a pointer we own (not the env var)
-            // We use a heuristic: if api_key was allocated, it's in our allocator
         }
         self.api_key = self.alloc.dupe(u8, key) catch return;
-        const msg = std.fmt.allocPrint(self.alloc, "API key set ({s}...{s})", .{ key[0..6], key[key.len-4..] }) catch return;
+        const msg = std.fmt.allocPrint(self.alloc, "API key saved ({d} chars)", .{key.len}) catch return;
         self.setNotification(msg);
 
         // Persist to store
@@ -1938,12 +1933,23 @@ pub const App = struct {
         const chat_target: u16 = if (h > fixed_h + 1) h - fixed_h - 1 else 1;
         var ci: usize = 0;
         while (row < chat_target + 1 and row < h) : (row += 1) {
+            // Chat content (left)
             if (ci < chat_lines.items.len) {
-                self.writeRow(&out, a, chat_lines.items[ci], w);
+                const l = chat_lines.items[ci];
+                out.appendSlice(a, l) catch {};
+                const lvis = ansiVisibleLen(l);
+                if (lvis < chat_w) {
+                    var p: usize = lvis;
+                    while (p < chat_w) : (p += 1) { out.appendSlice(a, " ") catch {}; }
+                }
                 ci += 1;
             } else {
-                self.writeEmptyRow(&out, a, w);
+                var p: u16 = 0;
+                while (p < chat_w) : (p += 1) { out.appendSlice(a, " ") catch {}; }
             }
+            // Sidebar (right)
+            self.renderSidebarInline(&out, a, row);
+            out.appendSlice(a, "\n") catch {};
         }
 
         // Overlay rows
@@ -1992,6 +1998,121 @@ pub const App = struct {
         var p: u16 = 0;
         while (p < w) : (p += 1) { out.appendSlice(a, " ") catch {}; }
         out.appendSlice(a, "\n") catch {};
+    }
+
+    fn renderSidebarInline(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, row: u16) void {
+        const sidebar_w: u16 = 22;
+        const d = D;
+        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
+        const cache_pct: f64 = self.cache_hit_rate * 100.0;
+        const is_active = self.streaming_idx != null;
+
+        switch (row) {
+            0 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "[") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, B) catch {};
+                out.appendSlice(a, Pal.yellow) catch {};
+                out.appendSlice(a, "zeepseek") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "]") catch {};
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 10);
+            },
+            1 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "model   ") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, Pal.fg) catch {};
+                out.appendSlice(a, if (self.model.len <= 10) self.model else self.model[0..10]) catch {};
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 8 + @min(self.model.len, @as(usize, 10)));
+            },
+            2 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "turn    ") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, Pal.yellow) catch {};
+                appendIntZig(out, a, self.turn);
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 9);
+            },
+            3 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "ctx     ") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, if (ctx_pct > 70) Pal.red else Pal.green) catch {};
+                appendFmtZig(out, a, "{d:.0}%", .{ctx_pct});
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 11);
+            },
+            4 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "cache   ") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, Pal.cyan) catch {};
+                appendFmtZig(out, a, "{d:.0}%", .{cache_pct});
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 11);
+            },
+            5 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "status  ") catch {};
+                out.appendSlice(a, R) catch {};
+                if (is_active) {
+                    out.appendSlice(a, Pal.green) catch {};
+                    out.appendSlice(a, "active") catch {};
+                } else {
+                    out.appendSlice(a, Pal.fg_dim) catch {};
+                    out.appendSlice(a, "idle") catch {};
+                }
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 14);
+            },
+            6 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "--------") catch {};
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 8);
+            },
+            7 => {
+                out.appendSlice(a, d) catch {};
+                out.appendSlice(a, "path    ") catch {};
+                out.appendSlice(a, R) catch {};
+                const cwd_n = std.c.getenv("PWD") orelse ".";
+                const cwd = std.mem.sliceTo(cwd_n, 0);
+                const last = std.mem.lastIndexOfScalar(u8, cwd, '/') orelse 0;
+                const dir = if (last > 0 and last < cwd.len) cwd[last + 1 ..] else cwd;
+                out.appendSlice(a, Pal.fg_dim) catch {};
+                out.appendSlice(a, dir) catch {};
+                out.appendSlice(a, R) catch {};
+                padTo(out, a, sidebar_w, 8 + @min(dir.len, @as(usize, 12)));
+            },
+            else => {
+                padTo(out, a, sidebar_w, 0);
+            },
+        }
+    }
+
+    fn padTo(out: *std.ArrayList(u8), a: std.mem.Allocator, target: u16, used: usize) void {
+        if (used < target) {
+            var p: usize = used;
+            while (p < target) : (p += 1) { out.appendSlice(a, " ") catch {}; }
+        }
+    }
+
+    fn appendIntZig(out: *std.ArrayList(u8), a: std.mem.Allocator, val: anytype) void {
+        if (std.fmt.allocPrint(a, "{d}", .{val})) |s| {
+            out.appendSlice(a, s) catch {};
+        } else |_| {}
+    }
+
+    fn appendFmtZig(out: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+        if (std.fmt.allocPrint(a, fmt, args)) |s| {
+            out.appendSlice(a, s) catch {};
+        } else |_| {}
     }
 
     fn renderHeaderLines(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator) void {

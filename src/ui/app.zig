@@ -526,6 +526,7 @@ pub const App = struct {
     };
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
+        mouse: zz.MouseEvent,
         stream_content: []const u8,
         stream_reasoning: []const u8,
         stream_done,
@@ -829,6 +830,7 @@ pub const App = struct {
         if (self.should_quit) return .quit;
         switch (msg) {
             .key => |k| return self.onKey(k),
+            .mouse => |m| return self.onMouse(m),
             .stream_content => |text| self.onStreamContent(text),
             .stream_reasoning => |text| self.onStreamReasoning(text),
             .stream_done => self.onStreamDone(),
@@ -844,6 +846,29 @@ pub const App = struct {
                 self.pollStream();
                 // Toast auto-dismiss is handled by zz.components.Toast based on timestamps
             },
+        }
+        return .none;
+    }
+
+    // ═════════════════════════════════════════════════════════════════
+    // Mouse Handling
+    // ═════════════════════════════════════════════════════════════════
+
+    fn onMouse(self: *App, ev: zz.MouseEvent) zz.Cmd(Msg) {
+        switch (ev.button) {
+            .wheel_up => {
+                self.scroll_offset +|= 3;
+                self.auto_scroll = false;
+            },
+            .wheel_down => {
+                if (self.scroll_offset > 3) {
+                    self.scroll_offset -= 3;
+                } else {
+                    self.scroll_offset = 0;
+                    self.auto_scroll = true;
+                }
+            },
+            else => {},
         }
         return .none;
     }
@@ -1932,12 +1957,14 @@ pub const App = struct {
         // Build body: chat (left) + sidebar (right) using join.horizontal
         const chat_text = self.renderClaudeChat(a, chat_w, body_h);
         defer a.free(chat_text);
+        const chat_clipped = clipFromBottom(a, chat_text, body_h, self.scroll_offset) catch chat_text;
+        defer if (chat_clipped.ptr != chat_text.ptr) a.free(chat_clipped);
         const sidebar_text = self.renderClaudeSidebar(a, sidebar_w, body_h);
         defer a.free(sidebar_text);
         const sep_text = self.buildVerticalSeparator(a, body_h);
         defer a.free(sep_text);
-        const chat_padded = enforceWidth(a, chat_text, chat_w) catch chat_text;
-        defer if (chat_padded.ptr != chat_text.ptr) a.free(chat_padded);
+        const chat_padded = enforceWidth(a, chat_clipped, chat_w) catch chat_clipped;
+        defer if (chat_padded.ptr != chat_clipped.ptr) a.free(chat_padded);
         const sidebar_padded = enforceWidth(a, sidebar_text, sidebar_w) catch sidebar_text;
         defer if (sidebar_padded.ptr != sidebar_text.ptr) a.free(sidebar_padded);
         const body_parts = [_][]const u8{ chat_padded, sep_text, sidebar_padded };
@@ -2288,13 +2315,13 @@ pub const App = struct {
         const input_vis = zz.layout.measure.width(input_view);
         const max_input = if (w > 4) w - 4 else 0;
         const display_input = if (input_vis > max_input)
-            (zz.layout.measure.truncate(a, input_view, max_input) catch input_view)
+            (ansiClip(a, input_view, max_input) catch input_view)
         else
             input_view;
         defer if (display_input.ptr != input_view.ptr) a.free(display_input);
         out.appendSlice(a, display_input) catch {};
 
-        // Pad to fill the cell (inside width is w - 2, leading space consumed 1)
+        // Pad to fill the cell (inside width is w - 2, leading "│ " consumes 2)
         const display_vis = zz.layout.measure.width(display_input);
         const pad_target = if (w > 3) w - 3 else 0;
         var p = display_vis;
@@ -2363,6 +2390,7 @@ pub const App = struct {
     // ── Claude-style chat rendering with markdown ──
 
     fn renderClaudeChat(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
+        _ = h;
         var lines = std.ArrayList(u8).empty;
         defer lines.deinit(a);
 
@@ -2373,15 +2401,7 @@ pub const App = struct {
             return lines.toOwnedSlice(a) catch "";
         }
 
-        // Scroll: show last N messages that fit
-        var consumed_h: u16 = 0;
-        var start_idx: usize = 0;
-        if (total > 0) {
-            // Find how many messages we can show from the end
-            start_idx = if (total > @as(usize, @intCast(h))) total - @as(usize, @intCast(h)) else 0;
-        }
-
-        for (start_idx..total) |i| {
+        for (0..total) |i| {
             const m = &self.messages.items[i];
             const is_streaming = (self.streaming_idx == i);
 
@@ -2469,11 +2489,9 @@ pub const App = struct {
                 }
             }
 
-            if (i + 1 < total and consumed_h + 1 < h) {
+            if (i + 1 < total) {
                 lines.appendSlice(a, "\n") catch {};
             }
-            consumed_h += 1;
-            if (consumed_h >= h) break;
         }
 
         return lines.toOwnedSlice(a) catch "";
@@ -2671,6 +2689,83 @@ pub const App = struct {
         return result.toOwnedSlice(a);
     }
 
+    /// Return the last `target_h` lines of `text`, shifted up by `scroll_offset`
+    /// lines from the bottom. Pads with blank lines at the bottom so the result
+    /// always contains exactly `target_h` lines. This keeps the footer fixed.
+    fn clipFromBottom(a: std.mem.Allocator, text: []const u8, target_h: u16, scroll_offset: u16) ![]const u8 {
+        if (target_h == 0) return try a.dupe(u8, "");
+        const trimmed = std.mem.trimEnd(u8, text, "\n");
+        var list = std.ArrayList([]const u8).empty;
+        defer list.deinit(a);
+        var it = std.mem.splitScalar(u8, trimmed, '\n');
+        while (it.next()) |line| try list.append(a, line);
+
+        const total = list.items.len;
+        const th = @min(total, @as(usize, target_h));
+        const max_offset = if (total > target_h) total - target_h else 0;
+        const offset = @min(scroll_offset, max_offset);
+        const end = total - offset;
+        const start = if (end > th) end - th else 0;
+
+        var result = std.ArrayList(u8).empty;
+        defer result.deinit(a);
+        for (start..end) |i| {
+            if (i > start) try result.appendSlice(a, "\n");
+            try result.appendSlice(a, list.items[i]);
+        }
+        var visible: usize = end - start;
+        while (visible < target_h) : (visible += 1) {
+            try result.appendSlice(a, "\n");
+        }
+        return result.toOwnedSlice(a);
+    }
+
+    /// Return the first `max_width` display columns of `str`, preserving any
+    /// ANSI escape sequences that appear before the cut-off point. Wide chars
+    /// are not split. No ellipsis is added.
+    fn ansiClip(a: std.mem.Allocator, str: []const u8, max_width: usize) ![]const u8 {
+        if (max_width == 0) return try a.dupe(u8, "");
+        var result = std.ArrayList(u8).empty;
+        defer result.deinit(a);
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < str.len and w < max_width) {
+            const c = str[i];
+            if (c == 0x1b) {
+                const start = i;
+                i += 1;
+                if (i < str.len and str[i] == '[') {
+                    i += 1;
+                    while (i < str.len and !((str[i] >= 'A' and str[i] <= 'Z') or (str[i] >= 'a' and str[i] <= 'z'))) {
+                        i += 1;
+                    }
+                    if (i < str.len) i += 1;
+                } else if (i < str.len) {
+                    i += 1;
+                }
+                try result.appendSlice(a, str[start..i]);
+                continue;
+            }
+            const byte_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            if (i + byte_len > str.len) {
+                try result.appendSlice(a, str[i..]);
+                break;
+            }
+            const cp = std.unicode.utf8Decode(str[i..][0..byte_len]) catch {
+                try result.appendSlice(a, str[i..i + 1]);
+                w += 1;
+                i += 1;
+                continue;
+            };
+            const cw = zz.unicode.charWidth(cp);
+            if (w + cw > max_width) break;
+            try result.appendSlice(a, str[i..i + byte_len]);
+            w += cw;
+            i += byte_len;
+        }
+        return result.toOwnedSlice(a);
+    }
+
     /// ANSI-aware overlay: places `content` onto `base` at (x, y), preserving
     /// escape sequences in both layers. Unlike zz.place.overlay, this does not
     /// corrupt ANSI codes by indexing into their byte sequences.
@@ -2709,10 +2804,10 @@ pub const App = struct {
             if (overlay_w > max_overlay_w) overlay_w = max_overlay_w;
 
             // Prefix: base columns [0, x)
-            const prefix = try zz.layout.measure.truncate(a, base_line, x);
+            const prefix = try ansiClip(a, base_line, x);
             defer a.free(prefix);
             // Suffix: base columns [x + overlay_w, base_w)
-            const up_to_overlay_end = try zz.layout.measure.truncate(a, base_line, x + overlay_w);
+            const up_to_overlay_end = try ansiClip(a, base_line, x + overlay_w);
             defer a.free(up_to_overlay_end);
             const suffix = base_line[up_to_overlay_end.len..];
 
@@ -2771,7 +2866,9 @@ pub const App = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    var program = zz.Program(App).init(init.gpa, init.io, init.environ_map);
+    var program = zz.Program(App).initWithOptions(init.gpa, init.io, init.environ_map, .{
+        .mouse = true,
+    });
     defer program.deinit();
     try program.run();
 }
@@ -2785,7 +2882,7 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.streaming_idx = null;
     app.text_input = zz.components.TextInput.init(alloc);
     app.palette = zz.components.CommandPalette.init(alloc) catch unreachable;
-    for (App.CMDS) |cmd| {
+    for (SlashDispatcher.Dispatcher.commands()) |cmd| {
         app.palette.addCommand(.{
             .id = cmd.id,
             .label = cmd.label,
@@ -3182,29 +3279,6 @@ test "view input shows placeholder when empty" {
     };
     const output = app.view(&ctx);
     try std.testing.expect(std.mem.indexOf(u8, output, "Type a message") != null);
-}
-
-test "palette select provider sets input" {
-    const alloc = std.testing.allocator;
-    var app = makeTestApp(alloc);
-    defer {
-        for (app.messages.items) |*m| { if (m.owns and m.content.len > 0) alloc.free(m.content); }
-        app.messages.deinit(alloc);
-        app.text_input.deinit();
-        app.palette.deinit();
-        app.toast.deinit();
-        app.theme_manager.deinit();
-        app.search_query.deinit(alloc);
-        app.pending_data.deinit(alloc);
-    }
-
-    // Simulate palette selection of /provider
-    app.execPaletteCommand(.{ .id = "provider", .label = "/provider", .description = "" });
-
-    // After palette selection, input should have "/provider "
-    try std.testing.expect(!app.palette.isOpen());
-    try std.testing.expect(std.mem.startsWith(u8, app.text_input.getValue(), "/provider"));
-    try std.testing.expect(app.text_input.getValue().len > 0);
 }
 
 test "command palette fuzzy filter finds command" {

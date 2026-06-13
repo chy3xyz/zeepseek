@@ -32,6 +32,8 @@ pub const DeepSeekStreamClient = struct {
     circuit_breaker: ?*CircuitBreaker = null,
     http_client: http.Client,
     endpoint: []const u8 = "https://api.deepseek.com/chat/completions",
+    last_http_status: u16 = 0,
+    last_http_body: ?[]u8 = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -49,6 +51,7 @@ pub const DeepSeekStreamClient = struct {
     }
 
     pub fn deinit(self: *DeepSeekStreamClient) void {
+        if (self.last_http_body) |b| self.allocator.free(b);
         self.http_client.deinit();
     }
 
@@ -93,6 +96,17 @@ pub const DeepSeekStreamClient = struct {
             .{ .name = "Accept", .value = "text/event-stream" },
         };
 
+        // Load system CA certificates on first HTTPS request. Zig's http.Client
+        // starts with an empty bundle, so TLS handshake would fail otherwise.
+        if (!@import("builtin").target.cpu.arch.isWasm()) {
+            if (self.http_client.ca_bundle.bytes.items.len == 0) {
+                var bundle = std.crypto.Certificate.Bundle.empty;
+                const now = std.Io.Timestamp.now(self.io, .real);
+                try bundle.rescan(self.allocator, self.io, now);
+                self.http_client.ca_bundle = bundle;
+            }
+        }
+
         var request = try self.http_client.request(.POST, uri, .{
             .extra_headers = &headers,
         });
@@ -107,6 +121,15 @@ pub const DeepSeekStreamClient = struct {
             if (self.circuit_breaker) |cb| {
                 cb.recordFailure();
             }
+
+            // Capture the response body so the UI can show *why* the request failed.
+            var err_reader_buf: [4096]u8 = undefined;
+            const err_reader = response.reader(&err_reader_buf);
+            const err_body = err_reader.allocRemaining(self.allocator, .limited(4096)) catch null;
+            if (self.last_http_body) |old| self.allocator.free(old);
+            self.last_http_body = err_body;
+            self.last_http_status = @intCast(status);
+
             return error.HttpError;
         }
 

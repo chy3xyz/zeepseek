@@ -44,3 +44,8 @@ const _subworker = @import("agent/sub_worker.zig");
 const _stream_client = @import("net/stream_client.zig");
 const _deepseek_client = @import("net/deepseek_client.zig");
 const _app = @import("ui/app.zig");
+const _slash_command_dispatcher = @import("ui/slash_command_dispatcher.zig");
+
+
+
+

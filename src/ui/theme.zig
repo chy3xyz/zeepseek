@@ -527,3 +527,83 @@ pub const Pal = struct {
     pub const bg_code_inline = "\x1b[48;2;50;52;64m";
     pub const bg_highlight = "\x1b[48;2;249;226;175;38;2;30;30;46m";
 };
+
+// ═══════════════════════════════════════════════════════════════════════
+// ZigZag Style Bridge — converts ColorPalette to zz.Style values
+// ═══════════════════════════════════════════════════════════════════════
+
+/// Pre-built styles derived from a ColorPalette.
+/// Regenerate whenever the active palette changes.
+pub const SemanticStyles = struct {
+    fg: zz.Style,
+    fg_dim: zz.Style,
+    fg_bright: zz.Style,
+    user: zz.Style,
+    assistant: zz.Style,
+    system: zz.Style,
+    tool: zz.Style,
+    cyan: zz.Style,
+    green: zz.Style,
+    yellow: zz.Style,
+    pink: zz.Style,
+    red: zz.Style,
+    orange: zz.Style,
+    blue: zz.Style,
+    mauve: zz.Style,
+    success: zz.Style,
+    warning: zz.Style,
+    error_color: zz.Style,
+    info: zz.Style,
+    thinking: zz.Style,
+    tool_call: zz.Style,
+    prompt_color: zz.Style,
+    border: zz.Style,
+    border_focused: zz.Style,
+    bg_surface: zz.Style,
+    bg_code: zz.Style,
+    bg_code_inline: zz.Style,
+
+    pub fn fromPalette(p: ColorPalette) SemanticStyles {
+        var base = zz.Style{};
+        base = base.inline_style(true);
+        var dim = base;
+        dim = dim.dim(true);
+        var bold = base;
+        bold = bold.bold(true);
+        return .{
+            .fg = base.fg(p.fg),
+            .fg_dim = dim.fg(p.fg_dim),
+            .fg_bright = bold.fg(p.fg_bright),
+            .user = base.fg(p.link),
+            .assistant = base.fg(p.success),
+            .system = base.fg(p.warning),
+            .tool = base.fg(p.warning),
+            .cyan = base.fg(Color.fromRgb(139, 233, 253)),
+            .green = base.fg(p.success),
+            .yellow = base.fg(p.warning),
+            .pink = base.fg(p.thinking),
+            .red = base.fg(p.error_color),
+            .orange = base.fg(p.warning),
+            .blue = base.fg(p.link),
+            .mauve = base.fg(p.thinking),
+            .success = base.fg(p.success),
+            .warning = base.fg(p.warning),
+            .error_color = base.fg(p.error_color),
+            .info = base.fg(p.info),
+            .thinking = base.fg(p.thinking),
+            .tool_call = base.fg(p.tool_call),
+            .prompt_color = base.fg(p.prompt),
+            .border = dim.fg(p.border),
+            .border_focused = base.fg(p.border_focused),
+            .bg_surface = base.bg(p.bg),
+            .bg_code = base.bg(Color.fromRgb(40, 42, 54)),
+            .bg_code_inline = base.bg(Color.fromRgb(50, 52, 64)),
+        };
+    }
+};
+
+test "semantic styles from palette" {
+    const palette = themes[0].palette;
+    const styles = SemanticStyles.fromPalette(palette);
+    _ = styles;
+}

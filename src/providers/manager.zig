@@ -59,9 +59,9 @@ pub const ProviderManager = struct {
         }
     }
 
-    pub fn setActive(self: *ProviderManager, id: []const u8) void {
+    pub fn setActive(self: *ProviderManager, id: []const u8) !void {
         if (self.configs.contains(id)) {
-            self.active = id;
+            self.active = try self.arena.allocator().dupe(u8, id);
         }
     }
 
@@ -73,16 +73,15 @@ pub const ProviderManager = struct {
         return self.configs.get(id);
     }
 
-    pub fn listProviders(self: *const ProviderManager) []const []const u8 {
-        var result: [32][]const u8 = undefined;
+    pub fn listProviders(self: *ProviderManager) ![]const []const u8 {
+        const max = self.configs.count();
+        const result = try self.arena.allocator().alloc([]const u8, max);
         var count: usize = 0;
 
         var it = self.configs.iterator();
         while (it.next()) |entry| {
-            if (count < result.len) {
-                result[count] = entry.key_ptr.*;
-                count += 1;
-            }
+            result[count] = entry.key_ptr.*;
+            count += 1;
         }
 
         return result[0..count];
@@ -161,7 +160,7 @@ test "provider manager set active" {
         .default_model = "gpt-4o",
     });
 
-    mgr.setActive("openai");
+    try mgr.setActive("openai");
     try std.testing.expectEqualSlices(u8, "openai", mgr.active);
 
     const active = mgr.getActive();
@@ -180,7 +179,7 @@ test "provider manager remove provider" {
         .default_model = "gpt-4o",
     });
 
-    mgr.setActive("openai");
+    try mgr.setActive("openai");
     mgr.removeProvider("openai");
 
     try std.testing.expectEqualSlices(u8, "deepseek", mgr.active);

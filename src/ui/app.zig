@@ -1113,14 +1113,16 @@ pub const App = struct {
         // Capture values for the thread
         const api_key = self.provider_mgr.resolveApiKey(self.provider) orelse self.api_key;
         const model = self.provider_mgr.resolveModel(self.provider);
+        const endpoint = self.provider_mgr.resolveEndpoint(self.provider);
         const alloc = self.alloc;
         const io = self.io;
         const ctx_slice = ctx_items.toOwnedSlice(self.alloc) catch &.{};
 
         // Spawn streaming thread
         const thread = std.Thread.spawn(.{}, struct {
-            fn run(api_k: []const u8, prompt: []const u8, ctx: []const stream_client_mod.CtxItem, mdl: []const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
+            fn run(api_k: []const u8, prompt: []const u8, ctx: []const stream_client_mod.CtxItem, mdl: []const u8, ep: []const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
                 var client = stream_client_mod.DeepSeekStreamClient.init(a, sio, null, null);
+                client.endpoint = ep;
                 defer client.deinit();
 
                 var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
@@ -1158,7 +1160,7 @@ pub const App = struct {
                 }
                 state.setDone();
             }
-        }.run, .{ api_key, user_input, ctx_slice, model, alloc, io, ss }) catch {
+        }.run, .{ api_key, user_input, ctx_slice, model, endpoint, alloc, io, ss }) catch {
             ss.setError("Failed to spawn thread");
             return;
         };

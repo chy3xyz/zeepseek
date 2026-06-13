@@ -114,7 +114,8 @@ pub const DeepSeekStreamClient = struct {
         try request.sendBodyComplete(body);
         errdefer request.deinit();
 
-        var response = try request.receiveHead(undefined);
+        var redirect_buf: [8192]u8 = undefined;
+        var response = try request.receiveHead(&redirect_buf);
 
         const status = @intFromEnum(response.head.status);
         if (status < 200 or status >= 300) {

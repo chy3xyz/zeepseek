@@ -896,8 +896,10 @@ pub const App = struct {
                 return .none;
             }
             if (k == .enter) {
-                const cmd_id = self.slash_awaiting_cmd orelse "";
-                const value = self.slash_prompt_input.getValue();
+                const cmd_id = self.alloc.dupe(u8, self.slash_awaiting_cmd orelse "") catch return .none;
+                defer self.alloc.free(cmd_id);
+                const value = self.alloc.dupe(u8, self.slash_prompt_input.getValue()) catch return .none;
+                defer self.alloc.free(value);
                 self.closeSlashPrompt();
                 self.executeSlashCommand(cmd_id, value);
                 return .none;
@@ -1620,6 +1622,7 @@ pub const App = struct {
             .set_apikey => |key| {
                 self.setApiKey(key);
                 self.alloc.free(key);
+                self.setNotification("API key set");
             },
 
             .set_provider => |name| {

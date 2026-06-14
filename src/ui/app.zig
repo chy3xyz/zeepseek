@@ -733,11 +733,15 @@ pub const App = struct {
     cursor_visible: bool,
 
     // --- Render cache
-    render_generation: u32 = 0,
-    cached_chat_text: ?[]const u8 = null,
-    cached_chat_width: u16 = 0,
-    cached_chat_height: u16 = 0,
-    cached_render_generation: u32 = 0,
+    // The chat text is split into a cached "history" (messages[0..streaming_idx))
+    // and a freshly-rendered "tail" (the streaming message and anything after).
+    // During streaming, onStreamContent mutates the tail so we only re-render
+    // the small tail; the history stays cached and is not re-walked per chunk.
+    // This is what keeps the typing effect smooth as the conversation grows.
+    history_generation: u32 = 0,
+    cached_history_text: ?[]const u8 = null,
+    cached_history_width: u16 = 0,
+    cached_history_generation: u32 = 0,
 
     // --- Notification toast
     toast: zz.components.Toast,
@@ -816,11 +820,10 @@ pub const App = struct {
             .width = 80,
             .height = 24,
             .cursor_visible = true,
-            .render_generation = 0,
-            .cached_chat_text = null,
-            .cached_chat_width = 0,
-            .cached_chat_height = 0,
-            .cached_render_generation = 0,
+            .history_generation = 0,
+            .cached_history_text = null,
+            .cached_history_width = 0,
+            .cached_history_generation = 0,
             .toast = zz.components.Toast.init(ctx.persistent_allocator),
             .theme_manager = theme.ThemeManager.init(ctx.persistent_allocator),
             .styles = undefined,
@@ -884,7 +887,7 @@ pub const App = struct {
         self.search_query.deinit(self.alloc);
         self.pending_data.deinit(self.alloc);
         self.slash_prompt_input.deinit();
-        if (self.cached_chat_text) |c| self.alloc.free(c);
+        if (self.cached_history_text) |c| self.alloc.free(c);
         self.model_picker.deinit();
         self.provider_picker.deinit();
         self.confirm_modal = undefined;
@@ -1363,7 +1366,11 @@ pub const App = struct {
     }
 
     fn invalidateRenderCache(self: *App) void {
-        self.render_generation +%= 1;
+        // Bumping the history generation invalidates the cached "history"
+        // portion of the chat (messages[0..streaming_idx)). Streaming-content
+        // events MUST NOT call this — the streaming message lives in the
+        // always-fresh tail and does not affect the cached history.
+        self.history_generation +%= 1;
     }
 
     fn startStreaming(self: *App, user_input: []const u8) void {
@@ -1828,7 +1835,8 @@ pub const App = struct {
             }) catch return;
             self.streaming_idx = idx;
         }
-        self.invalidateRenderCache();
+        // Streaming text mutates the tail message; the cached history
+        // is unaffected, so we do NOT invalidate the history cache here.
         if (self.auto_scroll) self.scroll_offset = 0;
     }
 
@@ -1841,7 +1849,7 @@ pub const App = struct {
                 self.messages.items[idx].thinking = new;
             }
         }
-        self.invalidateRenderCache();
+        // Tail-only mutation; history cache stays valid.
     }
 
     fn onStreamDone(self: *App) void {
@@ -1852,6 +1860,9 @@ pub const App = struct {
         }
         self.streaming_idx = null;
         self.turn += 1;
+        // The completed message now belongs to history; force a re-render
+        // so the tail doesn't keep owning it.
+        self.invalidateRenderCache();
     }
 
     fn onStreamError(self: *App, err_msg: []const u8) void {
@@ -2473,24 +2484,7 @@ pub const App = struct {
 
         // Build body: chat (left) + sidebar (right) using join.horizontal
         const pa = ctx.persistent_allocator;
-        const need_render = self.cached_chat_text == null or
-            self.cached_chat_width != chat_w or
-            self.cached_chat_height != body_h or
-            self.cached_render_generation != self.render_generation;
-        const chat_text = if (need_render) blk: {
-            const fresh = self.renderClaudeChat(a, chat_w, body_h);
-            const persistent = pa.dupe(u8, fresh) catch {
-                break :blk fresh;
-            };
-            if (self.cached_chat_text) |old| pa.free(old);
-            const mutable = @constCast(self);
-            mutable.cached_chat_text = persistent;
-            mutable.cached_chat_width = chat_w;
-            mutable.cached_chat_height = body_h;
-            mutable.cached_render_generation = self.render_generation;
-            a.free(fresh);
-            break :blk persistent;
-        } else self.cached_chat_text.?;
+        const chat_text = self.buildChatText(a, pa, chat_w);
         const chat_clipped = clipFromBottom(a, chat_text, body_h, self.scroll_offset) catch chat_text;
         defer if (chat_clipped.ptr != chat_text.ptr) a.free(chat_clipped);
         const sidebar_text = self.renderClaudeSidebar(a, sidebar_w, body_h);
@@ -2985,19 +2979,71 @@ pub const App = struct {
 
     // ── Claude-style chat rendering with markdown ──
 
-    fn renderClaudeChat(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
-        _ = h;
-        var lines = std.ArrayList(u8).empty;
-        defer lines.deinit(a);
+    /// Compose the full chat text from a cached "history" prefix and a freshly
+    /// rendered "tail" (the streaming message and anything after it).
+    ///
+    /// During streaming, `onStreamContent` mutates the tail message but leaves
+    /// the cached history untouched. `view()` therefore only re-walks the
+    /// tail per chunk, instead of re-rendering the whole conversation. Without
+    /// this split, render time grows linearly with the accumulated content and
+    /// the typing effect stalls after a few dozen characters.
+    fn buildChatText(self: *const App, a: std.mem.Allocator, pa: std.mem.Allocator, w: u16) []const u8 {
+        const split_idx = self.streaming_idx orelse self.messages.items.len;
 
-        const total = self.messages.items.len;
-        if (total == 0) {
-            // Welcome / empty state
-            self.renderClaudeWelcome(&lines, a, w);
-            return lines.toOwnedSlice(a) catch "";
+        // History = messages[0..split_idx), cached.
+        const need_history = self.cached_history_text == null or
+            self.cached_history_width != w or
+            self.cached_history_generation != self.history_generation;
+
+        var owned_history: ?[]u8 = null;
+        const history_text: []const u8 = if (need_history) blk: {
+            var buf = std.ArrayList(u8).empty;
+            self.renderClaudeChatRange(a, &buf, w, 0, split_idx);
+            const persistent = pa.dupe(u8, buf.items) catch break :blk buf.items;
+            if (self.cached_history_text) |old| pa.free(old);
+            const mutable = @constCast(self);
+            mutable.cached_history_text = persistent;
+            mutable.cached_history_width = w;
+            mutable.cached_history_generation = self.history_generation;
+            owned_history = buf.items;
+            break :blk persistent;
+        } else self.cached_history_text.?;
+
+        // Tail = messages[split_idx..]; always rendered fresh (typically 0 or
+        // 1 message, so cheap). The welcome state lives here when no history.
+        var tail_buf = std.ArrayList(u8).empty;
+        if (self.messages.items.len == 0) {
+            self.renderClaudeWelcome(&tail_buf, a, w);
+        } else {
+            self.renderClaudeChatRange(a, &tail_buf, w, split_idx, self.messages.items.len);
         }
 
-        for (0..total) |i| {
+        // Stitch history + tail into a single text for clipping.
+        var combined = std.ArrayList(u8).empty;
+        if (history_text.len > 0) combined.appendSlice(a, history_text) catch {};
+        if (tail_buf.items.len > 0) {
+            if (history_text.len > 0 and !std.mem.endsWith(u8, history_text, "\n")) {
+                combined.append(a, '\n') catch {};
+            }
+            combined.appendSlice(a, tail_buf.items) catch {};
+        }
+        if (owned_history) |h| a.free(h);
+        tail_buf.deinit(a);
+
+        return combined.toOwnedSlice(a) catch history_text;
+    }
+
+    fn renderClaudeChatRange(
+        self: *const App,
+        a: std.mem.Allocator,
+        out: *std.ArrayList(u8),
+        w: u16,
+        start: usize,
+        end: usize,
+    ) void {
+        const total = self.messages.items.len;
+        var i: usize = start;
+        while (i < end) : (i += 1) {
             const m = &self.messages.items[i];
             const is_streaming = (self.streaming_idx == i);
 
@@ -3010,63 +3056,63 @@ pub const App = struct {
             };
             const status_icon: []const u8 = if (is_streaming) " ◐" else "";
 
-            lines.appendSlice(a, D) catch {};
-            lines.appendSlice(a, "│") catch {};
-            lines.appendSlice(a, R) catch {};
-            lines.appendSlice(a, " ") catch {};
-            lines.appendSlice(a, B) catch {};
-            lines.appendSlice(a, role_color) catch {};
-            lines.appendSlice(a, role_label) catch {};
-            lines.appendSlice(a, R) catch {};
+            out.appendSlice(a, D) catch {};
+            out.appendSlice(a, "│") catch {};
+            out.appendSlice(a, R) catch {};
+            out.appendSlice(a, " ") catch {};
+            out.appendSlice(a, B) catch {};
+            out.appendSlice(a, role_color) catch {};
+            out.appendSlice(a, role_label) catch {};
+            out.appendSlice(a, R) catch {};
             if (status_icon.len > 0) {
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, status_icon) catch {};
-                lines.appendSlice(a, R) catch {};
+                out.appendSlice(a, D) catch {};
+                out.appendSlice(a, status_icon) catch {};
+                out.appendSlice(a, R) catch {};
             }
-            lines.appendSlice(a, "  ") catch {};
+            out.appendSlice(a, "  ") catch {};
 
             // Content — render markdown for assistant, plain for others
             if (m.content.len > 0) {
                 if (m.role == .assistant) {
-                    self.renderClaudeMarkdownContent(&lines, a, m.content, w - 10);
+                    self.renderClaudeMarkdownContent(out, a, m.content, w - 10);
                 } else {
-                    self.renderClaudePlainContent(&lines, a, m.content, w - 10);
+                    self.renderClaudePlainContent(out, a, m.content, w - 10);
                 }
             } else if (is_streaming) {
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, Pal.fg_dim) catch {};
-                lines.appendSlice(a, "(waiting...)") catch {};
-                lines.appendSlice(a, R) catch {};
+                out.appendSlice(a, D) catch {};
+                out.appendSlice(a, Pal.fg_dim) catch {};
+                out.appendSlice(a, "(waiting...)") catch {};
+                out.appendSlice(a, R) catch {};
             }
 
             // Thinking collapse toggle (only for assistant with thinking)
             if (m.thinking) |th| {
                 if (th.len > 0) {
-                    lines.appendSlice(a, "\n") catch {};
-                    lines.appendSlice(a, D) catch {};
-                    lines.appendSlice(a, "│   ") catch {};
-                    lines.appendSlice(a, R) catch {};
+                    out.appendSlice(a, "\n") catch {};
+                    out.appendSlice(a, D) catch {};
+                    out.appendSlice(a, "│   ") catch {};
+                    out.appendSlice(a, R) catch {};
                     const toggle_icon: []const u8 = if (m.think_collapsed) "▸" else "▾";
-                    lines.appendSlice(a, Pal.cyan) catch {};
-                    lines.appendSlice(a, toggle_icon) catch {};
-                    lines.appendSlice(a, " ") catch {};
-                    lines.appendSlice(a, Pal.fg_dim) catch {};
+                    out.appendSlice(a, Pal.cyan) catch {};
+                    out.appendSlice(a, toggle_icon) catch {};
+                    out.appendSlice(a, " ") catch {};
+                    out.appendSlice(a, Pal.fg_dim) catch {};
                     if (m.think_collapsed) {
-                        lines.appendSlice(a, "thinking...") catch {};
+                        out.appendSlice(a, "thinking...") catch {};
                     } else {
-                        lines.appendSlice(a, "thinking: ") catch {};
-                        lines.appendSlice(a, Pal.orange) catch {};
-                        lines.appendSlice(a, th) catch {};
+                        out.appendSlice(a, "thinking: ") catch {};
+                        out.appendSlice(a, Pal.orange) catch {};
+                        out.appendSlice(a, th) catch {};
                     }
-                    lines.appendSlice(a, R) catch {};
+                    out.appendSlice(a, R) catch {};
                 }
             }
 
             // Tool calls
             if (m.tool_calls.items.len > 0) {
-                lines.appendSlice(a, "\n") catch {};
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, "│   ") catch {};
+                out.appendSlice(a, "\n") catch {};
+                out.appendSlice(a, D) catch {};
+                out.appendSlice(a, "│   ") catch {};
                 for (m.tool_calls.items) |tc| {
                     const tc_icon: []const u8 = switch (tc.status) {
                         .running => "◐", .success => "✓", .failed => "✗",
@@ -3074,23 +3120,21 @@ pub const App = struct {
                     const tc_clr: []const u8 = switch (tc.status) {
                         .running => Pal.yellow, .success => Pal.green, .failed => Pal.red,
                     };
-                    lines.appendSlice(a, tc_clr) catch {};
-                    lines.appendSlice(a, tc_icon) catch {};
-                    lines.appendSlice(a, R) catch {};
-                    lines.appendSlice(a, " ") catch {};
-                    lines.appendSlice(a, Pal.tool_call) catch {};
-                    lines.appendSlice(a, tc.name) catch {};
-                    lines.appendSlice(a, R) catch {};
-                    lines.appendSlice(a, "  ") catch {};
+                    out.appendSlice(a, tc_clr) catch {};
+                    out.appendSlice(a, tc_icon) catch {};
+                    out.appendSlice(a, R) catch {};
+                    out.appendSlice(a, " ") catch {};
+                    out.appendSlice(a, Pal.tool_call) catch {};
+                    out.appendSlice(a, tc.name) catch {};
+                    out.appendSlice(a, R) catch {};
+                    out.appendSlice(a, "  ") catch {};
                 }
             }
 
             if (i + 1 < total) {
-                lines.appendSlice(a, "\n") catch {};
+                out.appendSlice(a, "\n") catch {};
             }
         }
-
-        return lines.toOwnedSlice(a) catch "";
     }
 
     fn renderClaudeWelcome(self: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {

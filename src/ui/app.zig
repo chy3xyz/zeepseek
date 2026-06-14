@@ -686,6 +686,7 @@ pub const App = struct {
     help_modal: zz.components.Modal,
     detail_modal: zz.components.Modal,
     detail_idx: usize,
+    detail_title_buf: ?[]u8,
 
     // --- Sub-agent panel
     show_subagents: bool,
@@ -783,6 +784,7 @@ pub const App = struct {
             .help_modal = zz.components.Modal.info("Keybindings", ""),
             .detail_modal = zz.components.Modal.init(),
             .detail_idx = 0,
+            .detail_title_buf = null,
             .show_subagents = false,
             .subagents = .empty,
             .stream_state = null,
@@ -1150,14 +1152,24 @@ pub const App = struct {
 
         // --- Detail overlay (Modal)
         if (self.detail_modal.isVisible()) {
-            const had = self.detail_modal.isVisible();
-            _ = self.detail_modal.handleKey(key);
-            if (had and !self.detail_modal.isVisible()) {
-                // Modal was dismissed; nothing extra to do
+            // Left/Right navigate between messages (suppresses the modal's
+            // button-focus handling for these keys so we don't fight it).
+            if (k == .left) {
+                if (self.detail_idx > 0) {
+                    self.detail_idx -= 1;
+                    self.updateDetailModal();
+                }
+                return .none;
             }
-            // Arrow keys navigate between messages while modal stays open
-            if (k == .left) { if (self.detail_idx > 0) self.detail_idx -= 1; self.updateDetailModal(); }
-            if (k == .right) { if (self.detail_idx + 1 < self.messages.items.len) self.detail_idx += 1; self.updateDetailModal(); }
+            if (k == .right) {
+                if (self.detail_idx + 1 < self.messages.items.len) {
+                    self.detail_idx += 1;
+                    self.updateDetailModal();
+                }
+                return .none;
+            }
+            // All other keys go to the modal (Esc/Enter/Tab/shortcut/c).
+            _ = self.detail_modal.handleKey(key);
             return .none;
         }
 
@@ -2711,13 +2723,25 @@ pub const App = struct {
     }
 
     fn updateDetailModal(self: *App) void {
+        // Free the previously allocated title before reassigning, and on the
+        // empty path reset to a static string so we don't retain a stale slice.
+        if (self.detail_title_buf) |old| {
+            self.alloc.free(old);
+            self.detail_title_buf = null;
+        }
+
         if (self.detail_idx >= self.messages.items.len) {
             self.detail_modal.title = "Message Detail";
             self.detail_modal.body = "";
             return;
         }
         const m = self.messages.items[self.detail_idx];
-        self.detail_modal.title = std.fmt.allocPrint(self.alloc, "Message Detail ({d}/{d})", .{ self.detail_idx + 1, self.messages.items.len }) catch "Message Detail";
+        if (std.fmt.allocPrint(self.alloc, "Message Detail ({d}/{d})", .{ self.detail_idx + 1, self.messages.items.len })) |title| {
+            self.detail_title_buf = title;
+            self.detail_modal.title = title;
+        } else |_| {
+            self.detail_modal.title = "Message Detail";
+        }
         self.detail_modal.body = m.content;
 
         // Rebuild buttons so Copy always targets the current message.
@@ -3504,8 +3528,9 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.search_query = .empty;
     app.search_cursor = 0;
     app.help_modal = zz.components.Modal.info("Keybindings", "");
-    app.detail_modal = zz.components.Modal.info("Message Detail", "");
+    app.detail_modal = zz.components.Modal.init();
     app.detail_idx = 0;
+    app.detail_title_buf = null;
     app.show_subagents = false;
     app.subagents = .empty;
     app.stream_state = null;

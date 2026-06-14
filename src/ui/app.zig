@@ -2492,9 +2492,10 @@ pub const App = struct {
 
         // Build body: chat (left) + sidebar (right) using join.horizontal
         const pa = ctx.persistent_allocator;
-        const chat_text = self.buildChatText(a, pa, chat_w);
-        const chat_clipped = clipFromBottom(a, chat_text, body_h, self.scroll_offset) catch chat_text;
-        defer if (chat_clipped.ptr != chat_text.ptr) a.free(chat_clipped);
+        const parts = self.buildChatText(a, pa, chat_w);
+        defer a.free(parts.tail);
+        const sources = [_][]const u8{ parts.history, parts.tail };
+        const chat_clipped = clipFromBottom(a, &sources, body_h, self.scroll_offset) catch parts.tail;
         const sidebar_text = self.renderClaudeSidebar(a, sidebar_w, body_h);
         defer a.free(sidebar_text);
         const sep_text = self.buildVerticalSeparator(a, body_h);
@@ -2987,15 +2988,27 @@ pub const App = struct {
 
     // ── Claude-style chat rendering with markdown ──
 
-    /// Compose the full chat text from a cached "history" prefix and a freshly
-    /// rendered "tail" (the streaming message and anything after it).
+    /// Result of splitting the chat into a cached "history" prefix and a
+    /// freshly-rendered "tail". `history` is owned by the App's persistent
+    /// cache and must NOT be freed by the caller; `tail` is a fresh
+    /// allocation the caller owns and must free.
+    const ChatParts = struct {
+        history: []const u8,
+        tail: []const u8,
+    };
+
+    /// Compose the chat from a cached history prefix and a freshly rendered
+    /// tail (the streaming message and anything after it). The two slices
+    /// are kept separate so `clipFromBottom` can scan them without first
+    /// copying the (potentially large) history into a combined buffer on
+    /// every frame.
     ///
-    /// During streaming, `onStreamContent` mutates the tail message but leaves
-    /// the cached history untouched. `view()` therefore only re-walks the
-    /// tail per chunk, instead of re-rendering the whole conversation. Without
-    /// this split, render time grows linearly with the accumulated content and
-    /// the typing effect stalls after a few dozen characters.
-    fn buildChatText(self: *const App, a: std.mem.Allocator, pa: std.mem.Allocator, w: u16) []const u8 {
+    /// During streaming, `onStreamContent` mutates the tail message but
+    /// leaves the cached history untouched. `view()` therefore only re-walks
+    /// the tail per chunk, instead of re-rendering the whole conversation.
+    /// Without this split, render time grows linearly with the accumulated
+    /// content and the typing effect stalls after a few dozen characters.
+    fn buildChatText(self: *const App, a: std.mem.Allocator, pa: std.mem.Allocator, w: u16) ChatParts {
         const split_idx = self.streaming_idx orelse self.messages.items.len;
 
         // History = messages[0..split_idx), cached.
@@ -3018,27 +3031,20 @@ pub const App = struct {
         } else self.cached_history_text.?;
 
         // Tail = messages[split_idx..]; always rendered fresh (typically 0 or
-        // 1 message, so cheap). The welcome state lives here when no history.
+        // 1 message, so cheap). The welcome state lives here when there is
+        // no message history at all.
         var tail_buf = std.ArrayList(u8).empty;
         if (self.messages.items.len == 0) {
             self.renderClaudeWelcome(&tail_buf, a, w);
         } else {
             self.renderClaudeChatRange(a, &tail_buf, w, split_idx, self.messages.items.len);
         }
-
-        // Stitch history + tail into a single text for clipping.
-        var combined = std.ArrayList(u8).empty;
-        if (history_text.len > 0) combined.appendSlice(a, history_text) catch {};
-        if (tail_buf.items.len > 0) {
-            if (history_text.len > 0 and !std.mem.endsWith(u8, history_text, "\n")) {
-                combined.append(a, '\n') catch {};
-            }
-            combined.appendSlice(a, tail_buf.items) catch {};
-        }
         if (owned_history) |h| a.free(h);
-        tail_buf.deinit(a);
 
-        return combined.toOwnedSlice(a) catch history_text;
+        return .{
+            .history = history_text,
+            .tail = tail_buf.toOwnedSlice(a) catch "",
+        };
     }
 
     fn renderClaudeChatRange(
@@ -3079,9 +3085,15 @@ pub const App = struct {
             }
             out.appendSlice(a, "  ") catch {};
 
-            // Content — render markdown for assistant, plain for others
+            // Content — during streaming, render as plain text so the typing
+            // effect doesn't pay for markdown (highlightCode, wrapAnsiLine,
+            // expandTabs, ...) on every SSE chunk. The full markdown render
+            // kicks in once streaming completes (onStreamDone invalidates
+            // history_generation via invalidateRenderCache, forcing a re-render
+            // with is_streaming == false).
             if (m.content.len > 0) {
-                if (m.role == .assistant) {
+                const use_markdown = (m.role == .assistant) and !is_streaming;
+                if (use_markdown) {
                     self.renderClaudeMarkdownContent(out, a, m.content, w - 10);
                 } else {
                     self.renderClaudePlainContent(out, a, m.content, w - 10);
@@ -3353,16 +3365,21 @@ pub const App = struct {
         return result.toOwnedSlice(a);
     }
 
-    /// Return the last `target_h` lines of `text`, shifted up by `scroll_offset`
-    /// lines from the bottom. Pads with blank lines at the bottom so the result
-    /// always contains exactly `target_h` lines. This keeps the footer fixed.
-    fn clipFromBottom(a: std.mem.Allocator, text: []const u8, target_h: u16, scroll_offset: u16) ![]const u8 {
+    /// Return the last `target_h` lines across the concatenated `texts`,
+    /// shifted up by `scroll_offset` lines from the bottom. Pads with blank
+    /// lines at the bottom so the result always contains exactly `target_h`
+    /// lines. Multiple slices are treated as one continuous stream of text
+    /// (so callers can pass a cached history prefix and a fresh tail without
+    /// copying them into a combined buffer first).
+    fn clipFromBottom(a: std.mem.Allocator, texts: []const []const u8, target_h: u16, scroll_offset: u16) ![]const u8 {
         if (target_h == 0) return try a.dupe(u8, "");
-        const trimmed = std.mem.trimEnd(u8, text, "\n");
         var list = std.ArrayList([]const u8).empty;
         defer list.deinit(a);
-        var it = std.mem.splitScalar(u8, trimmed, '\n');
-        while (it.next()) |line| try list.append(a, line);
+        for (texts) |t| {
+            const trimmed = std.mem.trimEnd(u8, t, "\n");
+            var it = std.mem.splitScalar(u8, trimmed, '\n');
+            while (it.next()) |line| try list.append(a, line);
+        }
 
         const total = list.items.len;
         const th = @min(total, @as(usize, target_h));

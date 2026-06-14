@@ -808,7 +808,7 @@ pub const App = struct {
             .tokens_used = 0,
             .ctx_max = 64000,
             .cache_hit_rate = 0,
-            .model = "deepseek-chat",
+            .model = "deepseek-v4-flash",
             .provider = "deepseek",
             .provider_mgr = ProviderManager.init(ctx.allocator),
             .i18n = I18nManager.init(.en),
@@ -946,7 +946,7 @@ pub const App = struct {
             self.provider_mgr.addProvider(.{
                 .provider_id = "deepseek",
                 .api_key = self.api_key,
-                .default_model = "deepseek-chat",
+                .default_model = "deepseek-v4-flash",
             }) catch {};
             // Sandbox: skip on macOS due to Seatbelt policy issues
             // self.sandbox stays null; tools work without sandbox
@@ -2097,7 +2097,7 @@ pub const App = struct {
                 const resolved_model = if (self.subsystems_initialized)
                     self.provider_mgr.resolveModel(name)
                 else
-                    "deepseek-chat";
+                    "deepseek-v4-flash";
                 self.model = self.alloc.dupe(u8, resolved_model) catch self.model;
 
                 if (self.cache_loop) |cl| {

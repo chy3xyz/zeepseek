@@ -511,8 +511,31 @@ pub const Theme = struct {
 /// display ticks.
 fn utf8SafePrefixLen(s: []const u8, max: usize) usize {
     var n = @min(max, s.len);
-    while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
+    // Only back up when n points *inside* the slice. When n == s.len the
+    // whole string is already a valid UTF-8 prefix and reading s[n]
+    // would be out of bounds.
+    while (n > 0 and n < s.len and (s[n] & 0xC0) == 0x80) n -= 1;
     return n;
+}
+
+test "utf8SafePrefixLen returns whole string when max exceeds length" {
+    // Regression: previously the loop read s[n] even when n == s.len,
+    // which is out of bounds and crashed the first time a small chunk
+    // (shorter than the per-tick drain limit) was drained.
+    const s = "你"; // 3 bytes in UTF-8
+    try std.testing.expectEqual(@as(usize, 3), utf8SafePrefixLen(s, 30));
+    try std.testing.expectEqual(@as(usize, 0), utf8SafePrefixLen("", 30));
+}
+
+test "utf8SafePrefixLen backs up over continuation bytes" {
+    // "你好世界" = 你(3) 好(3) 世(3) 界(3) = 12 bytes
+    const s = "你好世界";
+    // max=4 falls inside 你 (bytes 3-5 are continuation of 好): back up to 3.
+    try std.testing.expectEqual(@as(usize, 3), utf8SafePrefixLen(s, 4));
+    // max=6 is a clean cut between 好 and 世 (byte 6 is 0xE4 lead of 世).
+    try std.testing.expectEqual(@as(usize, 6), utf8SafePrefixLen(s, 6));
+    // max=12 returns the whole string.
+    try std.testing.expectEqual(@as(usize, 12), utf8SafePrefixLen(s, 12));
 }
 
 const StreamState = struct {

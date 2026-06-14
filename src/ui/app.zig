@@ -1452,10 +1452,15 @@ pub const App = struct {
                         .content => |c| {
                             if (debug_stream) std.debug.print("[zeepseek stream] content chunk len={d}\n", .{c.len});
                             state.pushContent(c);
+                            // The chunk slice is allocated by StreamIterator and
+                            // transferred to us; pushContent copies it into the
+                            // queue, so we own the original and must free it.
+                            a.free(c);
                         },
                         .reasoning => |r| {
                             if (debug_stream) std.debug.print("[zeepseek stream] reasoning chunk len={d}\n", .{r.len});
                             state.pushReasoning(r);
+                            a.free(r);
                         },
                     }
                 }

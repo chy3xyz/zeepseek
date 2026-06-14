@@ -235,7 +235,7 @@ pub const DeepSeekStreamClient = struct {
 
         var body_reader_buf: [8192]u8 = undefined;
         const body_reader = response.reader(&body_reader_buf);
-        const response_body = body_reader.allocRemaining(self.allocator, .limited(65536)) catch return null;
+        const response_body = body_reader.allocRemaining(self.allocator, .limited(10 * 1024 * 1024)) catch return null;
         defer self.allocator.free(response_body);
 
         const SyncResponse = struct {
@@ -294,12 +294,14 @@ pub const DeepSeekStreamClient = struct {
             try body.appendSlice(self.allocator, "\"}");
         }
 
-        if (body.items.len > 0 and body.items[body.items.len - 1] != '[') {
-            try body.appendSlice(self.allocator, ",");
+        if (prompt.len > 0) {
+            if (body.items.len > 0 and body.items[body.items.len - 1] != '[') {
+                try body.appendSlice(self.allocator, ",");
+            }
+            try body.appendSlice(self.allocator, "{\"role\":\"user\",\"content\":\"");
+            try escapeJsonString(self.allocator, prompt, &body);
+            try body.appendSlice(self.allocator, "\"}");
         }
-        try body.appendSlice(self.allocator, "{\"role\":\"user\",\"content\":\"");
-        try escapeJsonString(self.allocator, prompt, &body);
-        try body.appendSlice(self.allocator, "\"}");
 
         try body.appendSlice(self.allocator, "],\"tools\":[");
         // Shell tool

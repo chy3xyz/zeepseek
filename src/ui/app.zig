@@ -31,6 +31,7 @@ const ContextManager = @import("../dispatch/context_manager.zig").ContextManager
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
 const reasonix_mod = @import("../cache/reasonix.zig");
 const models_catalog = @import("../providers/models.zig");
+const tokenizer_mod = @import("../utils/tokenizer.zig");
 
 const join = zz.join;
 
@@ -728,6 +729,13 @@ pub const App = struct {
     height: u16,
     cursor_visible: bool,
 
+    // --- Render cache
+    render_generation: u32 = 0,
+    cached_chat_text: ?[]const u8 = null,
+    cached_chat_width: u16 = 0,
+    cached_chat_height: u16 = 0,
+    cached_render_generation: u32 = 0,
+
     // --- Notification toast
     toast: zz.components.Toast,
 
@@ -803,6 +811,11 @@ pub const App = struct {
             .width = 80,
             .height = 24,
             .cursor_visible = true,
+            .render_generation = 0,
+            .cached_chat_text = null,
+            .cached_chat_width = 0,
+            .cached_chat_height = 0,
+            .cached_render_generation = 0,
             .toast = zz.components.Toast.init(ctx.persistent_allocator),
             .theme_manager = theme.ThemeManager.init(ctx.persistent_allocator),
             .styles = undefined,
@@ -866,6 +879,7 @@ pub const App = struct {
         self.search_query.deinit(self.alloc);
         self.pending_data.deinit(self.alloc);
         self.slash_prompt_input.deinit();
+        if (self.cached_chat_text) |c| self.alloc.free(c);
         self.model_picker.deinit();
         self.provider_picker.deinit();
         self.confirm_modal = undefined;
@@ -1264,6 +1278,7 @@ pub const App = struct {
             .timestamp = 0,
             .owns = true,
         }) catch {};
+        self.invalidateRenderCache();
 
         self.text_input.setValue("") catch {};
         self.text_input.cursor = 0;
@@ -1282,6 +1297,43 @@ pub const App = struct {
                 .status = .complete,
             }) catch {};
         }
+    }
+
+    /// Build the context slice for a streaming request from the managed
+    /// CacheFirstLoop context. Keeps the most recent messages that fit within
+    /// 75 % of the model's context window, dropping older messages to avoid
+    /// input-token truncation.
+    fn buildStreamingContext(
+        self: *App,
+        a: std.mem.Allocator,
+        cl: *dispatch_loop.CacheFirstLoop,
+    ) ?[]const stream_client_mod.CtxItem {
+        _ = self;
+        const ctx_max = cl.contextWindow();
+        const budget = (ctx_max * 3) / 4;
+        const messages = cl.context.getMessages();
+
+        var used: usize = 0;
+        var start_idx: usize = messages.len;
+        while (start_idx > 0) {
+            const idx = start_idx - 1;
+            const msg = messages[idx];
+            const msg_tokens = tokenizer_mod.Tokenizer.count(msg.content);
+            if (used + msg_tokens > budget and start_idx < messages.len) break;
+            used += msg_tokens;
+            start_idx = idx;
+        }
+
+        var items: std.ArrayList(stream_client_mod.CtxItem) = .empty;
+        errdefer items.deinit(a);
+        for (messages[start_idx..]) |msg| {
+            items.append(a, .{ .role = msg.role, .content = msg.content }) catch return null;
+        }
+        return items.toOwnedSlice(a) catch null;
+    }
+
+    fn invalidateRenderCache(self: *App) void {
+        self.render_generation +%= 1;
     }
 
     fn startStreaming(self: *App, user_input: []const u8) void {
@@ -1323,23 +1375,33 @@ pub const App = struct {
             }
         }
 
-        // Build context from recent UI messages
-        var ctx_items = std.ArrayList(stream_client_mod.CtxItem).empty;
-        defer ctx_items.deinit(self.alloc);
-        const msg_count = self.messages.items.len - 1; // exclude the empty assistant msg
-        const start: usize = if (msg_count > 20) msg_count - 20 else 0;
-        for (self.messages.items[start..msg_count]) |m| {
-            const role_str: []const u8 = switch (m.role) {
-                .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
-            };
-            ctx_items.append(self.alloc, .{ .role = role_str, .content = m.content }) catch {};
-        }
+        // Build context for the streaming request. Prefer the managed/folded
+        // context maintained by cache_loop; fall back to recent UI messages.
+        const ctx_slice: []const stream_client_mod.CtxItem = blk: {
+            if (self.cache_loop) |cl| {
+                if (self.buildStreamingContext(self.alloc, cl)) |items| {
+                    break :blk items;
+                }
+            }
+            var items: std.ArrayList(stream_client_mod.CtxItem) = .empty;
+            const msg_count = self.messages.items.len - 1; // exclude the empty assistant msg
+            const start: usize = if (msg_count > 20) msg_count - 20 else 0;
+            for (self.messages.items[start..msg_count]) |m| {
+                const role_str: []const u8 = switch (m.role) {
+                    .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
+                };
+                items.append(self.alloc, .{ .role = role_str, .content = m.content }) catch {};
+            }
+            break :blk items.toOwnedSlice(self.alloc) catch &.{};
+        };
+        // When using the managed context, the latest user message is already
+        // included, so pass an empty prompt to avoid duplication.
+        const prompt_to_send: []const u8 = if (self.cache_loop != null) "" else user_input;
 
         const mgr_key = self.provider_mgr.resolveApiKey(self.provider) orelse "";
         const api_key = if (mgr_key.len > 0) mgr_key else self.api_key;
         const model = self.provider_mgr.resolveModel(self.provider);
         const endpoint = self.provider_mgr.resolveEndpoint(self.provider);
-        const ctx_slice = ctx_items.toOwnedSlice(self.alloc) catch &.{};
         const cache_decision = self.cacheDecision();
         const system_prompt = if (self.cache_loop) |cl| cl.prefix.system_prompt else "";
         const reasoning_effort: ?[]const u8 = if (self.cache_loop) |cl|
@@ -1423,7 +1485,7 @@ pub const App = struct {
 
                 state.setDone();
             }
-        }.run, .{ api_key, user_input, ctx_slice, model, endpoint, cache_decision, system_prompt, reasoning_effort, self.alloc, self.io, ss }) catch {
+        }.run, .{ api_key, prompt_to_send, ctx_slice, model, endpoint, cache_decision, system_prompt, reasoning_effort, self.alloc, self.io, ss }) catch {
             ss.setError("Failed to spawn thread");
             return;
         };
@@ -1729,6 +1791,7 @@ pub const App = struct {
             }) catch return;
             self.streaming_idx = idx;
         }
+        self.invalidateRenderCache();
         if (self.auto_scroll) self.scroll_offset = 0;
     }
 
@@ -1741,6 +1804,7 @@ pub const App = struct {
                 self.messages.items[idx].thinking = new;
             }
         }
+        self.invalidateRenderCache();
     }
 
     fn onStreamDone(self: *App) void {
@@ -2188,6 +2252,7 @@ pub const App = struct {
             }
         }
         self.auto_scroll = true;
+        self.invalidateRenderCache();
     }
 
     fn jumpToMatch(self: *App) void {
@@ -2226,6 +2291,7 @@ pub const App = struct {
         self.turn = 0;
         if (self.cache_loop) |cl| cl.context.clear();
         if (self.ctx_mgr) |cm| cm.clear();
+        self.invalidateRenderCache();
     }
 
     /// Compact older messages to reduce token usage.
@@ -2241,6 +2307,7 @@ pub const App = struct {
                 .content = "Not enough context to compact (need >{d} messages).",
                 .owns = false,
             }) catch {};
+            self.invalidateRenderCache();
             return;
         }
 
@@ -2255,6 +2322,7 @@ pub const App = struct {
                 .content = "Not enough conversation history to compact.",
                 .owns = false,
             }) catch {};
+            self.invalidateRenderCache();
             return;
         }
 
@@ -2335,6 +2403,7 @@ pub const App = struct {
             .content = note,
             .owns = true,
         }) catch {};
+        self.invalidateRenderCache();
     }
 
     // ═════════════════════════════════════════════════════════════════════
@@ -2366,8 +2435,24 @@ pub const App = struct {
         const footer_text = footer_buf.toOwnedSlice(a) catch "";
 
         // Build body: chat (left) + sidebar (right) using join.horizontal
-        const chat_text = self.renderClaudeChat(a, chat_w, body_h);
-        defer a.free(chat_text);
+        const need_render = self.cached_chat_text == null or
+            self.cached_chat_width != chat_w or
+            self.cached_chat_height != body_h or
+            self.cached_render_generation != self.render_generation;
+        const chat_text = if (need_render) blk: {
+            const fresh = self.renderClaudeChat(a, chat_w, body_h);
+            const persistent = self.alloc.dupe(u8, fresh) catch {
+                break :blk fresh;
+            };
+            if (self.cached_chat_text) |old| self.alloc.free(old);
+            const mutable = @constCast(self);
+            mutable.cached_chat_text = persistent;
+            mutable.cached_chat_width = chat_w;
+            mutable.cached_chat_height = body_h;
+            mutable.cached_render_generation = self.render_generation;
+            a.free(fresh);
+            break :blk persistent;
+        } else self.cached_chat_text.?;
         const chat_clipped = clipFromBottom(a, chat_text, body_h, self.scroll_offset) catch chat_text;
         defer if (chat_clipped.ptr != chat_text.ptr) a.free(chat_clipped);
         const sidebar_text = self.renderClaudeSidebar(a, sidebar_w, body_h);

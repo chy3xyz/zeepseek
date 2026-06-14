@@ -318,7 +318,7 @@ pub const DeepSeekStreamClient = struct {
         try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}},");
         // Web scrape
         try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_scrape\",\"description\":\"Fetch and extract content from a URL.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}");
-        try body.appendSlice(self.allocator, "],\"tool_choice\":\"none\",\"max_tokens\":4096");
+        try body.appendSlice(self.allocator, "],\"tool_choice\":\"none\",\"max_tokens\":65536");
 
         if (reasoning_effort) |effort| {
             try body.appendSlice(self.allocator, ",\"reasoning_effort\":\"");

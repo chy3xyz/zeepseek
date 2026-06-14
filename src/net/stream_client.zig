@@ -94,6 +94,7 @@ pub const DeepSeekStreamClient = struct {
 
         const max_tokens = maxTokensForModel(model);
         const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, true, max_tokens);
+        defer self.allocator.free(body);
 
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
         defer self.allocator.free(auth_value);

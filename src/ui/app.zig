@@ -868,12 +868,12 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
-        // Free stream state
-        if (self.stream_state) |ss| {
-            ss.deinit();
-            self.alloc.destroy(ss);
-        }
-        if (self.stream_thread) |t| t.join();
+        // Detach the streaming thread instead of joining. The thread may be
+        // blocked on a network read; joining it would hang the whole process
+        // shutdown. The thread's resources are reclaimed when the process
+        // exits. The stream state is intentionally leaked for the same reason.
+        self.stream_thread = null;
+        self.stream_state = null;
 
         // Free messages and their content
         self.clearMessages();
@@ -1374,12 +1374,20 @@ pub const App = struct {
     }
 
     fn startStreaming(self: *App, user_input: []const u8) void {
-        // Clean up previous stream state
+        // Abandon any previous in-flight stream rather than joining it. The
+        // streaming thread can stay blocked on a network read for the entire
+        // session if the upstream is slow or stalled, and join() would hang
+        // the main thread forever (making the TUI appear frozen). The old
+        // thread keeps running with the leaked state; the new stream gets a
+        // fresh state and is independent. The orphan thread is killed when
+        // the process exits.
         if (self.stream_state) |ss| {
-            ss.deinit();
-            self.alloc.destroy(ss);
+            // Mark the abandoned state as "done" so any future poll (there
+            // isn't one, but defensive) won't try to drain it.
+            ss.done.store(true, .release);
+            self.stream_state = null;
         }
-        if (self.stream_thread) |t| t.join();
+        self.stream_thread = null;
 
         // Create new stream state
         const ss = self.alloc.create(StreamState) catch return;

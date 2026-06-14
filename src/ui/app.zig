@@ -504,6 +504,17 @@ pub const Theme = struct {
 // Streaming state (thread-safe bridge between background thread and UI)
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Largest n <= max (and n <= s.len) such that s[0..n] is a valid UTF-8
+/// prefix. Backs up over any UTF-8 continuation bytes (10xxxxxx) at the
+/// boundary so we never cut a multi-byte sequence in the middle. Used by
+/// the rate-limited drain to avoid splitting a CJK character across two
+/// display ticks.
+fn utf8SafePrefixLen(s: []const u8, max: usize) usize {
+    var n = @min(max, s.len);
+    while (n > 0 and (s[n] & 0xC0) == 0x80) n -= 1;
+    return n;
+}
+
 const StreamState = struct {
     content_queue: std.ArrayList(u8) = .empty,
     reasoning_queue: std.ArrayList(u8) = .empty,
@@ -577,21 +588,31 @@ const StreamState = struct {
         self.done.store(true, .release);
     }
 
-    fn drainContent(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
+    fn drainContent(self: *StreamState, alloc: std.mem.Allocator, max_bytes: usize) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.content_queue.items.len == 0) return null;
-        const result = alloc.dupe(u8, self.content_queue.items) catch return null;
-        self.content_queue.clearRetainingCapacity();
+        const n = utf8SafePrefixLen(self.content_queue.items, max_bytes);
+        if (n == 0) return null;
+        const result = alloc.dupe(u8, self.content_queue.items[0..n]) catch return null;
+        var removed: usize = 0;
+        while (removed < n) : (removed += 1) {
+            _ = self.content_queue.orderedRemove(0);
+        }
         return result;
     }
 
-    fn drainReasoning(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
+    fn drainReasoning(self: *StreamState, alloc: std.mem.Allocator, max_bytes: usize) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.reasoning_queue.items.len == 0) return null;
-        const result = alloc.dupe(u8, self.reasoning_queue.items) catch return null;
-        self.reasoning_queue.clearRetainingCapacity();
+        const n = utf8SafePrefixLen(self.reasoning_queue.items, max_bytes);
+        if (n == 0) return null;
+        const result = alloc.dupe(u8, self.reasoning_queue.items[0..n]) catch return null;
+        var removed: usize = 0;
+        while (removed < n) : (removed += 1) {
+            _ = self.reasoning_queue.orderedRemove(0);
+        }
         return result;
     }
 
@@ -842,7 +863,7 @@ pub const App = struct {
         };
         // Try loading saved API key from disk
         self.loadSavedApiKey();
-        self.init_batch = .{ .enter_alt_screen, zz.Cmd(Msg).everyMs(100) };
+        self.init_batch = .{ .enter_alt_screen, zz.Cmd(Msg).everyMs(30) };
         return .{ .batch = &self.init_batch };
     }
 
@@ -1559,14 +1580,23 @@ pub const App = struct {
     fn pollStream(self: *App) void {
         const ss = self.stream_state orelse return;
 
+        // Rate-limit the display drain so fast-streaming models (e.g.
+        // deepseek-v4-flash) don't dump the entire response into the UI in
+        // a single tick. We reveal a small UTF-8-safe chunk per tick; the
+        // queue keeps accumulating in the background and is fully drained
+        // by the time streaming completes, so the final content is correct.
+        // Throughput = DRAIN_BYTES_PER_TICK / TICK_MS ≈ 30/30ms = 1KB/s,
+        // which reads like natural typing.
+        const DRAIN_BYTES_PER_TICK: usize = 30;
+
         // Drain content
-        if (ss.drainContent(self.alloc)) |content| {
+        if (ss.drainContent(self.alloc, DRAIN_BYTES_PER_TICK)) |content| {
             defer self.alloc.free(content);
             self.onStreamContent(content);
         }
 
         // Drain reasoning
-        if (ss.drainReasoning(self.alloc)) |reasoning| {
+        if (ss.drainReasoning(self.alloc, DRAIN_BYTES_PER_TICK)) |reasoning| {
             defer self.alloc.free(reasoning);
             self.onStreamReasoning(reasoning);
         }
@@ -1585,7 +1615,7 @@ pub const App = struct {
                 }
                 self.alloc.free(fb);
                 ss.fallback_content = null;
-                if (ss.drainContent(self.alloc)) |leftover| self.alloc.free(leftover);
+                if (ss.drainContent(self.alloc, std.math.maxInt(usize))) |leftover| self.alloc.free(leftover);
             }
 
             // Check for tool calls BEFORE marking done

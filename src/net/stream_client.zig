@@ -279,9 +279,11 @@ pub const StreamIterator = struct {
             if (std.mem.indexOfScalar(u8, self.line_accumulator.items, '\n')) |newline_idx| {
                 const line = self.line_accumulator.items[0 .. newline_idx + 1];
                 const remainder = self.line_accumulator.items[newline_idx + 1 ..];
+                const remainder_copy = try self.allocator.dupe(u8, remainder);
+                defer self.allocator.free(remainder_copy);
                 self.line_accumulator.clearRetainingCapacity();
-                if (remainder.len > 0) {
-                    try self.line_accumulator.appendSlice(self.allocator, remainder);
+                if (remainder_copy.len > 0) {
+                    try self.line_accumulator.appendSlice(self.allocator, remainder_copy);
                 }
                 const trimmed = std.mem.trim(u8, line, "\r\n");
                 if (trimmed.len == 0) continue;

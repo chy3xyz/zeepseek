@@ -781,7 +781,7 @@ pub const App = struct {
             .search_query = .empty,
             .search_cursor = 0,
             .help_modal = zz.components.Modal.info("Keybindings", ""),
-            .detail_modal = zz.components.Modal.info("Message Detail", ""),
+            .detail_modal = zz.components.Modal.init(),
             .detail_idx = 0,
             .show_subagents = false,
             .subagents = .empty,
@@ -1310,7 +1310,10 @@ pub const App = struct {
     ) ?[]const stream_client_mod.CtxItem {
         _ = self;
         const ctx_max = cl.contextWindow();
-        const budget = (ctx_max * 3) / 4;
+        // Reserve headroom for the model's output tokens plus a safety margin.
+        // Our tokenizer underestimates real token counts, so keep extra margin.
+        const output_reserve: u32 = 8192 + 2048;
+        const budget = if (ctx_max > output_reserve) ctx_max - output_reserve else ctx_max / 2;
         const messages = cl.context.getMessages();
 
         var used: usize = 0;
@@ -2711,6 +2714,12 @@ pub const App = struct {
         const m = self.messages.items[self.detail_idx];
         self.detail_modal.title = std.fmt.allocPrint(self.alloc, "Message Detail ({d}/{d})", .{ self.detail_idx + 1, self.messages.items.len }) catch "Message Detail";
         self.detail_modal.body = m.content;
+
+        // Rebuild buttons so Copy always targets the current message.
+        self.detail_modal.button_count = 0;
+        self.detail_modal.selected_button = 0;
+        self.detail_modal.addButton("Copy", .{ .char = 'c' });
+        self.detail_modal.addButton("Close", .enter);
     }
 
     // ── Claude-style header: border box with title + model info ──

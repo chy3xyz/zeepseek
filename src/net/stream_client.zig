@@ -92,7 +92,8 @@ pub const DeepSeekStreamClient = struct {
         defer self.allocator.free(completions_uri);
         const uri = std.Uri.parse(completions_uri) catch return error.InvalidUri;
 
-        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, true);
+        const max_tokens = maxTokensForModel(model);
+        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, true, max_tokens);
 
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
         defer self.allocator.free(auth_value);
@@ -191,7 +192,8 @@ pub const DeepSeekStreamClient = struct {
         defer self.allocator.free(completions_uri);
         const uri = std.Uri.parse(completions_uri) catch return error.InvalidUri;
 
-        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, false);
+        const max_tokens = maxTokensForModel(model);
+        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, false, max_tokens);
         defer self.allocator.free(body);
 
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
@@ -251,6 +253,26 @@ pub const DeepSeekStreamClient = struct {
         return try self.allocator.dupe(u8, parsed.value.choices[0].message.content);
     }
 
+    fn isReasoningModel(model: []const u8) bool {
+        if (std.mem.eql(u8, model, "deepseek-reasoner")) return true;
+        if (std.mem.eql(u8, model, "deepseek-coder")) return true;
+        if (std.mem.eql(u8, model, "deepseek-r1")) return true;
+        if (std.mem.eql(u8, model, "deepseek-v4-pro")) return true;
+        if (std.mem.eql(u8, model, "deepseek-v4-flash")) return true;
+        return false;
+    }
+
+    /// Model-specific output token limit. The standard DeepSeek Chat API
+    /// defaults to 4096 output tokens; only reasoning / beta models should
+    /// request more. Keep a conservative default for unknown models.
+    fn maxTokensForModel(model: []const u8) u32 {
+        if (isReasoningModel(model)) return 8192;
+        if (std.mem.startsWith(u8, model, "deepseek-")) return 4096;
+        if (std.mem.eql(u8, model, "gpt-4o")) return 4096;
+        if (std.mem.eql(u8, model, "gpt-4o-mini")) return 4096;
+        return 4096;
+    }
+
     fn buildRequestBody(
         self: *DeepSeekStreamClient,
         prompt: []const u8,
@@ -260,6 +282,7 @@ pub const DeepSeekStreamClient = struct {
         system_prompt: []const u8,
         reasoning_effort: ?[]const u8,
         stream_param: bool,
+        max_tokens: u32,
     ) ![]u8 {
         var body = try std.ArrayList(u8).initCapacity(self.allocator, 2048);
         errdefer body.deinit(self.allocator);
@@ -303,31 +326,31 @@ pub const DeepSeekStreamClient = struct {
             try body.appendSlice(self.allocator, "\"}");
         }
 
-        try body.appendSlice(self.allocator, "],\"tools\":[");
-        // Shell tool
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"shell\",\"description\":\"Execute a shell command. Returns stdout/stderr.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute\"}},\"required\":[\"command\"]}}},");
-        // File read
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"file_read\",\"description\":\"Read contents of a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path\"}},\"required\":[\"path\"]}}},");
-        // File write
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"file_write\",\"description\":\"Write content to a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},");
-        // File edit
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"file_edit\",\"description\":\"Edit a file by replacing oldString with newString.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"}},\"required\":[\"path\",\"oldString\",\"newString\"]}}},");
-        // Git status
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"git_status\",\"description\":\"Show git repository status.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"}},\"required\":[]}}},");
-        // Git commit
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"git_commit\",\"description\":\"Create a git commit.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"message\"]}}},");
-        // Web search
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}},");
-        // Web scrape
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_scrape\",\"description\":\"Fetch and extract content from a URL.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}");
-        try body.appendSlice(self.allocator, "],\"tool_choice\":\"none\",\"max_tokens\":65536");
+        // Note: tools are intentionally omitted from the streaming request.
+        // The previous body hard-coded tool_choice:"none" while still sending
+        // a large tools array; several providers (including DeepSeek) appear
+        // to truncate streaming responses when tools are present but disabled.
+        // Tool calling should be re-enabled later with tool_choice:"auto" and
+        // proper tool-result handling rather than left in a disabled state.
+        var max_tokens_buf: [64]u8 = undefined;
+        const max_tokens_str = std.fmt.bufPrint(&max_tokens_buf, "],\"max_tokens\":{d}", .{max_tokens}) catch return error.AllocationFailed;
+        try body.appendSlice(self.allocator, max_tokens_str);
 
+        // reasoning_effort is only valid for reasoning models; sending it for
+        // standard chat models can cause the API to behave unpredictably.
         if (reasoning_effort) |effort| {
-            try body.appendSlice(self.allocator, ",\"reasoning_effort\":\"");
-            try body.appendSlice(self.allocator, effort);
-            try body.appendSlice(self.allocator, "\"}");
-        } else {
-            try body.appendSlice(self.allocator, "}");
+            if (isReasoningModel(model)) {
+                try body.appendSlice(self.allocator, ",\"reasoning_effort\":\"");
+                try body.appendSlice(self.allocator, effort);
+                try body.appendSlice(self.allocator, "\"");
+            }
+        }
+
+        try body.appendSlice(self.allocator, "}");
+
+        if (std.c.getenv("ZEEPSEEK_DEBUG_STREAM") != null) {
+            const preview_len = @min(body.items.len, 800);
+            std.debug.print("[zeepseek stream] request body ({d} bytes): {s}\n", .{ body.items.len, body.items[0..preview_len] });
         }
 
         return body.toOwnedSlice(self.allocator);
@@ -350,7 +373,7 @@ pub const StreamIterator = struct {
     reasoning_buffer: []const u8 = &.{},
     tool_call_json: std.ArrayList(u8),
     has_tool_calls: bool = false,
-        finish_reason: []const u8 = "",
+    finish_reason: []const u8 = "",
 
     pub fn nextChunk(self: *StreamIterator) !?StreamChunk {
         if (self.done and self.content_buffer.len == 0 and self.reasoning_buffer.len == 0) return null;
@@ -1191,4 +1214,119 @@ test "extractContentAndReasoning parses Chinese content" {
         if (extracted.reasoning.len > 0) alloc.free(extracted.reasoning);
     }
     try std.testing.expectEqualStrings("你好，有什么可以帮你的吗？", extracted.content);
+}
+
+
+test "buildRequestBody omits tools and reasoning_effort for deepseek-chat" {
+    const alloc = std.testing.allocator;
+    var client = DeepSeekStreamClient{
+        .allocator = alloc,
+        .io = undefined,
+        .http_client = undefined,
+    };
+
+    const context = &[_]CtxItem{
+        .{ .role = "system", .content = "You are Zeep." },
+        .{ .role = "user", .content = "Hello" },
+    };
+    const body = try client.buildRequestBody(
+        "",
+        context,
+        "deepseek-chat",
+        .none,
+        "You are Zeep.",
+        "high",
+        true,
+        4096,
+    );
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"deepseek-chat\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"stream\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":4096") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tools\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_choice\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\"") == null);
+}
+
+test "buildRequestBody includes reasoning_effort for reasoning models" {
+    const alloc = std.testing.allocator;
+    var client = DeepSeekStreamClient{
+        .allocator = alloc,
+        .io = undefined,
+        .http_client = undefined,
+    };
+
+    const context = &[_]CtxItem{
+        .{ .role = "user", .content = "Hello" },
+    };
+    const body = try client.buildRequestBody(
+        "",
+        context,
+        "deepseek-reasoner",
+        .none,
+        "",
+        "high",
+        true,
+        8192,
+    );
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"model\":\"deepseek-reasoner\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"max_tokens\":8192") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"reasoning_effort\":\"high\"") != null);
+}
+
+test "updateFinishReason parses length and stop" {
+    const alloc = std.testing.allocator;
+    var it = StreamIterator{
+        .allocator = alloc,
+        .reader = undefined,
+        .buffer = std.ArrayList(u8).empty,
+        .line_accumulator = std.ArrayList(u8).empty,
+        .transfer_buffer = &.{},
+        .tool_call_json = std.ArrayList(u8).empty,
+    };
+    defer it.deinit();
+
+    it.updateFinishReason("{\"choices\":[{\"finish_reason\":\"length\"}]}");
+    try std.testing.expectEqualStrings("length", it.finish_reason);
+
+    alloc.free(it.finish_reason);
+    it.finish_reason = "";
+
+    it.updateFinishReason("{\"choices\":[{\"finish_reason\":\"stop\"}]}");
+    try std.testing.expectEqualStrings("stop", it.finish_reason);
+}
+
+test "extractContentAndReasoning handles multiple content chunks" {
+    const alloc = std.testing.allocator;
+    var it = StreamIterator{
+        .allocator = alloc,
+        .reader = undefined,
+        .buffer = std.ArrayList(u8).empty,
+        .line_accumulator = std.ArrayList(u8).empty,
+        .transfer_buffer = &.{},
+        .tool_call_json = std.ArrayList(u8).empty,
+    };
+
+    const chunks = [_][]const u8{
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"},\"finish_reason\":null}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\" world\"},\"finish_reason\":null}]}",
+        "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}",
+    };
+
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(alloc);
+
+    for (chunks) |json| {
+        const extracted = try it.extractContentAndReasoning(json);
+        defer {
+            if (extracted.content.len > 0) alloc.free(extracted.content);
+            if (extracted.reasoning.len > 0) alloc.free(extracted.reasoning);
+        }
+        try result.appendSlice(alloc, extracted.content);
+    }
+
+    try std.testing.expectEqualStrings("Hello world!", result.items);
 }

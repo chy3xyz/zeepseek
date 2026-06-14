@@ -350,6 +350,7 @@ pub const StreamIterator = struct {
     reasoning_buffer: []const u8 = &.{},
     tool_call_json: std.ArrayList(u8),
     has_tool_calls: bool = false,
+        finish_reason: []const u8 = "",
 
     pub fn nextChunk(self: *StreamIterator) !?StreamChunk {
         if (self.done and self.content_buffer.len == 0 and self.reasoning_buffer.len == 0) return null;
@@ -404,6 +405,7 @@ pub const StreamIterator = struct {
                 }
 
                 const extracted = try self.extractContentAndReasoning(data_value);
+                self.updateFinishReason(data_value);
                 if (extracted.reasoning.len > 0) {
                     self.reasoning_buffer = extracted.reasoning;
                 }
@@ -414,6 +416,24 @@ pub const StreamIterator = struct {
                     return self.nextChunk();
                 }
                 continue;
+            }
+        }
+    }
+
+    fn updateFinishReason(self: *StreamIterator, json_data: []const u8) void {
+        const key = "\"finish_reason\"";
+        if (std.mem.indexOf(u8, json_data, key)) |idx| {
+            var i = idx + key.len;
+            while (i < json_data.len and (json_data[i] == ' ' or json_data[i] == ':')) i += 1;
+            if (i < json_data.len and json_data[i] == '"') {
+                i += 1;
+                const start = i;
+                while (i < json_data.len and json_data[i] != '"') i += 1;
+                const val = json_data[start..i];
+                if (val.len > 0) {
+                    if (self.finish_reason.len > 0) self.allocator.free(self.finish_reason);
+                    self.finish_reason = self.allocator.dupe(u8, val) catch self.finish_reason;
+                }
             }
         }
     }
@@ -526,6 +546,7 @@ pub const StreamIterator = struct {
     pub fn deinit(self: *StreamIterator) void {
         if (self.content_buffer.len > 0) self.allocator.free(self.content_buffer);
         if (self.reasoning_buffer.len > 0) self.allocator.free(self.reasoning_buffer);
+        if (self.finish_reason.len > 0) self.allocator.free(self.finish_reason);
         self.allocator.free(self.transfer_buffer);
         self.buffer.deinit(self.allocator);
         self.line_accumulator.deinit(self.allocator);

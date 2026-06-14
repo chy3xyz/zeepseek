@@ -1467,9 +1467,11 @@ pub const App = struct {
 
                 // Fallback for the DeepSeek streaming endpoint, which sometimes
                 // truncates long responses after a few dozen tokens. If we got
-                // very little content and no tool calls, retry synchronously.
-                if (state.total_content_len < 120 and !stream.has_tool_calls) {
-                    if (debug_stream) std.debug.print("[zeepseek stream] streaming response short ({d} bytes), trying sync fallback\n", .{state.total_content_len});
+                // very little content, or the API explicitly reported a length
+                // stop, retry synchronously.
+                const was_truncated = std.mem.eql(u8, stream.finish_reason, "length");
+                if ((state.total_content_len < 120 or was_truncated) and !stream.has_tool_calls) {
+                    if (debug_stream) std.debug.print("[zeepseek stream] streaming response short ({d} bytes, finish_reason={s}), trying sync fallback\n", .{ state.total_content_len, stream.finish_reason });
                     const fallback = client.sendMessageSync(api_k, prompt, ctx, mdl, cache_d, sys, reason) catch |err| blk: {
                         if (debug_stream) std.debug.print("[zeepseek stream] sync fallback failed: {s}\n", .{@errorName(err)});
                         break :blk null;

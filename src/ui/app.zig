@@ -1563,9 +1563,18 @@ pub const App = struct {
                 // truncates long responses after a few dozen tokens. If we got
                 // very little content, or the API explicitly reported a length
                 // stop, retry synchronously.
+                //
+                // Only the truncation signal triggers a sync retry. The
+                // previous "or total_content_len < 120" clause was added when
+                // DeepSeek Chat was returning ~20 chars due to a bad
+                // max_tokens request; that bug is fixed by
+                // maxTokensForModel, but the length guard was silently
+                // replacing every short (< 120 byte) reply with a
+                // single-shot full copy, which bypasses the rate-limited
+                // drain and makes the typing effect impossible to see.
                 const was_truncated = std.mem.eql(u8, stream.finish_reason, "length");
-                if ((state.total_content_len < 120 or was_truncated) and !stream.has_tool_calls) {
-                    if (debug_stream) std.debug.print("[zeepseek stream] streaming response short ({d} bytes, finish_reason={s}), trying sync fallback\n", .{ state.total_content_len, stream.finish_reason });
+                if (was_truncated and !stream.has_tool_calls) {
+                    if (debug_stream) std.debug.print("[zeepseek stream] streaming response truncated (finish_reason={s}, {d} bytes), trying sync fallback\n", .{ stream.finish_reason, state.total_content_len });
                     const fallback = client.sendMessageSync(api_k, prompt, ctx, mdl, cache_d, sys, reason) catch |err| blk: {
                         if (debug_stream) std.debug.print("[zeepseek stream] sync fallback failed: {s}\n", .{@errorName(err)});
                         break :blk null;

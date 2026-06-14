@@ -33,6 +33,7 @@ const _exec_policy = @import("utils/exec_policy.zig");
 const _tool_registry = @import("utils/tool_registry.zig");
 const _notifications = @import("utils/notifications.zig");
 const _sandbox = @import("utils/sandbox.zig");
+const _clipboard = @import("utils/clipboard.zig");
 const _reasonix = @import("cache/reasonix.zig");
 const _context_manager = @import("dispatch/context_manager.zig");
 const _cache_first_loop = @import("dispatch/cache_first_loop.zig");

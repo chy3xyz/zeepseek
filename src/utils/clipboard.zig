@@ -1,3 +1,11 @@
+//! Cross-platform clipboard writer.
+//!
+//! Provides a single entry point, `copyText`, that writes UTF-8 text to the
+//! system clipboard by spawning the platform's standard external tool:
+//! - macOS:   pbcopy
+//! - Linux:   wl-copy (Wayland) or xclip (X11)
+//! - Windows: clip (via cmd /c clip)
+
 const std = @import("std");
 
 pub const ClipboardError = error{
@@ -10,73 +18,73 @@ pub const ClipboardError = error{
 /// Linux Wayland: wl-copy
 /// Linux X11: xclip -selection clipboard
 /// Windows: clip (via cmd /c clip)
-pub fn copyText(allocator: std.mem.Allocator, text: []const u8) ClipboardError!void {
-    const argv = clipboardArgv() orelse return error.ClipboardCommandNotFound;
+pub fn copyText(allocator: std.mem.Allocator, io: std.Io, text: []const u8) ClipboardError!void {
+    const argv = clipboardArgv(allocator) orelse return error.ClipboardCommandNotFound;
 
-    var child = std.process.Child.init(argv, allocator);
-    child.stdin_behavior = .Pipe;
-    child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
-
-    child.spawn() catch return error.ClipboardCopyFailed;
+    var child = std.process.spawn(io, .{
+        .argv = argv,
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    }) catch return error.ClipboardCopyFailed;
 
     if (child.stdin) |stdin| {
-        _ = stdin.write(text) catch {};
-        stdin.close();
+        std.Io.File.writeStreamingAll(stdin, io, text) catch return error.ClipboardCopyFailed;
+        std.Io.File.close(stdin, io);
         child.stdin = null;
     }
 
-    const term = child.wait() catch return error.ClipboardCopyFailed;
-    switch (term) {
-        .Exited => |code| if (code != 0) return error.ClipboardCopyFailed,
-        .Signal, .Stopped, .Unknown => return error.ClipboardCopyFailed,
-    }
+    const term = std.process.Child.wait(&child, io) catch return error.ClipboardCopyFailed;
+    if (!term.success()) return error.ClipboardCopyFailed;
 }
 
 /// Select the platform-appropriate clipboard command argv, or null if no
 /// supported tool can be located.
-fn clipboardArgv() ?[]const []const u8 {
+fn clipboardArgv(allocator: std.mem.Allocator) ?[]const []const u8 {
     const target = @import("builtin").target;
     return switch (target.os.tag) {
-        .macos => if (commandExists("pbcopy")) &.{ "pbcopy" } else null,
-        .linux => detectLinuxClipboardTool(),
-        .windows => if (commandExists("cmd")) &.{ "cmd", "/c", "clip" } else null,
+        .macos => if (commandExists(allocator, "pbcopy")) &.{ "pbcopy" } else null,
+        .linux => detectLinuxClipboardTool(allocator),
+        .windows => if (commandExists(allocator, "cmd")) &.{ "cmd", "/c", "clip" } else null,
         else => null,
     };
 }
 
 /// At runtime, prefer wl-copy if WAYLAND_DISPLAY is set and the binary exists,
 /// otherwise fall back to xclip. This avoids hard-coding the session type.
-fn detectLinuxClipboardTool() ?[]const []const u8 {
+fn detectLinuxClipboardTool(allocator: std.mem.Allocator) ?[]const []const u8 {
+    const has_wl_copy = commandExists(allocator, "wl-copy");
+    const has_xclip = commandExists(allocator, "xclip");
     const wayland_display = std.c.getenv("WAYLAND_DISPLAY");
-    if (wayland_display != null and commandExists("wl-copy")) {
+    if (wayland_display != null and has_wl_copy) {
         return &.{ "wl-copy" };
     }
-    if (commandExists("xclip")) {
+    if (has_xclip) {
         return &.{ "xclip", "-selection", "clipboard" };
     }
-    if (commandExists("wl-copy")) {
+    if (has_wl_copy) {
         return &.{ "wl-copy" };
     }
     return null;
 }
 
-fn commandExists(name: []const u8) bool {
+fn commandExists(allocator: std.mem.Allocator, name: []const u8) bool {
     const path = std.c.getenv("PATH") orelse return false;
     const path_slice = std.mem.sliceTo(path, 0);
 
     var it = std.mem.splitScalar(u8, path_slice, ':');
     while (it.next()) |dir| {
         if (dir.len == 0) continue;
-        const full_path = std.mem.concat(
-            std.heap.page_allocator,
-            u8,
-            &.{ dir, &.{std.fs.path.sep}, name, &.{0} },
-        ) catch continue;
-        defer std.heap.page_allocator.free(full_path);
+        const full_path = std.fs.path.join(allocator, &.{ dir, name }) catch continue;
+        defer allocator.free(full_path);
+
+        // std.c.open requires a null-terminated path; append a NUL byte.
+        const path_z = allocator.allocSentinel(u8, full_path.len, 0) catch continue;
+        defer allocator.free(path_z);
+        @memcpy(path_z, full_path);
 
         const fd = std.c.open(
-            @ptrCast(full_path.ptr),
+            @ptrCast(path_z.ptr),
             .{ .ACCMODE = .RDONLY },
             @as(std.c.mode_t, 0),
         );
@@ -88,22 +96,11 @@ fn commandExists(name: []const u8) bool {
     return false;
 }
 
-test "clipboard command selection for current target" {
-    const target = @import("builtin").target;
-    const tool = switch (target.os.tag) {
-        .macos => "pbcopy",
-        .linux => if (std.c.getenv("WAYLAND_DISPLAY") != null) "wl-copy" else "xclip",
-        .windows => "clip",
-        else => return,
-    };
-    try std.testing.expect(tool.len > 0);
-}
-
 test "linux clipboard tool detection returns a known tool" {
     const target = @import("builtin").target;
     if (target.os.tag != .linux) return;
 
-    const argv = detectLinuxClipboardTool();
+    const argv = detectLinuxClipboardTool(std.testing.allocator);
     try std.testing.expect(argv != null);
     try std.testing.expect(argv.?.len > 0);
     const first = argv.?[0];
@@ -115,7 +112,7 @@ test "macos clipboard argv selects pbcopy" {
     const target = @import("builtin").target;
     if (target.os.tag != .macos) return;
 
-    const argv = clipboardArgv();
+    const argv = clipboardArgv(std.testing.allocator);
     try std.testing.expect(argv != null);
     try std.testing.expect(argv.?.len > 0);
     try std.testing.expectEqualStrings("pbcopy", argv.?[0]);

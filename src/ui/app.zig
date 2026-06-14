@@ -32,6 +32,7 @@ const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePref
 const reasonix_mod = @import("../cache/reasonix.zig");
 const models_catalog = @import("../providers/models.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
+const clipboard = @import("../utils/clipboard.zig");
 
 const join = zz.join;
 
@@ -687,6 +688,7 @@ pub const App = struct {
     detail_modal: zz.components.Modal,
     detail_idx: usize,
     detail_title_buf: ?[]u8,
+    detail_copy_btn_idx: usize,
 
     // --- Sub-agent panel
     show_subagents: bool,
@@ -785,6 +787,7 @@ pub const App = struct {
             .detail_modal = zz.components.Modal.init(),
             .detail_idx = 0,
             .detail_title_buf = null,
+            .detail_copy_btn_idx = 0,
             .show_subagents = false,
             .subagents = .empty,
             .stream_state = null,
@@ -892,6 +895,7 @@ pub const App = struct {
             d.deinit(self.alloc);
             self.slash_output_data = null;
         }
+        if (self.detail_title_buf) |t| self.alloc.free(t);
 
         // Free subsystems
         if (self.subsystems_initialized) {
@@ -1152,8 +1156,7 @@ pub const App = struct {
 
         // --- Detail overlay (Modal)
         if (self.detail_modal.isVisible()) {
-            // Left/Right navigate between messages (suppresses the modal's
-            // button-focus handling for these keys so we don't fight it).
+            // Left/Right navigate between messages while the modal stays open.
             if (k == .left) {
                 if (self.detail_idx > 0) {
                     self.detail_idx -= 1;
@@ -1168,8 +1171,20 @@ pub const App = struct {
                 }
                 return .none;
             }
-            // All other keys go to the modal (Esc/Enter/Tab/shortcut/c).
+            const was_visible = self.detail_modal.isVisible();
             _ = self.detail_modal.handleKey(key);
+            // If the modal was just dismissed by this key, react to its result.
+            if (was_visible and !self.detail_modal.isVisible()) {
+                if (self.detail_modal.result) |res| {
+                    switch (res) {
+                        .button_pressed => |idx| {
+                            if (idx == self.detail_copy_btn_idx) self.copyDetailContentToClipboard();
+                        },
+                        .dismissed => {},
+                    }
+                    self.detail_modal.result = null;
+                }
+            }
             return .none;
         }
 
@@ -2712,7 +2727,7 @@ pub const App = struct {
             \\Ctrl+N      Toggle thinking display
             \\Ctrl+S      Toggle sub-agent panel
             \\Ctrl+T      Cycle color theme
-            \\Ctrl+O      Message detail
+            \\Ctrl+O      Message detail (Copy / Close)
             \\Enter       Send message
             \\Shift+Enter Newline in input
             \\↑/↓         Scroll / navigate
@@ -2747,8 +2762,29 @@ pub const App = struct {
         // Rebuild buttons so Copy always targets the current message.
         self.detail_modal.button_count = 0;
         self.detail_modal.selected_button = 0;
+        self.detail_copy_btn_idx = self.detail_modal.button_count;
         self.detail_modal.addButton("Copy", .{ .char = 'c' });
         self.detail_modal.addButton("Close", .enter);
+    }
+
+    fn copyDetailContentToClipboard(self: *App) void {
+        if (self.detail_idx >= self.messages.items.len) return;
+        const content = self.messages.items[self.detail_idx].content;
+        if (content.len == 0) {
+            self.setNotification("Nothing to copy");
+            return;
+        }
+
+        clipboard.copyText(self.alloc, self.io, content) catch |err| {
+            const msg = switch (err) {
+                error.ClipboardCommandNotFound => "Clipboard tool not installed (pbcopy/xclip/wl-copy/clip)",
+                error.ClipboardCopyFailed => "Failed to copy to clipboard",
+            };
+            self.setNotification(msg);
+            return;
+        };
+
+        self.setNotification("Copied to clipboard");
     }
 
     // ── Claude-style header: border box with title + model info ──
@@ -3531,6 +3567,7 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.detail_modal = zz.components.Modal.init();
     app.detail_idx = 0;
     app.detail_title_buf = null;
+    app.detail_copy_btn_idx = 0;
     app.show_subagents = false;
     app.subagents = .empty;
     app.stream_state = null;

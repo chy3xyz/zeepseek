@@ -375,9 +375,9 @@ pub const StreamIterator = struct {
 
                         var ci: usize = 0;
                         while (ci < delta_json.len) : (ci += 1) {
-                            if (ci + 9 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+9], "\"content\":")) {
-                                ci += 9;
-                                while (ci < delta_json.len and (delta_json[ci] == ' ' or delta_json[ci] == '"')) : (ci += 1) {}
+                            if (ci + 10 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+10], "\"content\":")) {
+                                ci += 10;
+                                while (ci < delta_json.len and delta_json[ci] == ' ') : (ci += 1) {}
                                 if (ci < delta_json.len and delta_json[ci] == '"') {
                                     ci += 1;
                                     const value_start = ci;
@@ -388,9 +388,9 @@ pub const StreamIterator = struct {
                                 }
                             }
 
-                            if (ci + 18 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+18], "\"reasoning_content\":")) {
-                                ci += 18;
-                                while (ci < delta_json.len and (delta_json[ci] == ' ' or delta_json[ci] == '"')) : (ci += 1) {}
+                            if (ci + 20 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+20], "\"reasoning_content\":")) {
+                                ci += 20;
+                                while (ci < delta_json.len and delta_json[ci] == ' ') : (ci += 1) {}
                                 if (ci < delta_json.len and delta_json[ci] == '"') {
                                     ci += 1;
                                     const value_start = ci;

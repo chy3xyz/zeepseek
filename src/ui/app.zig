@@ -16,6 +16,7 @@ const cc = @import("c");
 const stream_client_mod = @import("../net/stream_client.zig");
 const SlashDispatcher = @import("slash_command_dispatcher.zig");
 const theme = @import("theme.zig");
+const ansi_text = @import("ansi_text.zig");
 const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const tools_mod = @import("../tools/mod.zig");
@@ -29,6 +30,7 @@ const session_manager = @import("../storage/session_manager.zig");
 const ContextManager = @import("../dispatch/context_manager.zig").ContextManager;
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
 const reasonix_mod = @import("../cache/reasonix.zig");
+const models_catalog = @import("../providers/models.zig");
 
 const join = zz.join;
 
@@ -73,7 +75,6 @@ fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []con
         // Code block fence
         if (std.mem.startsWith(u8, line, "```")) {
             if (in_code_block) {
-                // Render accumulated code block with line numbers
                 renderCodeBlockWithLineNums(buf, a, &code_lines, code_count, code_lang, width);
                 code_count = 0;
                 in_code_block = false;
@@ -95,15 +96,36 @@ fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []con
 
         // Headings
         if (std.mem.startsWith(u8, line, "# ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.blue, line[2..], R });
+            const wrapped = ansi_text.wrapLine(a, line[2..], width) catch {
+                appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.blue, line[2..], R });
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped) |sub| {
+                appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.blue, sub, R });
+            }
             continue;
         }
         if (std.mem.startsWith(u8, line, "## ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.green, line[3..], R });
+            const wrapped = ansi_text.wrapLine(a, line[3..], width) catch {
+                appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.green, line[3..], R });
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped) |sub| {
+                appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.green, sub, R });
+            }
             continue;
         }
         if (std.mem.startsWith(u8, line, "### ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.yellow, line[4..], R });
+            const wrapped = ansi_text.wrapLine(a, line[4..], width) catch {
+                appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.yellow, line[4..], R });
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped) |sub| {
+                appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.yellow, sub, R });
+            }
             continue;
         }
 
@@ -118,30 +140,76 @@ fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []con
 
         // List items
         if (std.mem.startsWith(u8, line, "- ") or std.mem.startsWith(u8, line, "* ")) {
-            appendFmt(buf, a, "  {s}•{s} ", .{ Pal.green, R });
-            renderInlineAnsi(buf, a, line[2..]);
-            buf.appendSlice(a, "\n") catch {};
+            const inner = line[2..];
+            const inner_w = if (width > 4) width - 4 else 0;
+            const wrapped = ansi_text.wrapLine(a, inner, inner_w) catch {
+                appendFmt(buf, a, "  {s}•{s} ", .{ Pal.green, R });
+                renderInlineAnsi(buf, a, inner);
+                buf.appendSlice(a, "\n") catch {};
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped, 0..) |sub, idx| {
+                if (idx == 0) {
+                    appendFmt(buf, a, "  {s}•{s} ", .{ Pal.green, R });
+                } else {
+                    buf.appendSlice(a, "      ") catch {};
+                }
+                renderInlineAnsi(buf, a, sub);
+                buf.appendSlice(a, "\n") catch {};
+            }
             continue;
         }
         if (line.len >= 3 and line[0] >= '1' and line[0] <= '9' and (line[1] == '.' or (line[1] >= '0' and line[1] <= '9' and line[2] == '.'))) {
             const dot = std.mem.indexOfScalar(u8, line, '.') orelse 0;
-            appendFmt(buf, a, "  {s}{s}{s} ", .{ Pal.green, line[0 .. dot + 1], R });
-            renderInlineAnsi(buf, a, std.mem.trim(u8, line[dot + 1 ..], " "));
-            buf.appendSlice(a, "\n") catch {};
+            const prefix = line[0 .. dot + 1];
+            const inner = std.mem.trim(u8, line[dot + 1 ..], " ");
+            const inner_w = if (width > 6) width - 6 else 0;
+            const wrapped = ansi_text.wrapLine(a, inner, inner_w) catch {
+                appendFmt(buf, a, "  {s}{s}{s} ", .{ Pal.green, prefix, R });
+                renderInlineAnsi(buf, a, inner);
+                buf.appendSlice(a, "\n") catch {};
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped, 0..) |sub, idx| {
+                if (idx == 0) {
+                    appendFmt(buf, a, "  {s}{s}{s} ", .{ Pal.green, prefix, R });
+                } else {
+                    buf.appendSlice(a, "      ") catch {};
+                }
+                renderInlineAnsi(buf, a, sub);
+                buf.appendSlice(a, "\n") catch {};
+            }
             continue;
         }
 
         // Blockquote
         if (std.mem.startsWith(u8, line, "> ")) {
-            appendFmt(buf, a, "  {s}|{s} {s}", .{ D, R, line[2..] });
-            buf.appendSlice(a, R) catch {};
-            buf.appendSlice(a, "\n") catch {};
+            const inner = line[2..];
+            const inner_w = if (width > 4) width - 4 else 0;
+            const wrapped = ansi_text.wrapLine(a, inner, inner_w) catch {
+                appendFmt(buf, a, "  {s}|{s} {s}{s}\n", .{ D, R, inner, R });
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped) |sub| {
+                appendFmt(buf, a, "  {s}|{s} {s}{s}\n", .{ D, R, sub, R });
+            }
             continue;
         }
 
         // Regular paragraph
-        renderInlineAnsi(buf, a, line);
-        buf.appendSlice(a, "\n") catch {};
+        const wrapped = ansi_text.wrapLine(a, line, width) catch {
+            renderInlineAnsi(buf, a, line);
+            buf.appendSlice(a, "\n") catch {};
+            continue;
+        };
+        defer ansi_text.freeWrapped(a, wrapped);
+        for (wrapped) |sub| {
+            renderInlineAnsi(buf, a, sub);
+            buf.appendSlice(a, "\n") catch {};
+        }
     }
     // Unclosed code block
     if (in_code_block) {
@@ -172,8 +240,8 @@ fn renderCodeBlockWithLineNums(
     // Line number width: enough digits for max line number
     var digits: usize = 1;
     if (count >= 100) digits = 3 else if (count >= 10) digits = 2;
-    const gutter_w = @as(u16, @intCast(digits + 2)); // " N │ "
-    const content_w = if (width > gutter_w) width - gutter_w else 10;
+    const gutter_w = @as(u16, @intCast(digits + 5)); // "│ N │ "
+    const content_w = if (width > gutter_w + 1) width - gutter_w - 1 else 10;
 
     // Header
     buf.appendSlice(a, D) catch {};
@@ -196,44 +264,56 @@ fn renderCodeBlockWithLineNums(
 
     // Code lines
     for (0..count) |i| {
-        const line = code_lines[i];
-        // Line number with manual padding to digits width
-        buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, "│") catch {};
-        buf.appendSlice(a, R) catch {};
-        buf.appendSlice(a, " ") catch {};
-        buf.appendSlice(a, Pal.blue) catch {};
-        // Line number
-        var line_num_buf: [16]u8 = undefined;
-        const ln_str = std.fmt.bufPrint(&line_num_buf, "{d}", .{i + 1}) catch "0";
-        buf.appendSlice(a, ln_str) catch {};
-        buf.appendSlice(a, " ") catch {};
-        buf.appendSlice(a, "│") catch {};
-        buf.appendSlice(a, " ") catch {};
-        buf.appendSlice(a, R) catch {};
-        // Pad line number to fixed width
-        var pd: usize = ln_str.len;
-        while (pd < digits) : (pd += 1) buf.appendSlice(a, " ") catch {};
+        const raw_line = code_lines[i];
+        const expanded = ansi_text.expandTabs(a, raw_line, 4) catch raw_line;
+        defer if (expanded.ptr != raw_line.ptr) a.free(expanded);
+        const highlighted = ansi_text.highlightCode(a, lang, expanded) catch expanded;
+        defer if (highlighted.ptr != expanded.ptr) a.free(highlighted);
+        const wrapped = ansi_text.wrapAnsiLine(a, highlighted, content_w) catch highlighted;
+        defer if (wrapped.ptr != highlighted.ptr) a.free(wrapped);
 
-        // Code content with background
-        buf.appendSlice(a, CodeBg) catch {};
-        buf.appendSlice(a, Pal.code_fg) catch {};
-        if (line.len > content_w) {
-            buf.appendSlice(a, line[0..content_w]) catch {};
-        } else {
-            buf.appendSlice(a, line) catch {};
+        var wrap_iter = std.mem.splitScalar(u8, wrapped, '\n');
+        var is_first = true;
+        while (wrap_iter.next()) |segment| {
+            // Gutter
+            buf.appendSlice(a, D) catch {};
+            buf.appendSlice(a, "│") catch {};
+            buf.appendSlice(a, R) catch {};
+            buf.appendSlice(a, " ") catch {};
+            if (is_first) {
+                buf.appendSlice(a, Pal.blue) catch {};
+                var line_num_buf: [16]u8 = undefined;
+                const ln_str = std.fmt.bufPrint(&line_num_buf, "{d}", .{i + 1}) catch "0";
+                buf.appendSlice(a, ln_str) catch {};
+                var pd: usize = ln_str.len;
+                while (pd < digits) : (pd += 1) buf.appendSlice(a, " ") catch {};
+                buf.appendSlice(a, " ") catch {};
+                buf.appendSlice(a, "│") catch {};
+                buf.appendSlice(a, " ") catch {};
+                buf.appendSlice(a, R) catch {};
+            } else {
+                var pd: usize = 0;
+                while (pd < digits) : (pd += 1) buf.appendSlice(a, " ") catch {};
+                buf.appendSlice(a, "  │ ") catch {};
+            }
+            is_first = false;
+
+            // Code content with background
+            buf.appendSlice(a, CodeBg) catch {};
+            buf.appendSlice(a, segment) catch {};
+            buf.appendSlice(a, R) catch {};
+
+            const seg_w = zz.layout.measure.width(segment);
+            if (seg_w < content_w) {
+                var p: usize = seg_w;
+                while (p < content_w) : (p += 1) buf.appendSlice(a, " ") catch {};
+            }
+
+            buf.appendSlice(a, D) catch {};
+            buf.appendSlice(a, "│") catch {};
+            buf.appendSlice(a, R) catch {};
+            buf.appendSlice(a, "\n") catch {};
         }
-        buf.appendSlice(a, R) catch {};
-
-        // Pad
-        const used = if (line.len > content_w) content_w else line.len;
-        const pad = content_w - used;
-        var p: u16 = 0;
-        while (p < pad) : (p += 1) { buf.appendSlice(a, " ") catch {}; }
-        buf.appendSlice(a, D) catch {};
-        buf.appendSlice(a, "│") catch {};
-        buf.appendSlice(a, R) catch {};
-        buf.appendSlice(a, "\n") catch {};
     }
 
     // Footer
@@ -429,6 +509,8 @@ const StreamState = struct {
     has_tool_calls: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     tool_call_json: std.ArrayList(u8) = .empty,
     error_msg: ?[]const u8 = null,
+    total_content_len: usize = 0,
+    fallback_content: ?[]const u8 = null,
     alloc: std.mem.Allocator = undefined,
     locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
@@ -448,6 +530,14 @@ const StreamState = struct {
         self.lock();
         defer self.unlock();
         self.content_queue.appendSlice(self.alloc, text) catch {};
+        self.total_content_len += text.len;
+    }
+
+    fn clearContent(self: *StreamState) void {
+        self.lock();
+        defer self.unlock();
+        self.content_queue.clearRetainingCapacity();
+        self.total_content_len = 0;
     }
 
     fn pushReasoning(self: *StreamState, text: []const u8) void {
@@ -507,11 +597,19 @@ const StreamState = struct {
         return self.done.load(.acquire);
     }
 
+    fn setFallbackContent(self: *StreamState, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        if (self.fallback_content) |old| self.alloc.free(old);
+        self.fallback_content = self.alloc.dupe(u8, text) catch null;
+    }
+
     fn deinit(self: *StreamState) void {
         self.content_queue.deinit(self.alloc);
         self.reasoning_queue.deinit(self.alloc);
         self.tool_call_json.deinit(self.alloc);
         if (self.error_msg) |m| self.alloc.free(m);
+        if (self.fallback_content) |c| self.alloc.free(c);
     }
 };
 
@@ -558,6 +656,12 @@ pub const App = struct {
         }
     };
 
+    const ConfirmAction = enum {
+        clear,
+        new,
+        compact,
+    };
+
     // --- Chat state
     messages: std.ArrayList(ChatMsg),
     alloc: std.mem.Allocator,
@@ -601,6 +705,9 @@ pub const App = struct {
     session_dir: []const u8,
     should_quit: bool,
 
+    // --- Lifetime-safe init command batch
+    init_batch: [2]zz.Cmd(Msg) = undefined,
+
     // --- Metrics
     turn: u32,
     tokens_used: u64,
@@ -614,6 +721,7 @@ pub const App = struct {
     subsystems_initialized: bool,
     ctx_mgr: ?*ContextManager,
     cache_loop: ?*dispatch_loop.CacheFirstLoop,
+    reasonix: ?*reasonix_mod.Reasonix,
 
     // --- Dimensions
     width: u16,
@@ -636,6 +744,16 @@ pub const App = struct {
     slash_output_title: []const u8 = "",
     slash_output_data: ?OutputData = null,
 
+    // --- Model / provider pickers
+    model_picker_active: bool = false,
+    provider_picker_active: bool = false,
+    model_picker: zz.components.List([]const u8) = undefined,
+    provider_picker: zz.components.List([]const u8) = undefined,
+
+    // --- Confirm modal for destructive commands
+    confirm_modal: zz.components.Modal = undefined,
+    confirm_action: ?ConfirmAction = null,
+
     // --- Elm Interface
 
     pub fn init(self: *App, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -647,6 +765,9 @@ pub const App = struct {
             .streaming_idx = null,
             .text_input = zz.components.TextInput.init(ctx.persistent_allocator),
             .palette = zz.components.CommandPalette.init(ctx.persistent_allocator) catch unreachable,
+            .model_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
+            .provider_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
+            .confirm_modal = zz.components.Modal.confirm("Confirm", ""),
             .show_thinking = true,
             .search_active = false,
             .search_query = .empty,
@@ -678,6 +799,7 @@ pub const App = struct {
             .subsystems_initialized = false,
             .ctx_mgr = null,
             .cache_loop = null,
+            .reasonix = null,
             .width = 80,
             .height = 24,
             .cursor_visible = true,
@@ -693,10 +815,14 @@ pub const App = struct {
             .slash_output_active = false,
             .slash_output_title = "",
             .slash_output_data = null,
+            .model_picker_active = false,
+            .provider_picker_active = false,
+            .confirm_action = null,
         };
         // Try loading saved API key from disk
         self.loadSavedApiKey();
-        return .{ .batch = &[_]zz.Cmd(Msg){ .enter_alt_screen, zz.Cmd(Msg).everyMs(100) } };
+        self.init_batch = .{ .enter_alt_screen, zz.Cmd(Msg).everyMs(100) };
+        return .{ .batch = &self.init_batch };
     }
 
     fn loadSavedApiKey(self: *App) void {
@@ -740,6 +866,9 @@ pub const App = struct {
         self.search_query.deinit(self.alloc);
         self.pending_data.deinit(self.alloc);
         self.slash_prompt_input.deinit();
+        self.model_picker.deinit();
+        self.provider_picker.deinit();
+        self.confirm_modal = undefined;
         if (self.slash_awaiting_cmd) |s| self.alloc.free(s);
         if (self.slash_prompt_title) |s| self.alloc.free(s);
         if (self.slash_prompt_placeholder) |s| self.alloc.free(s);
@@ -758,6 +887,10 @@ pub const App = struct {
             if (self.cache_loop) |cl| {
                 cl.deinit();
                 self.alloc.destroy(cl);
+            }
+            if (self.reasonix) |r| {
+                r.deinit();
+                self.alloc.destroy(r);
             }
         }
 
@@ -802,7 +935,7 @@ pub const App = struct {
             }
             const cl = ctx.persistent_allocator.create(dispatch_loop.CacheFirstLoop) catch null;
             if (cl) |c| {
-                const prefix = ImmutablePrefix.init(ctx.persistent_allocator, "", "", "");
+                const prefix = ImmutablePrefix.init(ctx.persistent_allocator, "You are Zeep, a helpful coding assistant.", "", "");
                 c.* = dispatch_loop.CacheFirstLoop.init(ctx.persistent_allocator, .{
                     .prefix = prefix,
                     .context = self.ctx_mgr.?,
@@ -811,8 +944,15 @@ pub const App = struct {
                     .io = self.io,
                     .api_key = self.api_key,
                     .stream = true,
+                    .reasoning_effort = "",
                 });
                 self.cache_loop = c;
+                const r = ctx.persistent_allocator.create(reasonix_mod.Reasonix) catch null;
+                if (r) |rp| {
+                    rp.* = reasonix_mod.Reasonix.init(ctx.persistent_allocator, .{});
+                    self.reasonix = rp;
+                    self.cache_loop.?.reasonix = rp;
+                }
             }
             for (SlashDispatcher.Dispatcher.commands()) |cmd| {
                 self.palette.addCommand(.{
@@ -844,6 +984,14 @@ pub const App = struct {
             .tick => |t| {
                 self.cursor_visible = (t.timestamp / 500_000_000) % 2 == 0; // blink every 500ms
                 self.pollStream();
+                // Update context/cache metrics
+                if (self.cache_loop) |cl| {
+                    self.tokens_used = cl.context.totalTokens();
+                    self.ctx_max = cl.contextWindow();
+                }
+                if (self.reasonix) |r| {
+                    self.cache_hit_rate = r.hitRate();
+                }
                 // Toast auto-dismiss is handled by zz.components.Toast based on timestamps
             },
         }
@@ -880,6 +1028,64 @@ pub const App = struct {
     fn onKey(self: *App, key: zz.KeyEvent) zz.Cmd(Msg) {
         const k = key.key;
         const m = key.modifiers;
+
+        // --- Confirm modal
+        if (self.confirm_modal.isVisible()) {
+            self.confirm_modal.handleKey(key);
+            if (self.confirm_modal.getResult()) |res| {
+                self.confirm_modal.hide();
+                switch (res) {
+                    .button_pressed => |idx| {
+                        if (idx == 0) {
+                            if (self.confirm_action) |action| {
+                                switch (action) {
+                                    .clear => self.clearMessages(),
+                                    .new => self.clearMessages(), // TODO: full new-session reset
+                                    .compact => self.compactContext(),
+                                }
+                            }
+                        }
+                        self.confirm_action = null;
+                    },
+                    .dismissed => self.confirm_action = null,
+                }
+            }
+            return .none;
+        }
+
+        // --- Model picker
+        if (self.model_picker_active) {
+            if (k == .escape) {
+                self.model_picker_active = false;
+                return .none;
+            }
+            if (k == .enter) {
+                if (self.model_picker.selectedValue()) |model_id| {
+                    self.model_picker_active = false;
+                    self.executeSlashCommand("model", model_id);
+                }
+                return .none;
+            }
+            self.model_picker.handleKey(key);
+            return .none;
+        }
+
+        // --- Provider picker
+        if (self.provider_picker_active) {
+            if (k == .escape) {
+                self.provider_picker_active = false;
+                return .none;
+            }
+            if (k == .enter) {
+                if (self.provider_picker.selectedValue()) |provider_id| {
+                    self.provider_picker_active = false;
+                    self.executeSlashCommand("provider", provider_id);
+                }
+                return .none;
+            }
+            self.provider_picker.handleKey(key);
+            return .none;
+        }
 
         // --- Slash output modal
         if (self.slash_output_active) {
@@ -1100,7 +1306,24 @@ pub const App = struct {
         }) catch return;
         self.streaming_idx = idx;
 
-        // Build context from recent messages
+        // Keep the dispatch context in sync. Skip the synthetic placeholder
+        // used for tool-result follow-ups; the actual tool message is added
+        // separately.
+        if (self.cache_loop) |cl| {
+            cl.api_key = self.api_key;
+            cl.endpoint = self.provider_mgr.resolveEndpoint(self.provider);
+            cl.model_name = self.provider_mgr.resolveModel(self.provider);
+
+            if (!std.mem.eql(u8, user_input, "(tool results)")) {
+                const owned = cl.context.arena.allocator().dupe(u8, user_input) catch return;
+                cl.context.addMessage(.{
+                    .role = "user",
+                    .content = owned,
+                }) catch {};
+            }
+        }
+
+        // Build context from recent UI messages
         var ctx_items = std.ArrayList(stream_client_mod.CtxItem).empty;
         defer ctx_items.deinit(self.alloc);
         const msg_count = self.messages.items.len - 1; // exclude the empty assistant msg
@@ -1112,34 +1335,41 @@ pub const App = struct {
             ctx_items.append(self.alloc, .{ .role = role_str, .content = m.content }) catch {};
         }
 
-        // Capture values for the thread
         const mgr_key = self.provider_mgr.resolveApiKey(self.provider) orelse "";
         const api_key = if (mgr_key.len > 0) mgr_key else self.api_key;
         const model = self.provider_mgr.resolveModel(self.provider);
         const endpoint = self.provider_mgr.resolveEndpoint(self.provider);
-        const alloc = self.alloc;
-        const io = self.io;
         const ctx_slice = ctx_items.toOwnedSlice(self.alloc) catch &.{};
+        const cache_decision = self.cacheDecision();
+        const system_prompt = if (self.cache_loop) |cl| cl.prefix.system_prompt else "";
+        const reasoning_effort: ?[]const u8 = if (self.cache_loop) |cl|
+            (if (cl.reasoning_effort.len > 0) cl.reasoning_effort else null)
+        else
+            null;
 
-        // Spawn streaming thread
         const thread = std.Thread.spawn(.{}, struct {
-            fn run(api_k: []const u8, prompt: []const u8, ctx: []const stream_client_mod.CtxItem, mdl: []const u8, ep: []const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
+            fn run(api_k: []const u8, prompt: []const u8, ctx: []const stream_client_mod.CtxItem, mdl: []const u8, ep: []const u8, cache_d: CacheDecision, sys: []const u8, reason: ?[]const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
+                defer a.free(ctx);
+                const debug_stream = std.c.getenv("ZEEPSEEK_DEBUG_STREAM") != null;
                 var client = stream_client_mod.DeepSeekStreamClient.init(a, sio, null, null);
                 client.endpoint = ep;
                 defer client.deinit();
 
-                var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
+                var stream = client.streamMessage(api_k, prompt, ctx, mdl, cache_d, sys, reason) catch |err| {
                     if (err == error.HttpError and client.last_http_status != 0) {
                         const detail = std.fmt.allocPrint(a, "HTTP {d}: {s}", .{
                             client.last_http_status,
                             client.last_http_body orelse "",
                         }) catch {
+                            if (debug_stream) std.debug.print("[zeepseek stream] HTTP error (status {d})\n", .{client.last_http_status});
                             state.setError(@errorName(err));
                             return;
                         };
+                        if (debug_stream) std.debug.print("[zeepseek stream] {s}\n", .{detail});
                         state.setError(detail);
                         a.free(detail);
                     } else {
+                        if (debug_stream) std.debug.print("[zeepseek stream] error: {s}\n", .{@errorName(err)});
                         state.setError(@errorName(err));
                     }
                     return;
@@ -1148,26 +1378,68 @@ pub const App = struct {
 
                 while (true) {
                     const chunk = stream.nextChunk() catch |err| {
+                        if (debug_stream) std.debug.print("[zeepseek stream] chunk error: {s}\n", .{@errorName(err)});
                         state.setError(@errorName(err));
                         return;
                     };
                     if (chunk == null) break;
                     switch (chunk.?) {
-                        .content => |c| state.pushContent(c),
-                        .reasoning => |r| state.pushReasoning(r),
+                        .content => |c| {
+                            if (debug_stream) std.debug.print("[zeepseek stream] content chunk len={d}\n", .{c.len});
+                            state.pushContent(c);
+                        },
+                        .reasoning => |r| {
+                            if (debug_stream) std.debug.print("[zeepseek stream] reasoning chunk len={d}\n", .{r.len});
+                            state.pushReasoning(r);
+                        },
                     }
                 }
-                // Capture tool call JSON if present
+                if (debug_stream) std.debug.print("[zeepseek stream] done (content_queue={d} reasoning_queue={d} tool_calls={})\n", .{
+                    state.content_queue.items.len,
+                    state.reasoning_queue.items.len,
+                    stream.has_tool_calls,
+                });
                 if (stream.has_tool_calls and stream.tool_call_json.items.len > 0) {
                     state.pushToolCallJson(stream.tool_call_json.items);
                 }
+
+                // Fallback for the DeepSeek streaming endpoint, which sometimes
+                // truncates long responses after a few dozen tokens. If we got
+                // very little content and no tool calls, retry synchronously.
+                if (state.total_content_len < 120 and !stream.has_tool_calls) {
+                    if (debug_stream) std.debug.print("[zeepseek stream] streaming response short ({d} bytes), trying sync fallback\n", .{state.total_content_len});
+                    const fallback = client.sendMessageSync(api_k, prompt, ctx, mdl, cache_d, sys, reason) catch |err| blk: {
+                        if (debug_stream) std.debug.print("[zeepseek stream] sync fallback failed: {s}\n", .{@errorName(err)});
+                        break :blk null;
+                    };
+                    if (fallback) |full| {
+                        defer a.free(full);
+                        if (debug_stream) std.debug.print("[zeepseek stream] sync fallback returned {d} bytes\n", .{full.len});
+                        if (full.len > state.total_content_len) {
+                            state.setFallbackContent(full);
+                        }
+                    }
+                }
+
                 state.setDone();
             }
-        }.run, .{ api_key, user_input, ctx_slice, model, endpoint, alloc, io, ss }) catch {
+        }.run, .{ api_key, user_input, ctx_slice, model, endpoint, cache_decision, system_prompt, reasoning_effort, self.alloc, self.io, ss }) catch {
             ss.setError("Failed to spawn thread");
             return;
         };
         self.stream_thread = thread;
+    }
+
+    fn cacheDecision(self: *App) CacheDecision {
+        if (self.cache_loop) |cl| {
+            if (cl.prefix.system_prompt.len == 0) return .none;
+            if (self.reasonix) |r| {
+                const cached = r.get(&cl.prefix.fingerprint);
+                if (cached != null) return .hit;
+                return .miss;
+            }
+        }
+        return .none;
     }
 
     fn pollStream(self: *App) void {
@@ -1187,6 +1459,21 @@ pub const App = struct {
 
         // Check done
         if (ss.isDone()) {
+            // If the streaming endpoint returned a truncated response and the
+            // sync fallback produced a full response, replace the assistant's
+            // content with the fallback version.
+            if (ss.fallback_content) |fb| {
+                if (self.streaming_idx) |idx| {
+                    const msg = &self.messages.items[idx];
+                    if (msg.owns and msg.content.len > 0) self.alloc.free(msg.content);
+                    msg.content = self.alloc.dupe(u8, fb) catch msg.content;
+                    msg.owns = true;
+                }
+                self.alloc.free(fb);
+                ss.fallback_content = null;
+                if (ss.drainContent(self.alloc)) |leftover| self.alloc.free(leftover);
+            }
+
             // Check for tool calls BEFORE marking done
             const has_tc = ss.has_tool_calls.load(.acquire);
             const tc_json = if (has_tc) ss.drainToolCallJson(self.alloc) else null;
@@ -1194,6 +1481,14 @@ pub const App = struct {
             if (ss.error_msg) |msg| {
                 self.onStreamError(msg);
             } else if (tc_json != null) {
+                // Record the assistant's tool-call request in the dispatch context
+                if (self.streaming_idx) |idx| {
+                    const content = if (self.messages.items[idx].content.len > 0)
+                        self.messages.items[idx].content
+                    else
+                        tc_json.?;
+                    self.recordAssistantToContext(content);
+                }
                 // Handle tool calls — don't mark stream done yet
                 self.handleToolCalls(tc_json.?);
                 self.alloc.free(tc_json.?);
@@ -1207,6 +1502,10 @@ pub const App = struct {
                 self.stream_state = null;
                 return;
             } else {
+                if (self.streaming_idx) |idx| {
+                    const content = self.messages.items[idx].content;
+                    if (content.len > 0) self.recordAssistantToContext(content);
+                }
                 self.onStreamDone();
             }
             // Cleanup
@@ -1220,11 +1519,37 @@ pub const App = struct {
         }
     }
 
+    fn recordAssistantToContext(self: *App, content: []const u8) void {
+        if (self.cache_loop) |cl| {
+            const owned = cl.context.arena.allocator().dupe(u8, content) catch return;
+            cl.context.addMessage(.{
+                .role = "assistant",
+                .content = owned,
+            }) catch {};
+            if (self.reasonix) |r| {
+                r.put(&cl.prefix.fingerprint, cl.prefix.system_prompt) catch {};
+            }
+        }
+    }
+
     fn handleToolCalls(self: *App, tc_json: []const u8) void {
+        const debug_tools = std.c.getenv("ZEEPSEEK_DEBUG_TOOLS") != null;
+        if (debug_tools) {
+            std.debug.print("[zeepseek tools] handleToolCalls tc_json len={d}\n", .{tc_json.len});
+            if (tc_json.len > 0) {
+                const preview_len = @min(tc_json.len, 600);
+                std.debug.print("[zeepseek tools] tc_json preview:\n{s}\n", .{tc_json[0..preview_len]});
+            }
+        }
+
         var pipeline = stream_client_mod.ToolCallRepairPipeline.init(self.alloc);
         defer pipeline.deinit();
 
-        const parse_result = pipeline.processChunk(tc_json) catch return;
+        const parse_result = pipeline.processChunk(tc_json) catch |err| {
+            if (debug_tools) std.debug.print("[zeepseek tools] parse error: {s}\n", .{@errorName(err)});
+            return;
+        };
+        if (debug_tools) std.debug.print("[zeepseek tools] parsed {d} call(s)\n", .{parse_result.calls.len});
         defer {
             for (parse_result.calls) |call| {
                 self.alloc.free(call.name);
@@ -1247,10 +1572,12 @@ pub const App = struct {
         for (parse_result.calls) |call| {
             // Notify UI about tool call
             self.onToolStart(call.name, call.arguments);
+            if (debug_tools) std.debug.print("[zeepseek tools] call: {s} args={s}\n", .{ call.name, call.arguments });
 
             // Execute the tool
             const result = self.executeToolCall(call.name, call.arguments, cwd);
             const success = result.len > 0 and !std.mem.startsWith(u8, result, "Error:");
+            if (debug_tools) std.debug.print("[zeepseek tools] result success={} len={d}\n", .{ success, result.len });
 
             // Notify UI about result
             self.onToolOutput(call.name, result, success);
@@ -1265,12 +1592,22 @@ pub const App = struct {
 
         // Re-submit with tool results to continue the conversation
         if (tool_results.items.len > 0) {
+            if (debug_tools) std.debug.print("[zeepseek tools] re-submitting with tool results\n", .{});
             const result_text = self.alloc.dupe(u8, tool_results.items) catch return;
             self.messages.append(self.alloc, .{
                 .role = .tool,
                 .content = result_text,
                 .owns = true,
             }) catch {};
+
+            // Keep the dispatch context in sync for the follow-up API call
+            if (self.cache_loop) |cl| {
+                const owned = cl.context.arena.allocator().dupe(u8, result_text) catch return;
+                cl.context.addMessage(.{
+                    .role = "tool",
+                    .content = owned,
+                }) catch {};
+            }
 
             // Start a new stream with the tool results in context
             self.startStreaming("(tool results)");
@@ -1524,6 +1861,9 @@ pub const App = struct {
             return;
         }
         self.api_key = self.alloc.dupe(u8, key) catch return;
+        if (self.cache_loop) |cl| {
+            cl.api_key = self.api_key;
+        }
         const msg = std.fmt.allocPrint(self.alloc, "API key saved ({d} chars)", .{key.len}) catch return;
         self.setNotification(msg);
 
@@ -1609,6 +1949,9 @@ pub const App = struct {
                         self.provider_mgr.addProvider(new_cfg) catch {};
                     }
                 }
+                if (self.cache_loop) |cl| {
+                    cl.model_name = self.provider_mgr.resolveModel(self.provider);
+                }
                 const msg = std.fmt.allocPrint(self.alloc, "Model: {s} (via {s})", .{ name, self.provider }) catch return;
                 defer self.alloc.free(msg);
                 self.setNotification(msg);
@@ -1637,6 +1980,11 @@ pub const App = struct {
                     "deepseek-chat";
                 self.model = self.alloc.dupe(u8, resolved_model) catch self.model;
 
+                if (self.cache_loop) |cl| {
+                    cl.endpoint = self.provider_mgr.resolveEndpoint(self.provider);
+                    cl.model_name = resolved_model;
+                }
+
                 const title = std.fmt.allocPrint(self.alloc, "Enter API key for {s}", .{name}) catch return;
                 self.alloc.free(name);
                 self.openSlashPrompt("apikey", title, "sk-...");
@@ -1644,14 +1992,9 @@ pub const App = struct {
             },
 
             .prompt => |p| {
-                const title = self.alloc.dupe(u8, p.title) catch return;
-                const placeholder = self.alloc.dupe(u8, p.placeholder) catch {
-                    self.alloc.free(title);
-                    return;
-                };
+                self.openSlashPrompt(id, p.title, p.placeholder);
                 self.alloc.free(p.title);
                 self.alloc.free(p.placeholder);
-                self.openSlashPrompt(id, title, placeholder);
             },
 
             .show_table => |t| {
@@ -1661,10 +2004,70 @@ pub const App = struct {
             .show_list => |l| {
                 self.setSlashOutput(.{ .list = l });
             },
+
+            .confirm => |c| {
+                self.confirm_action = if (std.mem.eql(u8, c.action, "new"))
+                    .new
+                else if (std.mem.eql(u8, c.action, "compact"))
+                    .compact
+                else
+                    .clear;
+                self.confirm_modal = zz.components.Modal.confirm(c.title, c.body);
+                self.confirm_modal.show();
+            },
+
+            .pick_model => {
+                self.model_picker.clear();
+                const models = models_catalog.listModelsByProvider(self.provider);
+                if (models.len == 0) {
+                    self.setNotification("No models available for this provider");
+                    return;
+                }
+                for (models) |m| {
+                    const item = zz.components.List([]const u8).Item.init(m.id, m.name);
+                    self.model_picker.addItem(item) catch {};
+                }
+                // Pre-select the current model if it exists in the list
+                const current = self.model;
+                for (self.model_picker.items.items, 0..) |it, i| {
+                    if (std.mem.eql(u8, it.value, current)) {
+                        self.model_picker.cursor = @intCast(i);
+                        self.model_picker.y_offset = 0;
+                        break;
+                    }
+                }
+                self.model_picker_active = true;
+            },
+
+            .pick_provider => {
+                self.provider_picker.clear();
+                const providers = @import("../providers/mod.zig").listProviders();
+                for (providers) |p| {
+                    const item = zz.components.List([]const u8).Item.withDescription(p.id, p.name, p.endpoint);
+                    self.provider_picker.addItem(item) catch {};
+                }
+                // Pre-select current provider
+                const current = self.provider;
+                for (self.provider_picker.items.items, 0..) |it, i| {
+                    if (std.mem.eql(u8, it.value, current)) {
+                        self.provider_picker.cursor = @intCast(i);
+                        self.provider_picker.y_offset = 0;
+                        break;
+                    }
+                }
+                self.provider_picker_active = true;
+            },
         }
     }
 
     fn openSlashPrompt(self: *App, cmd_id: []const u8, title: []const u8, placeholder: []const u8) void {
+        const echo_mode: zz.components.TextInput.EchoMode =
+            if (std.mem.eql(u8, cmd_id, "apikey") or std.mem.eql(u8, cmd_id, "key"))
+                .password
+            else
+                .normal;
+        self.slash_prompt_input.setEchoMode(echo_mode);
+
         if (self.slash_awaiting_cmd) |old| self.alloc.free(old);
         if (self.slash_prompt_title) |old| self.alloc.free(old);
         if (self.slash_prompt_placeholder) |old| self.alloc.free(old);
@@ -1674,7 +2077,7 @@ pub const App = struct {
         self.slash_prompt_placeholder = self.alloc.dupe(u8, placeholder) catch return;
 
         self.slash_prompt_input.setValue("") catch {};
-        self.slash_prompt_input.setPlaceholder(placeholder);
+        self.slash_prompt_input.setPlaceholder(self.slash_prompt_placeholder.?);
     }
 
     fn closeSlashPrompt(self: *App) void {
@@ -1821,6 +2224,8 @@ pub const App = struct {
         self.messages.clearRetainingCapacity();
         self.streaming_idx = null;
         self.turn = 0;
+        if (self.cache_loop) |cl| cl.context.clear();
+        if (self.ctx_mgr) |cm| cm.clear();
     }
 
     /// Compact older messages to reduce token usage.
@@ -2017,6 +2422,29 @@ pub const App = struct {
             } else {
                 a.free(modal_view);
             }
+        }
+
+        // Confirm modal overlay
+        if (self.confirm_modal.isVisible()) {
+            const modal_view = self.confirm_modal.viewWithBackdrop(a, w, h) catch "";
+            if (modal_view.len > 0) {
+                a.free(result);
+                result = modal_view;
+            } else {
+                a.free(modal_view);
+            }
+        }
+
+        // Model picker overlay
+        if (self.model_picker_active) {
+            const overlay = self.renderPicker(a, w, h, "Select model", &self.model_picker);
+            result = ansiOverlay(a, result, overlay, 0, 0) catch result;
+        }
+
+        // Provider picker overlay
+        if (self.provider_picker_active) {
+            const overlay = self.renderPicker(a, w, h, "Select provider", &self.provider_picker);
+            result = ansiOverlay(a, result, overlay, 0, 0) catch result;
         }
 
         // Render slash command output modal
@@ -2318,8 +2746,8 @@ pub const App = struct {
 
         const input_view = self.text_input.view(a) catch "Error";
         defer if (input_view.ptr != "Error".ptr) a.free(input_view);
-        const input_vis = zz.layout.measure.width(input_view);
-        const max_input = if (w > 4) w - 4 else 0;
+        const input_vis = displayWidth(input_view);
+        const max_input = if (w > 5) w - 5 else 0;
         const display_input = if (input_vis > max_input)
             (ansiClip(a, input_view, max_input) catch input_view)
         else
@@ -2547,10 +2975,26 @@ pub const App = struct {
     }
 
     fn renderClaudePlainContent(self: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, content: []const u8, w: u16) void {
-        _ = self; _ = w;
-        lines.appendSlice(a, Pal.fg) catch {};
-        lines.appendSlice(a, content) catch {};
-        lines.appendSlice(a, R) catch {};
+        _ = self;
+        var iter = std.mem.splitScalar(u8, content, '\n');
+        var first = true;
+        while (iter.next()) |line| {
+            if (!first) lines.appendSlice(a, "\n") catch {};
+            first = false;
+            const wrapped = ansi_text.wrapLine(a, line, w) catch {
+                lines.appendSlice(a, Pal.fg) catch {};
+                lines.appendSlice(a, line) catch {};
+                lines.appendSlice(a, R) catch {};
+                continue;
+            };
+            defer ansi_text.freeWrapped(a, wrapped);
+            for (wrapped, 0..) |sub, idx| {
+                if (idx > 0) lines.appendSlice(a, "\n") catch {};
+                lines.appendSlice(a, Pal.fg) catch {};
+                lines.appendSlice(a, sub) catch {};
+                lines.appendSlice(a, R) catch {};
+            }
+        }
     }
 
     // ── Claude-style right sidebar ──
@@ -2772,6 +3216,43 @@ pub const App = struct {
         return result.toOwnedSlice(a);
     }
 
+    /// Compute the visual width of a string, ignoring ANSI escape sequences and
+    /// counting wide CJK characters as two columns.
+    fn displayWidth(str: []const u8) usize {
+        var w: usize = 0;
+        var i: usize = 0;
+        while (i < str.len) {
+            const c = str[i];
+            if (c == 0x1b) {
+                i += 1;
+                if (i < str.len and str[i] == '[') {
+                    i += 1;
+                    while (i < str.len and !((str[i] >= 'A' and str[i] <= 'Z') or (str[i] >= 'a' and str[i] <= 'z'))) {
+                        i += 1;
+                    }
+                    if (i < str.len) i += 1;
+                } else if (i < str.len) {
+                    i += 1;
+                }
+                continue;
+            }
+            const byte_len = std.unicode.utf8ByteSequenceLength(c) catch 1;
+            if (i + byte_len > str.len) {
+                w += 1;
+                i += 1;
+                continue;
+            }
+            const cp = std.unicode.utf8Decode(str[i..][0..byte_len]) catch {
+                w += 1;
+                i += 1;
+                continue;
+            };
+            w += zz.unicode.charWidth(cp);
+            i += byte_len;
+        }
+        return w;
+    }
+
     /// ANSI-aware overlay: places `content` onto `base` at (x, y), preserving
     /// escape sequences in both layers. Unlike zz.place.overlay, this does not
     /// corrupt ANSI codes by indexing into their byte sequences.
@@ -2839,6 +3320,27 @@ pub const App = struct {
         }
 
         return result.toOwnedSlice(a);
+    }
+
+    fn renderPicker(
+        self: *const App,
+        a: std.mem.Allocator,
+        w: u16,
+        h: u16,
+        title: []const u8,
+        picker: *const zz.components.List([]const u8),
+    ) []const u8 {
+        _ = self;
+        const list_view = picker.view(a) catch "";
+        const body = std.fmt.allocPrint(a, "{s}\n\n{s}\n\n[↑/↓] choose  [Enter] select  [Esc] cancel", .{
+            title, list_view,
+        }) catch "";
+        var style = zz.Style{};
+        style = style.borderAll(.rounded);
+        style = style.width(@min(60, w -| 4));
+        style = style.paddingAll(1);
+        const boxed = style.render(a, body) catch "";
+        return zz.place.place(a, w, h, .center, .middle, boxed) catch "";
     }
 
     fn appendIntFn(out: *std.ArrayList(u8), a: std.mem.Allocator, val: anytype) void {
@@ -2931,6 +3433,12 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.styles = theme.SemanticStyles.fromPalette(app.theme_manager.getPalette());
     app.pending_action = .none;
     app.pending_data = .empty;
+    app.model_picker_active = false;
+    app.provider_picker_active = false;
+    app.model_picker = zz.components.List([]const u8).init(alloc);
+    app.provider_picker = zz.components.List([]const u8).init(alloc);
+    app.confirm_modal = zz.components.Modal.confirm("Confirm", "");
+    app.confirm_action = null;
     return app;
 }
 
@@ -3452,4 +3960,45 @@ test "theme switch updates current theme id" {
     const first = app.theme_manager.current;
     app.cycleTheme();
     try std.testing.expect(app.theme_manager.current != first);
+}
+
+test "/model opens model picker" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+    }
+
+    app.executeSlashCommand("model", "");
+    try std.testing.expect(app.model_picker_active);
+}
+
+test "/clear opens confirm modal" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+    }
+
+    app.executeSlashCommand("clear", "");
+    try std.testing.expect(app.confirm_modal.isVisible());
+    try std.testing.expectEqual(App.ConfirmAction.clear, app.confirm_action.?);
 }

@@ -92,7 +92,7 @@ pub const DeepSeekStreamClient = struct {
         defer self.allocator.free(completions_uri);
         const uri = std.Uri.parse(completions_uri) catch return error.InvalidUri;
 
-        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort);
+        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, true);
 
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
         defer self.allocator.free(auth_value);
@@ -164,6 +164,93 @@ pub const DeepSeekStreamClient = struct {
         };
     }
 
+    /// Synchronous non-streaming request. Returns the assistant's full content
+    /// or null on failure. Used as a fallback when the streaming endpoint
+    /// returns a truncated response.
+    pub fn sendMessageSync(
+        self: *DeepSeekStreamClient,
+        api_key: []const u8,
+        prompt: []const u8,
+        context: []const CtxItem,
+        model: []const u8,
+        cache_decision: anytype,
+        system_prompt: []const u8,
+        reasoning_effort: ?[]const u8,
+    ) !?[]const u8 {
+        if (self.circuit_breaker) |cb| {
+            if (cb.isOpen()) return error.CircuitOpen;
+        }
+        if (self.rate_limiter) |rl| {
+            try rl.wait();
+        }
+
+        const completions_uri = if (std.mem.endsWith(u8, self.endpoint, "/v1"))
+            std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.endpoint}) catch return error.AllocationFailed
+        else
+            std.fmt.allocPrint(self.allocator, "{s}/v1/chat/completions", .{self.endpoint}) catch return error.AllocationFailed;
+        defer self.allocator.free(completions_uri);
+        const uri = std.Uri.parse(completions_uri) catch return error.InvalidUri;
+
+        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, false);
+        defer self.allocator.free(body);
+
+        const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+        defer self.allocator.free(auth_value);
+
+        const headers = [_]http.Header{
+            .{ .name = "Authorization", .value = auth_value },
+            .{ .name = "Content-Type", .value = "application/json" },
+            .{ .name = "Accept", .value = "application/json" },
+        };
+
+        if (!@import("builtin").target.cpu.arch.isWasm()) {
+            if (self.http_client.ca_bundle.bytes.items.len == 0) {
+                var bundle = std.crypto.Certificate.Bundle.empty;
+                const now = std.Io.Timestamp.now(self.io, .real);
+                try bundle.rescan(self.allocator, self.io, now);
+                self.http_client.ca_bundle = bundle;
+            }
+        }
+
+        var request = try self.http_client.request(.POST, uri, .{
+            .extra_headers = &headers,
+        });
+        defer request.deinit();
+        try request.sendBodyComplete(body);
+
+        var redirect_buf: [8192]u8 = undefined;
+        var response = try request.receiveHead(&redirect_buf);
+        const status = @intFromEnum(response.head.status);
+        if (status < 200 or status >= 300) {
+            if (self.circuit_breaker) |cb| cb.recordFailure();
+            var err_reader_buf: [4096]u8 = undefined;
+            const err_reader = response.reader(&err_reader_buf);
+            const err_body = err_reader.allocRemaining(self.allocator, .limited(4096)) catch null;
+            if (self.last_http_body) |old| self.allocator.free(old);
+            self.last_http_body = err_body;
+            self.last_http_status = @intCast(status);
+            return error.HttpError;
+        }
+        if (self.circuit_breaker) |cb| cb.recordSuccess();
+
+        var body_reader_buf: [8192]u8 = undefined;
+        const body_reader = response.reader(&body_reader_buf);
+        const response_body = body_reader.allocRemaining(self.allocator, .limited(65536)) catch return null;
+        defer self.allocator.free(response_body);
+
+        const SyncResponse = struct {
+            choices: []struct {
+                message: struct {
+                    content: []const u8,
+                },
+            } = &.{},
+        };
+        const parsed = std.json.parseFromSlice(SyncResponse, self.allocator, response_body, .{ .ignore_unknown_fields = true }) catch return null;
+        defer parsed.deinit();
+        if (parsed.value.choices.len == 0) return null;
+        return try self.allocator.dupe(u8, parsed.value.choices[0].message.content);
+    }
+
     fn buildRequestBody(
         self: *DeepSeekStreamClient,
         prompt: []const u8,
@@ -172,13 +259,14 @@ pub const DeepSeekStreamClient = struct {
         cache_decision: anytype,
         system_prompt: []const u8,
         reasoning_effort: ?[]const u8,
+        stream_param: bool,
     ) ![]u8 {
         var body = try std.ArrayList(u8).initCapacity(self.allocator, 2048);
         errdefer body.deinit(self.allocator);
 
         try body.appendSlice(self.allocator, "{\"model\":\"");
         try body.appendSlice(self.allocator, model);
-        try body.appendSlice(self.allocator, "\",\"stream\":true,\"messages\":[");
+        try body.appendSlice(self.allocator, if (stream_param) "\",\"stream\":true,\"messages\":[" else "\",\"stream\":false,\"messages\":[");
 
         if (system_prompt.len > 0) {
             const cache_tag = switch (cache_decision) {
@@ -230,7 +318,7 @@ pub const DeepSeekStreamClient = struct {
         try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}},");
         // Web scrape
         try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_scrape\",\"description\":\"Fetch and extract content from a URL.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}");
-        try body.appendSlice(self.allocator, "],\"tool_choice\":\"auto\"");
+        try body.appendSlice(self.allocator, "],\"tool_choice\":\"none\",\"max_tokens\":4096");
 
         if (reasoning_effort) |effort| {
             try body.appendSlice(self.allocator, ",\"reasoning_effort\":\"");
@@ -305,6 +393,9 @@ pub const StreamIterator = struct {
 
                 const data_value = std.mem.trim(u8, trimmed[5..], " ");
                 if (data_value.len == 0) continue;
+                if (std.c.getenv("ZEEPSEEK_DEBUG_STREAM") != null) {
+                    std.debug.print("[zeepseek sse] {s}\n", .{data_value});
+                }
                 if (std.mem.eql(u8, data_value, "[DONE]")) {
                     self.done = true;
                     return null;
@@ -444,6 +535,7 @@ pub const ToolCallRepairPipeline = struct {
     allocator: std.mem.Allocator,
     seen_signatures: std.StringHashMap(void),
     accumulators: std.AutoHashMap(usize, []u8),
+    names: std.AutoHashMap(usize, []const u8),
     max_accumulators: usize = 8,
     last_seen_names: std.ArrayList([]const u8),
 
@@ -452,6 +544,7 @@ pub const ToolCallRepairPipeline = struct {
             .allocator = allocator,
             .seen_signatures = std.StringHashMap(void).init(allocator),
             .accumulators = std.AutoHashMap(usize, []u8).init(allocator),
+            .names = std.AutoHashMap(usize, []const u8).init(allocator),
             .last_seen_names = .empty,
         };
     }
@@ -467,6 +560,11 @@ pub const ToolCallRepairPipeline = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.accumulators.deinit();
+        var name_iter = self.names.iterator();
+        while (name_iter.next()) |entry| {
+            self.allocator.free(entry.value_ptr.*);
+        }
+        self.names.deinit();
         for (self.last_seen_names.items) |name| {
             self.allocator.free(name);
         }
@@ -492,37 +590,70 @@ pub const ToolCallRepairPipeline = struct {
     ) !ToolCallResult {
         var content_buf: []const u8 = "";
         var extracted_calls: std.ArrayList(ToolCallExtracted) = .empty;
-        var i: usize = 0;
 
-        while (i < json_data.len) : (i += 1) {
-            if (i + 5 <= json_data.len and std.mem.eql(u8, json_data[i..i+5], "\"tool")) {
-                const tc_result = try self.parseToolCallsFromDelta(json_data, &i);
-                if (tc_result) |calls| {
-                    for (calls) |call| {
-                        try extracted_calls.append(self.allocator, call);
-                    }
+        const SseChunk = struct {
+            choices: []struct {
+                delta: struct {
+                    content: ?[]const u8 = null,
+                    tool_calls: ?[]ToolCallJson = null,
+                } = .{},
+            } = &.{},
+        };
+
+        // The accumulated raw JSON may contain multiple SSE data lines.
+        var line_it = std.mem.splitScalar(u8, json_data, '\n');
+        while (line_it.next()) |line| {
+            if (line.len == 0) continue;
+            const parsed = std.json.parseFromSlice(SseChunk, self.allocator, line, .{ .ignore_unknown_fields = true }) catch continue;
+            defer parsed.deinit();
+            if (parsed.value.choices.len == 0) continue;
+            const delta = parsed.value.choices[0].delta;
+            if (delta.content) |c| content_buf = c;
+
+            const tool_calls = delta.tool_calls orelse continue;
+            for (tool_calls) |tc| {
+                // Track the function name as it arrives.
+                if (tc.function.name.len > 0) {
+                    const name_copy = try self.allocator.dupe(u8, tc.function.name);
+                    const gop = try self.names.getOrPut(tc.index);
+                    if (gop.found_existing) self.allocator.free(gop.value_ptr.*);
+                    gop.value_ptr.* = name_copy;
                 }
-            } else if (i + 9 <= json_data.len and std.mem.eql(u8, json_data[i..i+9], "\"content\":")) {
-                i += 9;
-                while (i < json_data.len and (json_data[i] == ' ' or json_data[i] == '"')) : (i += 1) {}
-                if (i < json_data.len and json_data[i] == '"') {
-                    i += 1;
-                    const value_start = i;
-                    while (i < json_data.len and json_data[i] != '"') : (i += 1) {
-                        if (json_data[i] == '\\' and i + 1 < json_data.len) i += 1;
+                // Accumulate the arguments string fragment by fragment.
+                if (tc.function.arguments.len > 0) {
+                    const gop = try self.accumulators.getOrPut(tc.index);
+                    if (!gop.found_existing) {
+                        gop.value_ptr.* = try self.allocator.dupe(u8, "");
                     }
-                    content_buf = json_data[value_start..i];
-                }
-            } else if (i + 18 <= json_data.len and std.mem.eql(u8, json_data[i..i+18], "\"reasoning_content\":")) {
-                i += 18;
-                while (i < json_data.len and (json_data[i] == ' ' or json_data[i] == '"')) : (i += 1) {}
-                if (i < json_data.len and json_data[i] == '"') {
-                    i += 1;
-                    while (i < json_data.len and json_data[i] != '"') : (i += 1) {
-                        if (json_data[i] == '\\' and i + 1 < json_data.len) i += 1;
-                    }
+                    const old = gop.value_ptr.*;
+                    const combined = try std.mem.concat(self.allocator, u8, &.{ old, tc.function.arguments });
+                    self.allocator.free(old);
+                    gop.value_ptr.* = combined;
                 }
             }
+        }
+
+        // Emit any tool calls whose arguments have become complete JSON.
+        var acc_iter = self.accumulators.iterator();
+        while (acc_iter.next()) |entry| {
+            const idx = entry.key_ptr.*;
+            const args = entry.value_ptr.*;
+            if (args.len == 0 or !isCompleteJson(args)) continue;
+            const name = self.names.get(idx) orelse continue;
+            if (name.len == 0) continue;
+
+            const sig = try std.fmt.allocPrint(self.allocator, "{d}:{s}", .{ idx, name });
+            defer self.allocator.free(sig);
+            const gop = try self.seen_signatures.getOrPut(sig);
+            if (gop.found_existing) continue;
+            gop.key_ptr.* = try self.allocator.dupe(u8, sig);
+
+            try extracted_calls.append(self.allocator, .{
+                .index = idx,
+                .name = try self.allocator.dupe(u8, name),
+                .arguments = try self.allocator.dupe(u8, args),
+                .signature = try self.allocator.dupe(u8, sig),
+            });
         }
 
         return .{
@@ -530,6 +661,36 @@ pub const ToolCallRepairPipeline = struct {
             .content_delta = content_buf,
             .done = extracted_calls.items.len > 0,
         };
+    }
+
+    fn isCompleteJson(text: []const u8) bool {
+        var open_braces: i32 = 0;
+        var open_brackets: i32 = 0;
+        var in_string: bool = false;
+        var escaped: bool = false;
+        for (text) |c| {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (c == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (c == '"') {
+                in_string = !in_string;
+                continue;
+            }
+            if (in_string) continue;
+            switch (c) {
+                '{' => open_braces += 1,
+                '}' => open_braces -= 1,
+                '[' => open_brackets += 1,
+                ']' => open_brackets -= 1,
+                else => {},
+            }
+        }
+        return !in_string and open_braces == 0 and open_brackets == 0;
     }
 
     fn parseToolCallsFromDelta(
@@ -945,3 +1106,66 @@ pub const StreamIteratorOld = struct {
         self.buffer.deinit(self.allocator);
     }
 };
+
+test "extractContentAndReasoning parses DeepSeek stream deltas" {
+    const alloc = std.testing.allocator;
+    var it = StreamIterator{
+        .allocator = alloc,
+        .reader = undefined,
+        .buffer = std.ArrayList(u8).empty,
+        .line_accumulator = std.ArrayList(u8).empty,
+        .transfer_buffer = &.{},
+        .tool_call_json = std.ArrayList(u8).empty,
+    };
+
+    const json = "{\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"},\"finish_reason\":null}]}";
+    const extracted = try it.extractContentAndReasoning(json);
+    defer {
+        if (extracted.content.len > 0) alloc.free(extracted.content);
+        if (extracted.reasoning.len > 0) alloc.free(extracted.reasoning);
+    }
+    try std.testing.expectEqualStrings("Hello", extracted.content);
+    try std.testing.expectEqualStrings("", extracted.reasoning);
+}
+
+test "extractContentAndReasoning parses reasoning_content" {
+    const alloc = std.testing.allocator;
+    var it = StreamIterator{
+        .allocator = alloc,
+        .reader = undefined,
+        .buffer = std.ArrayList(u8).empty,
+        .line_accumulator = std.ArrayList(u8).empty,
+        .transfer_buffer = &.{},
+        .tool_call_json = std.ArrayList(u8).empty,
+    };
+
+    const json = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":null,\"reasoning_content\":\"I should greet\"},\"finish_reason\":null}]}";
+    const extracted = try it.extractContentAndReasoning(json);
+    defer {
+        if (extracted.content.len > 0) alloc.free(extracted.content);
+        if (extracted.reasoning.len > 0) alloc.free(extracted.reasoning);
+    }
+    try std.testing.expectEqualStrings("", extracted.content);
+    try std.testing.expectEqualStrings("I should greet", extracted.reasoning);
+}
+
+
+test "extractContentAndReasoning parses Chinese content" {
+    const alloc = std.testing.allocator;
+    var it = StreamIterator{
+        .allocator = alloc,
+        .reader = undefined,
+        .buffer = std.ArrayList(u8).empty,
+        .line_accumulator = std.ArrayList(u8).empty,
+        .transfer_buffer = &.{},
+        .tool_call_json = std.ArrayList(u8).empty,
+    };
+
+    const json = "{\"choices\":[{\"index\":0,\"delta\":{\"content\":\"你好，有什么可以帮你的吗？\"},\"finish_reason\":null}]}";
+    const extracted = try it.extractContentAndReasoning(json);
+    defer {
+        if (extracted.content.len > 0) alloc.free(extracted.content);
+        if (extracted.reasoning.len > 0) alloc.free(extracted.reasoning);
+    }
+    try std.testing.expectEqualStrings("你好，有什么可以帮你的吗？", extracted.content);
+}

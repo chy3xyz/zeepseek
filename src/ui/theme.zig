@@ -494,10 +494,10 @@ pub const Pal = struct {
     pub const fg_bright = colorToAnsi(rgb(245, 245, 245));
 
     // Role colors
-    pub const user = colorToAnsi(rgb(137, 180, 250));    // Blue
+    pub const user = colorToAnsi(rgb(137, 180, 250)); // Blue
     pub const assistant = colorToAnsi(rgb(166, 227, 161)); // Green
-    pub const system = colorToAnsi(rgb(249, 226, 175));   // Yellow
-    pub const tool = colorToAnsi(rgb(255, 184, 108));     // Orange
+    pub const system = colorToAnsi(rgb(249, 226, 175)); // Yellow
+    pub const tool = colorToAnsi(rgb(255, 184, 108)); // Orange
 
     // Accent colors
     pub const cyan = colorToAnsi(rgb(139, 233, 253));
@@ -520,6 +520,12 @@ pub const Pal = struct {
 
     // Code
     pub const code_fg = colorToAnsi(rgb(245, 245, 245));
+    pub const code_keyword = colorToAnsi(rgb(245, 194, 231));
+    pub const code_string = colorToAnsi(rgb(166, 227, 161));
+    pub const code_comment = colorToAnsi(rgb(108, 112, 134));
+    pub const code_number = colorToAnsi(rgb(255, 184, 108));
+    pub const code_function = colorToAnsi(rgb(139, 233, 253));
+    pub const code_type = colorToAnsi(rgb(249, 226, 175));
 
     // Backgrounds (24-bit)
     pub const bg_surface = "\x1b[48;2;30;30;46m";

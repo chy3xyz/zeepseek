@@ -46,6 +46,12 @@ pub const ListData = struct {
     items: []const []const u8,
 };
 
+pub const ConfirmPrompt = struct {
+    title: []const u8,
+    body: []const u8,
+    action: []const u8,
+};
+
 pub const Result = union(enum) {
     none,
     set_input: []const u8,
@@ -68,14 +74,17 @@ pub const Result = union(enum) {
     set_provider: []const u8,
     set_apikey: []const u8,
     set_theme: []const u8,
+    pick_model,
+    pick_provider,
+    confirm: ConfirmPrompt,
 };
 
 const commands_table = [_]Command{
     .{ .id = "help", .label = "/help", .desc = "Show help information" },
     .{ .id = "clear", .label = "/clear", .desc = "Clear conversation history" },
     .{ .id = "exit", .label = "/exit", .desc = "Quit the application" },
-    .{ .id = "model", .label = "/model", .desc = "Switch model", .kind = .prompt },
-    .{ .id = "provider", .label = "/provider", .desc = "Switch API provider and set key", .kind = .prompt },
+    .{ .id = "model", .label = "/model", .desc = "Switch model", .kind = .instant },
+    .{ .id = "provider", .label = "/provider", .desc = "Switch API provider and set key", .kind = .instant },
     .{ .id = "models", .label = "/models", .desc = "List available models", .kind = .output },
     .{ .id = "save", .label = "/save", .desc = "Save current session" },
     .{ .id = "load", .label = "/load", .desc = "Load a session from file" },
@@ -110,7 +119,20 @@ pub const Dispatcher = struct {
     {
         if (std.mem.eql(u8, id, "help")) return .show_help;
         if (std.mem.eql(u8, id, "exit")) return .quit;
-        if (std.mem.eql(u8, id, "clear") or std.mem.eql(u8, id, "new")) return .clear_chat;
+        if (std.mem.eql(u8, id, "clear") or std.mem.eql(u8, id, "new")) {
+            return .{ .confirm = .{
+                .title = if (std.mem.eql(u8, id, "new")) "Start new session?" else "Clear chat?",
+                .body = "This will remove the current conversation. This cannot be undone.",
+                .action = id,
+            } };
+        }
+        if (std.mem.eql(u8, id, "compact")) {
+            return .{ .confirm = .{
+                .title = "Compact context?",
+                .body = "This will summarize older messages to reduce token usage.",
+                .action = "compact",
+            } };
+        }
         if (std.mem.eql(u8, id, "save")) return .save_session;
         if (std.mem.eql(u8, id, "load")) return .load_session;
         if (std.mem.eql(u8, id, "think")) return .toggle_thinking;
@@ -118,14 +140,10 @@ pub const Dispatcher = struct {
         if (std.mem.eql(u8, id, "top")) return .scroll_top;
         if (std.mem.eql(u8, id, "bottom")) return .scroll_bottom;
         if (std.mem.eql(u8, id, "subagents")) return .toggle_subagents;
-        if (std.mem.eql(u8, id, "compact")) return .compact_context;
 
         if (std.mem.eql(u8, id, "model")) {
             if (args.len == 0) {
-                return .{ .prompt = .{
-                    .title = try ctx.allocator.dupe(u8, "Switch model"),
-                    .placeholder = try ctx.allocator.dupe(u8, "e.g. deepseek-chat"),
-                } };
+                return .pick_model;
             }
             return .{ .set_model = try ctx.allocator.dupe(u8, args) };
         }
@@ -150,10 +168,7 @@ pub const Dispatcher = struct {
 
         if (std.mem.eql(u8, id, "provider")) {
             if (args.len == 0) {
-                return .{ .prompt = .{
-                    .title = try ctx.allocator.dupe(u8, "Switch provider"),
-                    .placeholder = try ctx.allocator.dupe(u8, "deepseek, openai, groq, ollama..."),
-                } };
+                return .pick_provider;
             }
             return .{ .set_provider = try ctx.allocator.dupe(u8, args) };
         }
@@ -379,7 +394,9 @@ test "instant commands return direct results" {
 
     try std.testing.expectEqual(Result.show_help, try Dispatcher.execute(ctx, "help", ""));
     try std.testing.expectEqual(Result.quit, try Dispatcher.execute(ctx, "exit", ""));
-    try std.testing.expectEqual(Result.clear_chat, try Dispatcher.execute(ctx, "clear", ""));
+    const clear_res = try Dispatcher.execute(ctx, "clear", "");
+    try std.testing.expect(clear_res == .confirm);
+    try std.testing.expectEqualStrings("clear", clear_res.confirm.action);
 }
 
 test "model with args returns set_model" {
@@ -406,7 +423,7 @@ test "model with args returns set_model" {
     alloc.free(result.set_model);
 }
 
-test "model without args returns prompt" {
+test "model without args returns pick_model" {
     const alloc = std.testing.allocator;
     var pm = ProviderManager.init(alloc);
     defer pm.deinit();
@@ -426,13 +443,10 @@ test "model without args returns prompt" {
     };
 
     const result = try Dispatcher.execute(ctx, "model", "");
-    try std.testing.expectEqualStrings("Switch model", result.prompt.title);
-    try std.testing.expectEqualStrings("e.g. deepseek-chat", result.prompt.placeholder);
-    alloc.free(result.prompt.title);
-    alloc.free(result.prompt.placeholder);
+    try std.testing.expectEqual(Result.pick_model, result);
 }
 
-test "provider without args returns prompt" {
+test "provider without args returns pick_provider" {
     const alloc = std.testing.allocator;
     var pm = ProviderManager.init(alloc);
     defer pm.deinit();
@@ -452,10 +466,7 @@ test "provider without args returns prompt" {
     };
 
     const result = try Dispatcher.execute(ctx, "provider", "");
-    try std.testing.expectEqualStrings("Switch provider", result.prompt.title);
-    try std.testing.expectEqualStrings("deepseek, openai, groq, ollama...", result.prompt.placeholder);
-    alloc.free(result.prompt.title);
-    alloc.free(result.prompt.placeholder);
+    try std.testing.expectEqual(Result.pick_provider, result);
 }
 
 test "provider with args returns set_provider" {
@@ -502,4 +513,61 @@ test "unknown command returns error" {
     };
 
     try std.testing.expectError(error.UnknownCommand, Dispatcher.execute(ctx, "nope", ""));
+}
+
+test "model/provider without args open pickers" {
+    const alloc = std.testing.allocator;
+    var pm = ProviderManager.init(alloc);
+    defer pm.deinit();
+    var sandbox: Sandbox = undefined;
+    const ctx = CommandContext{
+        .allocator = alloc,
+        .io = undefined,
+        .provider = "deepseek",
+        .model = "deepseek-chat",
+        .subsystems_initialized = false,
+        .provider_mgr = &pm,
+        .sandbox = &sandbox,
+        .tokens_used = 0,
+        .ctx_max = 64000,
+        .cache_hit_rate = 0,
+        .session_id = "test",
+    };
+
+    const model_res = try Dispatcher.execute(ctx, "model", "");
+    try std.testing.expectEqual(.pick_model, model_res);
+
+    const provider_res = try Dispatcher.execute(ctx, "provider", "");
+    try std.testing.expectEqual(.pick_provider, provider_res);
+}
+
+test "clear/new/compact return confirmation" {
+    const alloc = std.testing.allocator;
+    var pm = ProviderManager.init(alloc);
+    defer pm.deinit();
+    var sandbox: Sandbox = undefined;
+    const ctx = CommandContext{
+        .allocator = alloc,
+        .io = undefined,
+        .provider = "deepseek",
+        .model = "deepseek-chat",
+        .subsystems_initialized = false,
+        .provider_mgr = &pm,
+        .sandbox = &sandbox,
+        .tokens_used = 0,
+        .ctx_max = 64000,
+        .cache_hit_rate = 0,
+        .session_id = "test",
+    };
+
+    const clear_res = try Dispatcher.execute(ctx, "clear", "");
+    try std.testing.expect(clear_res == .confirm);
+    try std.testing.expectEqualStrings("clear", clear_res.confirm.action);
+
+    const new_res = try Dispatcher.execute(ctx, "new", "");
+    try std.testing.expect(new_res == .confirm);
+    try std.testing.expectEqualStrings("new", new_res.confirm.action);
+
+    const compact_res = try Dispatcher.execute(ctx, "compact", "");
+    try std.testing.expect(compact_res == .confirm);
 }

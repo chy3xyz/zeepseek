@@ -239,7 +239,7 @@ pub const Reasonix = struct {
         errdefer alloc.destroy(entry);
 
         const tokens = tokenizer_mod.Tokenizer.count(value);
-        const now = self.time_fn.*;
+        const now = self.time_fn();
 
         entry.* = .{
             .key = key_copy,
@@ -253,7 +253,7 @@ pub const Reasonix = struct {
 
         try self.lirsStackPush(key_copy);
 
-        if (self.hot.getSize() >= self.config.max_hot_size) {
+        if (self.hot.count() >= self.config.max_hot_size) {
             try self.lirsEvict();
         }
 

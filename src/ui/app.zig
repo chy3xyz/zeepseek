@@ -1113,7 +1113,8 @@ pub const App = struct {
         }
 
         // Capture values for the thread
-        const api_key = self.provider_mgr.resolveApiKey(self.provider) orelse self.api_key;
+        const mgr_key = self.provider_mgr.resolveApiKey(self.provider) orelse "";
+        const api_key = if (mgr_key.len > 0) mgr_key else self.api_key;
         const model = self.provider_mgr.resolveModel(self.provider);
         const endpoint = self.provider_mgr.resolveEndpoint(self.provider);
         const alloc = self.alloc;

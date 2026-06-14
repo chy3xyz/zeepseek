@@ -34,6 +34,8 @@ pub const DeepSeekStreamClient = struct {
     endpoint: []const u8 = "https://api.deepseek.com/chat/completions",
     last_http_status: u16 = 0,
     last_http_body: ?[]u8 = null,
+    request: ?http.Client.Request = null,
+    response: ?http.Client.Response = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -52,6 +54,11 @@ pub const DeepSeekStreamClient = struct {
 
     pub fn deinit(self: *DeepSeekStreamClient) void {
         if (self.last_http_body) |b| self.allocator.free(b);
+        if (self.request) |*req| {
+            req.deinit();
+            self.request = null;
+        }
+        self.response = null;
         self.http_client.deinit();
     }
 
@@ -107,15 +114,22 @@ pub const DeepSeekStreamClient = struct {
             }
         }
 
-        var request = try self.http_client.request(.POST, uri, .{
+        if (self.request) |*req| {
+            req.deinit();
+            self.request = null;
+        }
+        self.response = null;
+
+        self.request = try self.http_client.request(.POST, uri, .{
             .extra_headers = &headers,
         });
+        const req = &self.request.?;
 
-        try request.sendBodyComplete(body);
-        errdefer request.deinit();
+        try req.sendBodyComplete(body);
 
         var redirect_buf: [8192]u8 = undefined;
-        var response = try request.receiveHead(&redirect_buf);
+        self.response = try req.receiveHead(&redirect_buf);
+        const response = &self.response.?;
 
         const status = @intFromEnum(response.head.status);
         if (status < 200 or status >= 300) {
@@ -139,11 +153,10 @@ pub const DeepSeekStreamClient = struct {
         }
 
         const transfer_buffer = try self.allocator.alloc(u8, 8192);
-        const body_reader = response.reader(transfer_buffer);
 
         return StreamIterator{
             .allocator = self.allocator,
-            .reader = body_reader,
+            .reader = response.reader(transfer_buffer),
             .buffer = try std.ArrayList(u8).initCapacity(self.allocator, 4096),
             .line_accumulator = try std.ArrayList(u8).initCapacity(self.allocator, 4096),
             .transfer_buffer = transfer_buffer,

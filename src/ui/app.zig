@@ -2435,16 +2435,17 @@ pub const App = struct {
         const footer_text = footer_buf.toOwnedSlice(a) catch "";
 
         // Build body: chat (left) + sidebar (right) using join.horizontal
+        const pa = ctx.persistent_allocator;
         const need_render = self.cached_chat_text == null or
             self.cached_chat_width != chat_w or
             self.cached_chat_height != body_h or
             self.cached_render_generation != self.render_generation;
         const chat_text = if (need_render) blk: {
             const fresh = self.renderClaudeChat(a, chat_w, body_h);
-            const persistent = self.alloc.dupe(u8, fresh) catch {
+            const persistent = pa.dupe(u8, fresh) catch {
                 break :blk fresh;
             };
-            if (self.cached_chat_text) |old| self.alloc.free(old);
+            if (self.cached_chat_text) |old| pa.free(old);
             const mutable = @constCast(self);
             mutable.cached_chat_text = persistent;
             mutable.cached_chat_width = chat_w;

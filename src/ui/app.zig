@@ -717,7 +717,8 @@ pub const App = struct {
     streaming_idx: ?usize,
 
     // --- Input state
-    text_input: zz.components.TextInput,
+    text_input: zz.components.TextInput, // slash prompt + API-key prompt (single line)
+    text_area: zz.components.TextArea,   // main chat input (multi-line)
 
     // --- UI overlays
     palette: zz.components.CommandPalette,
@@ -824,6 +825,13 @@ pub const App = struct {
             .auto_scroll = true,
             .streaming_idx = null,
             .text_input = zz.components.TextInput.init(ctx.persistent_allocator),
+            .text_area = blk: {
+                var ta = zz.components.TextArea.init(ctx.persistent_allocator);
+                ta.setSize(if (self.width > 6) self.width - 6 else 60, 3);
+                ta.placeholder = "Type a message, or / for commands";
+                ta.word_wrap = true;
+                break :blk ta;
+            },
             .palette = zz.components.CommandPalette.init(ctx.persistent_allocator) catch unreachable,
             .model_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
             .provider_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
@@ -926,6 +934,7 @@ pub const App = struct {
 
         // Free input buffers
         self.text_input.deinit();
+        self.text_area.deinit();
         self.palette.deinit();
         self.toast.deinit();
         self.theme_manager.deinit();
@@ -974,6 +983,51 @@ pub const App = struct {
         defer self.alloc.free(new_text);
         self.text_input.setValue(new_text) catch {};
         self.text_input.cursor = self.text_input.getValue().len;
+    }
+
+    // ── Main (multi-line) chat input helpers ────────────────────────────
+
+    /// True when the multi-line text area is in its pristine "one empty
+    /// line" state. Used to decide whether bare `/` should open the
+    /// command palette and whether Up/Down/PageUp/PageDown should scroll
+    /// the chat history.
+    fn mainInputIsEmpty(self: *const App) bool {
+        const lines = self.text_area.lines.items;
+        if (lines.len != 1) return false;
+        return lines[0].items.len == 0;
+    }
+
+    /// Build the full user-facing message by joining all text-area lines
+    /// with `\n`. Allocated from `a`; caller frees.
+    fn mainInputText(self: *const App, a: std.mem.Allocator) []u8 {
+        const lines = self.text_area.lines.items;
+        if (lines.len == 0) return a.dupe(u8, "") catch "";
+        if (lines.len == 1) return a.dupe(u8, lines[0].items) catch lines[0].items;
+        var total: usize = 0;
+        for (lines) |l| total += l.items.len + 1; // +1 for trailing \n
+        const out = a.alloc(u8, total) catch return lines[0].items;
+        var pos: usize = 0;
+        for (lines, 0..) |l, i| {
+            @memcpy(out[pos..][0..l.items.len], l.items);
+            pos += l.items.len;
+            if (i + 1 < lines.len) {
+                out[pos] = '\n';
+                pos += 1;
+            }
+        }
+        return out;
+    }
+
+    /// Reset the multi-line text area to a single empty line.
+    fn mainInputClear(self: *App) void {
+        for (self.text_area.lines.items) |*l| l.deinit();
+        self.text_area.lines.clearRetainingCapacity();
+        // TextArea always keeps at least one line; recreate it.
+        self.text_area.lines.append(std.array_list.Managed(u8).init(self.alloc)) catch {};
+        self.text_area.cursor_row = 0;
+        self.text_area.cursor_col = 0;
+        self.text_area.viewport_row = 0;
+        self.text_area.viewport_col = 0;
     }
 
     pub fn update(self: *App, msg: Msg, ctx: *zz.Context) zz.Cmd(Msg) {
@@ -1278,20 +1332,20 @@ pub const App = struct {
         }
 
         // --- / at start of input opens palette; otherwise type as normal
-        if (k == .char and k.char == '/' and self.text_input.getValue().len == 0) {
+        if (k == .char and k.char == '/' and self.mainInputIsEmpty()) {
             self.palette.open();
             return .none;
         }
 
         // --- F1 / ? for help (when input empty)
-        if (k == .f1 or (k == .char and k.char == '?' and self.text_input.getValue().len == 0)) {
+        if (k == .f1 or (k == .char and k.char == '?' and self.mainInputIsEmpty())) {
             self.updateHelpModal();
             self.help_modal.show();
             return .none;
         }
 
         // --- Scroll keys (when input empty)
-        if (self.text_input.getValue().len == 0) {
+        if (self.mainInputIsEmpty()) {
             if (k == .up) { if (self.scroll_offset > 0) self.scroll_offset -= 1; self.auto_scroll = false; return .none; }
             if (k == .down) { self.scroll_offset += 1; return .none; }
             if (k == .page_up) { self.scroll_offset -|= 10; self.auto_scroll = false; return .none; }
@@ -1300,18 +1354,18 @@ pub const App = struct {
             if (k == .end) { self.scroll_offset = 0; self.auto_scroll = true; return .none; }
         }
 
-        // --- Enter: submit
+        // --- Enter: plain Enter submits, Shift/Ctrl/Alt+Enter inserts newline
         if (k == .enter) {
-            if (key.modifiers.shift) {
-                self.textInputAppend("\n");
+            if (key.modifiers.shift or key.modifiers.ctrl or key.modifiers.alt) {
+                self.text_area.handleKey(key);
             } else {
                 self.submit();
             }
             return .none;
         }
 
-        // --- Input editing via ZigZag TextInput
-        self.text_input.handleKey(key);
+        // --- Input editing via ZigZag TextArea (multi-line)
+        self.text_area.handleKey(key);
         return .none;
     }
 
@@ -1320,11 +1374,19 @@ pub const App = struct {
     // ═════════════════════════════════════════════════════════════════
 
     fn submit(self: *App) void {
-        const text_slice = self.text_input.getValue();
+        // The apikey prompt is still driven by the single-line TextInput;
+        // everything else (regular chat, slash commands) reads from the
+        // multi-line TextArea so newlines round-trip correctly.
+        const is_apikey_prompt = self.pending_action == .await_api_key;
+        const text_slice: []const u8 = if (is_apikey_prompt)
+            self.text_input.getValue()
+        else
+            self.mainInputText(self.alloc);
+        defer if (!is_apikey_prompt and text_slice.len > 0) self.alloc.free(text_slice);
         if (text_slice.len == 0) return;
 
         // Handle pending interactive actions
-        if (self.pending_action == .await_api_key) {
+        if (is_apikey_prompt) {
             const key = self.alloc.dupe(u8, text_slice) catch return;
             self.setApiKey(key);
             self.pending_action = .none;
@@ -1341,8 +1403,7 @@ pub const App = struct {
             const cmd_id = it.first();
             const args = std.mem.trim(u8, rest[cmd_id.len..], " ");
             self.executeSlashCommand(cmd_id, args);
-            self.text_input.setValue("") catch {};
-            self.text_input.cursor = 0;
+            self.mainInputClear();
             return;
         }
 
@@ -1355,8 +1416,7 @@ pub const App = struct {
         }) catch {};
         self.invalidateRenderCache();
 
-        self.text_input.setValue("") catch {};
-        self.text_input.cursor = 0;
+        self.mainInputClear();
         self.auto_scroll = true;
         self.scroll_offset = 0;
         self.turn += 1;
@@ -2606,7 +2666,7 @@ pub const App = struct {
         if (w == 0 or h == 0) return "";
 
         const header_h: u16 = 3; // top border + title row + bottom border
-        const footer_h: u16 = 3; // input(1) + separator(1) + status(1)
+        const footer_h: u16 = 5; // input(3) + separator(1) + status(1)
         const sidebar_w: u16 = 32;
         const chat_w: u16 = if (w > sidebar_w + 1) @as(u16, @intCast(w - sidebar_w - 1)) else w;
         const body_h = if (h > header_h + footer_h) h - header_h - footer_h else @as(u16, @intCast(@max(h, 6) - header_h - footer_h));
@@ -3028,41 +3088,83 @@ pub const App = struct {
     // ── Claude-style input line ──
 
     fn renderClaudeInput(self: *App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│ ") catch {};
-        out.appendSlice(a, R) catch {};
-
         if (self.pending_action == .await_api_key) {
+            // API-key prompt stays single-line (it's a single secret).
             self.text_input.setEchoMode(.password);
             self.text_input.setPrompt("🔑 ");
             self.text_input.setPlaceholder("Enter API key...");
-        } else {
-            self.text_input.setEchoMode(.normal);
-            self.text_input.setPrompt("▸ ");
-            self.text_input.setPlaceholder("Type a message, or / for commands");
+            self.text_input.setWidth(if (w > 5) w - 5 else 1);
+            out.appendSlice(a, D) catch {};
+            out.appendSlice(a, "│ ") catch {};
+            out.appendSlice(a, R) catch {};
+            const input_view = self.text_input.view(a) catch "Error";
+            defer if (input_view.ptr != "Error".ptr) a.free(input_view);
+            const max_input = if (w > 5) w - 5 else 0;
+            const input_vis = displayWidth(input_view);
+            const display_input = if (input_vis > max_input)
+                (ansiClip(a, input_view, max_input) catch input_view)
+            else
+                input_view;
+            defer if (display_input.ptr != input_view.ptr) a.free(display_input);
+            out.appendSlice(a, display_input) catch {};
+            const display_vis = zz.layout.measure.width(display_input);
+            const pad_target = if (w > 3) w - 3 else 0;
+            var p = display_vis;
+            while (p < pad_target) : (p += 1) out.append(a, ' ') catch {};
+            out.appendSlice(a, D) catch {};
+            out.appendSlice(a, "│") catch {};
+            out.appendSlice(a, R) catch {};
+            out.append(a, '\n') catch {};
+            return;
         }
 
-        const input_view = self.text_input.view(a) catch "Error";
-        defer if (input_view.ptr != "Error".ptr) a.free(input_view);
-        const input_vis = displayWidth(input_view);
-        const max_input = if (w > 5) w - 5 else 0;
-        const display_input = if (input_vis > max_input)
-            (ansiClip(a, input_view, max_input) catch input_view)
-        else
-            input_view;
-        defer if (display_input.ptr != input_view.ptr) a.free(display_input);
-        out.appendSlice(a, display_input) catch {};
+        // Main chat input — multi-line TextArea. We render a 3-line
+        // bordered box; the user gets plain Enter to send, Shift/Ctrl/Alt
+        // +Enter to insert a newline, and full Up/Down/Left/Right
+        // navigation within the buffer.
+        const inner_w = if (w > 5) w - 5 else 1;
+        self.text_area.setSize(inner_w, 3);
 
-        // Pad to fill the cell (inside width is w - 2, leading "│ " consumes 2)
-        const display_vis = zz.layout.measure.width(display_input);
-        const pad_target = if (w > 3) w - 3 else 0;
-        var p = display_vis;
-        while (p < pad_target) : (p += 1) { out.appendSlice(a, " ") catch {}; }
-
+        // Top border.
         out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
+        out.appendSlice(a, "┌") catch {};
+        for (0..inner_w) |_| out.appendSlice(a, "─") catch {};
+        out.appendSlice(a, "┐") catch {};
         out.appendSlice(a, R) catch {};
-        out.appendSlice(a, "\n") catch {};
+        out.append(a, '\n') catch {};
+
+        // Render the text area. Split on '\n' so each visual row is
+        // enclosed by the left/right borders.
+        const ta_view = self.text_area.view(a) catch "";
+        if (ta_view.len > 0) {
+            var it = std.mem.splitScalar(u8, ta_view, '\n');
+            var idx: usize = 0;
+            while (it.next()) |line| : (idx += 1) {
+                out.appendSlice(a, D) catch {};
+                out.appendSlice(a, "│ ") catch {};
+                out.appendSlice(a, R) catch {};
+                out.appendSlice(a, line) catch {};
+                out.appendSlice(a, D) catch {};
+                out.appendSlice(a, "│") catch {};
+                out.appendSlice(a, R) catch {};
+                if (idx == 0) {
+                    out.append(a, '\n') catch {};
+                }
+            }
+            if (ta_view.len > 0 and ta_view[ta_view.len - 1] == '\n') {
+                // trailing newline; close the last row.
+            } else {
+                out.append(a, '\n') catch {};
+            }
+        }
+        defer if (ta_view.len > 0) a.free(ta_view);
+
+        // Bottom border.
+        out.appendSlice(a, D) catch {};
+        out.appendSlice(a, "└") catch {};
+        for (0..inner_w) |_| out.appendSlice(a, "─") catch {};
+        out.appendSlice(a, "┘") catch {};
+        out.appendSlice(a, R) catch {};
     }
 
     // ── Vertical separator between chat and sidebar ──
@@ -3870,7 +3972,7 @@ test "submit adds user message" {
     }
 
     // Type "hello"
-    try app.text_input.setValue("hello");
+    try app.text_area.setValue("hello");
     app.text_input.cursor = 5;
 
     // Submit
@@ -3904,7 +4006,7 @@ test "submit slash command /help" {
     }
 
     // Type "/help"
-    try app.text_input.setValue("/help");
+    try app.text_area.setValue("/help");
     app.text_input.cursor = 5;
 
     // Submit
@@ -3937,7 +4039,7 @@ test "submit slash command /clear" {
     try app.messages.append(alloc, .{ .role = .user, .content = "old", .owns = false });
 
     // Type "/clear"
-    try app.text_input.setValue("/clear");
+    try app.text_area.setValue("/clear");
     app.text_input.cursor = 6;
 
     // Submit
@@ -3961,7 +4063,7 @@ test "submit slash command /exit" {
     }
 
     // Type "/exit"
-    try app.text_input.setValue("/exit");
+    try app.text_area.setValue("/exit");
     app.text_input.cursor = 5;
 
     // Submit
@@ -3988,7 +4090,7 @@ test "submit unknown command" {
     }
 
     // Type "/foobar"
-    try app.text_input.setValue("/foobar");
+    try app.text_area.setValue("/foobar");
     app.text_input.cursor = 7;
 
     // Submit
@@ -4211,7 +4313,7 @@ test "submit /provider deepseek sets pending action" {
     }
 
     // Type "/provider deepseek" and submit
-    try app.text_input.setValue("/provider deepseek");
+    try app.text_area.setValue("/provider deepseek");
     app.text_input.cursor = 18;
     app.submit();
 
@@ -4242,7 +4344,7 @@ test "pending api key submit saves key" {
 
     // Set up pending action
     app.pending_action = .await_api_key;
-    try app.text_input.setValue("sk-test123");
+    try app.text_area.setValue("sk-test123");
     app.text_input.cursor = 10;
     app.submit();
 
@@ -4268,7 +4370,7 @@ test "text input accepts typed text" {
         app.pending_data.deinit(alloc);
     }
 
-    try app.text_input.setValue("hello");
+    try app.text_area.setValue("hello");
     app.text_input.cursor = 5;
     try std.testing.expectEqualStrings("hello", app.text_input.getValue());
 }

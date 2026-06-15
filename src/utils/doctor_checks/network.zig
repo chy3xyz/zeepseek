@@ -35,40 +35,25 @@ fn runInner(ctx: *const doctor.Ctx) !doctor.CheckResult {
     // 1. Parse the endpoint into scheme / host / port.
     const parsed = try parseEndpoint(ctx.endpoint);
 
-    // 2. Resolve host → IpAddress (DNS lookup).
+    // 2. Resolve host → IpAddress (DNS lookup). This validates the
+    //    upstream is at least routable from this machine's resolver.
+    //    We deliberately do NOT open a TCP stream here: the vtable
+    //    connect/close path in Zig 0.17 has been a source of subtle
+    //    runtime panics, and the synchronous DNS lookup is enough to
+    //    surface the most common reachability issues (wrong host,
+    //    missing DNS, network down). A real round-trip is exercised
+    //    every time the user actually sends a message.
     const addr = std.Io.net.IpAddress.resolve(io, parsed.host, parsed.port) catch |err| {
         return failWith(a, parsed, @errorName(err));
     };
 
-    // 3. Open a TCP stream to validate reachability. Honor the configured
-    //    timeout when the implementation can express one, otherwise the
-    //    connect will block at the OS default.
-    const timeout: std.Io.Timeout = if (ctx.http_probe_timeout_ms == 0)
-        .none
-    else
-        .{
-            .duration = .{
-                .raw = .{ .nanoseconds = @as(i96, @intCast(ctx.http_probe_timeout_ms)) * 1_000_000 },
-                .clock = .awake,
-            },
-        };
-
-    var stream = std.Io.net.IpAddress.connect(&addr, io, .{
-        .mode = .stream,
-        .protocol = .tcp,
-        .timeout = timeout,
-    }) catch |err| {
-        return failWith(a, parsed, @errorName(err));
-    };
-    defer std.Io.net.Stream.close(&stream, io);
-
-    // 4. Format the resolved IP for the success detail line.
+    // 3. Format the resolved IP for the success detail line.
     var ip_buf: [64]u8 = undefined;
     var ip_w: std.Io.Writer = .fixed(&ip_buf);
     std.Io.net.IpAddress.format(addr, &ip_w) catch {};
 
     const name = try a.dupe(u8, "network");
-    const detail = try std.fmt.allocPrint(a, "reachable: {s}:{d} (resolved to {s})", .{
+    const detail = try std.fmt.allocPrint(a, "dns resolves {s}:{d} → {s}", .{
         parsed.host,
         parsed.port,
         ip_buf[0..ip_w.end],

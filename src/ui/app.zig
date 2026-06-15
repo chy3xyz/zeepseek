@@ -753,6 +753,8 @@ pub const App = struct {
     // --- Session state
     session_id: []const u8,
     session_dir: []const u8,
+    messages_dirty: bool = false, // true after any user/assistant/tool change; cleared by saveSession
+    auto_save_tick_counter: u32 = 0,
     should_quit: bool,
 
     // --- Lifetime-safe init command batch
@@ -854,7 +856,7 @@ pub const App = struct {
                 break :blk if (key_ptr) |k| std.mem.sliceTo(k, 0) else "";
             },
             .io = ctx.io,
-            .session_id = "default",
+            .session_id = ctx.persistent_allocator.dupe(u8, "default") catch "default",
             .session_dir = "",
             .should_quit = false,
             .turn = 0,
@@ -975,6 +977,8 @@ pub const App = struct {
         if (self.api_key.len > 0) {
             std.heap.page_allocator.free(self.api_key);
         }
+        // Free the always-allocated session id.
+        self.alloc.free(self.session_id);
     }
 
     fn textInputAppend(self: *App, bytes: []const u8) void {
@@ -1040,6 +1044,9 @@ pub const App = struct {
             self.text_input.setPrompt("> ");
             self.text_input.setPlaceholder("Type a message, or / for commands");
             self.text_input.setWidth(self.width - 6);
+            // Auto-restore the previous session before any UI is drawn,
+            // so the user comes back to the conversation they were in.
+            self.tryAutoRestore();
             self.provider_mgr = ProviderManager.init(ctx.persistent_allocator);
             // Register default deepseek provider
             self.provider_mgr.addProvider(.{
@@ -1114,6 +1121,14 @@ pub const App = struct {
                 if (self.reasonix) |r| {
                     self.cache_hit_rate = r.hitRate();
                 }
+                // Periodic safety-net auto-save: every ~90s if anything
+                // is dirty. onStreamDone is the primary checkpoint; this
+                // catches runaway streams and tool-call sequences.
+                self.auto_save_tick_counter +%= 1;
+                if (self.messages_dirty and self.auto_save_tick_counter % 3000 == 0) {
+                    self.saveSession();
+                    self.saveLastSessionPointer();
+                }
                 // Toast auto-dismiss is handled by zz.components.Toast based on timestamps
             },
         }
@@ -1161,8 +1176,8 @@ pub const App = struct {
                         if (idx == 0) {
                             if (self.confirm_action) |action| {
                                 switch (action) {
-                                    .clear => self.clearMessages(),
-                                    .new => self.clearMessages(), // TODO: full new-session reset
+                                    .clear => self.rotateSession(),
+                                    .new => self.rotateSession(),
                                     .compact => self.compactContext(),
                                 }
                             }
@@ -1414,7 +1429,12 @@ pub const App = struct {
             .timestamp = 0,
             .owns = true,
         }) catch {};
+        self.messages_dirty = true;
         self.invalidateRenderCache();
+        // Persist the user message before the network round-trip so a
+        // mid-flight crash still leaves the prompt on disk.
+        self.saveSession();
+        self.saveLastSessionPointer();
 
         self.mainInputClear();
         self.auto_scroll = true;
@@ -1987,6 +2007,11 @@ pub const App = struct {
         // Streaming text mutates the tail message; the cached history
         // is unaffected, so we do NOT invalidate the history cache here.
         if (self.auto_scroll) self.scroll_offset = 0;
+        // Mark the session dirty so the periodic safety-net save in the
+        // tick handler will flush mid-stream progress. onStreamDone is
+        // the primary checkpoint; this is just insurance against a
+        // runaway stream.
+        self.messages_dirty = true;
     }
 
     fn onStreamReasoning(self: *App, text: []const u8) void {
@@ -2012,6 +2037,10 @@ pub const App = struct {
         // The completed message now belongs to history; force a re-render
         // so the tail doesn't keep owning it.
         self.invalidateRenderCache();
+        // Auto-save the full turn so a crash / kill mid-session doesn't
+        // lose the assistant's reply.
+        self.saveSession();
+        self.saveLastSessionPointer();
     }
 
     fn onStreamError(self: *App, err_msg: []const u8) void {
@@ -2241,7 +2270,7 @@ pub const App = struct {
             },
 
             .quit => self.should_quit = true,
-            .clear_chat => self.clearMessages(),
+            .clear_chat => self.rotateSession(),
             .save_session => self.saveSession(),
             .load_session => self.loadSessionFromDefault(),
             .toggle_thinking => self.show_thinking = !self.show_thinking,
@@ -2434,20 +2463,107 @@ pub const App = struct {
         _ = std.c.mkdir(&dir_buf, 0o755);
         // Build file path
         var path_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, self.session_id }, 0) catch return;
-        // Write messages using C API
+        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.zsess", .{ home, self.session_id }, 0) catch return;
+        // Write messages using a tagged length-prefixed format that
+        // tolerates ANY content (newlines, colons, quotes, …):
+        //   # zeepseek-session-v1
+        //   R <role>
+        //   C <content_len>
+        //   <exactly content_len bytes of content>
+        //   T <thinking_len or 0>
+        //   [<exactly thinking_len bytes of thinking>]
+        //   D <timestamp>
         const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
         const fd = std.c.open(&path_buf, flags, @as(std.c.mode_t, 0o644));
         if (fd < 0) return;
         defer _ = std.c.close(fd);
+
+        _ = std.c.write(fd, "# zeepseek-session-v1\n", 22);
+
         for (self.messages.items) |m| {
             const role_str: []const u8 = switch (m.role) {
-                .user => "USER", .assistant => "ASSISTANT", .system => "SYSTEM", .tool => "TOOL",
+                .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
             };
-            // Write role:content\n using write()
-            var line_buf: [4096]u8 = undefined;
-            const line = std.fmt.bufPrint(&line_buf, "{s}:{s}\n", .{ role_str, m.content }) catch &.{};
-            _ = std.c.write(fd, line.ptr, line.len);
+            var head_buf: [256]u8 = undefined;
+            const head_r = std.fmt.bufPrint(&head_buf, "R {s}\nC {d}\n", .{ role_str, m.content.len }) catch continue;
+            _ = std.c.write(fd, head_r.ptr, head_r.len);
+            _ = std.c.write(fd, m.content.ptr, m.content.len);
+            if (m.thinking) |th| {
+                const think_h = std.fmt.bufPrint(&head_buf, "\nT {d}\n", .{th.len}) catch continue;
+                _ = std.c.write(fd, think_h.ptr, think_h.len);
+                _ = std.c.write(fd, th.ptr, th.len);
+            } else {
+                _ = std.c.write(fd, "\nT 0\n", 5);
+            }
+            const tail = std.fmt.bufPrint(&head_buf, "D {d}\n", .{m.timestamp}) catch continue;
+            _ = std.c.write(fd, tail.ptr, tail.len);
+        }
+    }
+
+    /// Write the path of the last-saved session to a tiny pointer file
+    /// so the next startup can auto-restore it.
+    fn saveLastSessionPointer(self: *App) void {
+        const home_ptr = std.c.getenv("HOME") orelse return;
+        const home = std.mem.sliceTo(home_ptr, 0);
+        if (home.len == 0) return;
+        var path_buf: [512:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/last_session.txt", .{home}, 0) catch return;
+        const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+        const fd = std.c.open(&path_buf, flags, @as(std.c.mode_t, 0o644));
+        if (fd < 0) return;
+        defer _ = std.c.close(fd);
+        _ = std.c.write(fd, self.session_id.ptr, self.session_id.len);
+        _ = std.c.write(fd, "\n", 1);
+    }
+
+    /// Read the last-session pointer. Returns the session_id it points
+    /// to, or null if there is no pointer / it can't be parsed / HOME
+    /// is unset. The caller is expected to try loading the session file
+    /// and gracefully fall back to a fresh session if it doesn't exist.
+    fn loadLastSessionPointer(self: *App) ?[]u8 {
+        const home_ptr = std.c.getenv("HOME") orelse return null;
+        const home = std.mem.sliceTo(home_ptr, 0);
+        if (home.len == 0) return null;
+        var path_buf: [512:0]u8 = undefined;
+        const pw = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/last_session.txt", .{home}, 0) catch return null;
+        const fd = std.c.open(pw.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (fd < 0) return null;
+        defer _ = std.c.close(fd);
+        var buf: [256]u8 = undefined;
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) return null;
+        const trimmed = std.mem.trim(u8, buf[0..@intCast(n)], " \t\r\n");
+        if (trimmed.len == 0) return null;
+        return self.alloc.dupe(u8, trimmed) catch null;
+    }
+
+    /// Try to auto-restore the last session on startup. Called from the
+    /// lazy init block once subsystems are ready. No-op when
+    /// `ZEEPSEEK_NO_AUTO_RESTORE=1` is set or no pointer exists.
+    fn tryAutoRestore(self: *App) void {
+        if (std.c.getenv("ZEEPSEEK_NO_AUTO_RESTORE") != null) return;
+        const sid = self.loadLastSessionPointer() orelse return;
+        defer self.alloc.free(sid);
+        const home_ptr = std.c.getenv("HOME") orelse return;
+        const home = std.mem.sliceTo(home_ptr, 0);
+        var path_buf: [512:0]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.zsess", .{ home, sid }, 0) catch return;
+        // Probe for existence with a quick open.
+        const probe = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+        if (probe < 0) return; // pointer stale; leave the fresh session alone
+        _ = std.c.close(probe);
+
+        self.alloc.free(self.session_id);
+        self.session_id = self.alloc.dupe(u8, sid) catch return;
+        self.loadSession(std.mem.sliceTo(&path_buf, 0));
+        if (self.messages.items.len > 0) {
+            const msg = std.fmt.allocPrint(
+                self.alloc,
+                "Restored last session '{s}' ({d} messages)",
+                .{ self.session_id, self.messages.items.len },
+            ) catch return;
+            self.setNotification(msg);
+            self.alloc.free(msg);
         }
     }
 
@@ -2455,7 +2571,7 @@ pub const App = struct {
         const home_ptr = std.c.getenv("HOME") orelse return;
         const home = std.mem.sliceTo(home_ptr, 0);
         var path_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, self.session_id }, 0) catch return;
+        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.zsess", .{ home, self.session_id }, 0) catch return;
         // Check if file exists
         const fd = std.c.open(&path_buf, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) {
@@ -2473,7 +2589,7 @@ pub const App = struct {
         const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) return;
         defer _ = std.c.close(fd);
-        // Read entire file
+        // Slurp the whole file.
         var data = std.ArrayList(u8).empty;
         defer data.deinit(self.alloc);
         var read_buf: [4096]u8 = undefined;
@@ -2482,23 +2598,67 @@ pub const App = struct {
             if (n <= 0) break;
             data.appendSlice(self.alloc, read_buf[0..@intCast(n)]) catch break;
         }
+        // Reject anything that isn't the v1 format; the old
+        // ROLE:content\n files will be silently ignored, and a fresh
+        // save on the next checkpoint will overwrite them.
+        if (data.items.len < 22 or !std.mem.eql(u8, data.items[0..22], "# zeepseek-session-v1\n")) {
+            // Old format / empty / corrupt: don't clobber the user's
+            // current messages with a half-parse.
+            return;
+        }
+
         self.clearMessages();
-        var line_iter = std.mem.splitScalar(u8, data.items, '\n');
-        while (line_iter.next()) |line| {
-            if (line.len == 0) continue;
-            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-                const role_str = line[0..colon];
-                const content = if (colon + 1 < line.len) line[colon + 1 ..] else "";
-                const role: Role = if (std.mem.eql(u8, role_str, "USER")) .user
-                    else if (std.mem.eql(u8, role_str, "ASSISTANT")) .assistant
-                    else if (std.mem.eql(u8, role_str, "SYSTEM")) .system
-                    else .tool;
-                self.messages.append(self.alloc, .{
-                    .role = role,
-                    .content = self.alloc.dupe(u8, content) catch continue,
-                    .owns = true,
-                }) catch {};
+        var pos: usize = 22;
+        while (pos < data.items.len) {
+            // R <role>\n
+            const r_end = std.mem.indexOfScalar(u8, data.items[pos..], '\n') orelse break;
+            const role_line = data.items[pos..][0..r_end];
+            pos += r_end + 1;
+            if (role_line.len < 2 or role_line[0] != 'R' or role_line[1] != ' ') break;
+            const role_str = role_line[2..];
+            const role: Role = if (std.mem.eql(u8, role_str, "user")) .user
+                else if (std.mem.eql(u8, role_str, "assistant")) .assistant
+                else if (std.mem.eql(u8, role_str, "system")) .system
+                else if (std.mem.eql(u8, role_str, "tool")) .tool
+                else break;
+
+            // C <content_len>\n
+            const c_end = std.mem.indexOfScalar(u8, data.items[pos..], '\n') orelse break;
+            const c_line = data.items[pos..][0..c_end];
+            pos += c_end + 1;
+            if (c_line.len < 2 or c_line[0] != 'C' or c_line[1] != ' ') break;
+            const content_len = std.fmt.parseInt(usize, c_line[2..], 10) catch break;
+            if (pos + content_len > data.items.len) break;
+            const content = self.alloc.dupe(u8, data.items[pos..][0..content_len]) catch break;
+            pos += content_len;
+
+            // T <thinking_len>\n
+            const t_end = std.mem.indexOfScalar(u8, data.items[pos..], '\n') orelse break;
+            const t_line = data.items[pos..][0..t_end];
+            pos += t_end + 1;
+            if (t_line.len < 2 or t_line[0] != 'T' or t_line[1] != ' ') break;
+            const thinking_len = std.fmt.parseInt(usize, t_line[2..], 10) catch break;
+            var thinking_owned: ?[]u8 = null;
+            if (thinking_len > 0) {
+                if (pos + thinking_len > data.items.len) break;
+                thinking_owned = self.alloc.dupe(u8, data.items[pos..][0..thinking_len]) catch break;
+                pos += thinking_len;
             }
+
+            // D <timestamp>\n
+            const d_end = std.mem.indexOfScalar(u8, data.items[pos..], '\n') orelse break;
+            const d_line = data.items[pos..][0..d_end];
+            pos += d_end + 1;
+            if (d_line.len < 2 or d_line[0] != 'D' or d_line[1] != ' ') break;
+            const ts = std.fmt.parseInt(i64, d_line[2..], 10) catch 0;
+
+            self.messages.append(self.alloc, .{
+                .role = role,
+                .content = content,
+                .thinking = thinking_owned,
+                .timestamp = ts,
+                .owns = true,
+            }) catch {};
         }
         self.auto_scroll = true;
         self.invalidateRenderCache();
@@ -2541,6 +2701,29 @@ pub const App = struct {
         if (self.cache_loop) |cl| cl.context.clear();
         if (self.ctx_mgr) |cm| cm.clear();
         self.invalidateRenderCache();
+    }
+
+    /// Persist the current session to disk, then swap in a fresh
+    /// session_id so the old conversation survives on disk and can be
+    /// reloaded with `/load`. Used by /clear and /new so the user can
+    /// start fresh without nuking history.
+    fn rotateSession(self: *App) void {
+        if (self.messages.items.len > 0) {
+            // Persist the conversation we are about to leave behind.
+            self.saveSession();
+        }
+        const ts = session_manager.currentTimestamp();
+        var new_id_buf: [64]u8 = undefined;
+        const new_id = std.fmt.bufPrint(
+            &new_id_buf,
+            "session-{d}",
+            .{ts},
+        ) catch "session";
+        const new_id_owned = self.alloc.dupe(u8, new_id) catch new_id;
+        self.alloc.free(self.session_id);
+        self.session_id = new_id_owned;
+        self.clearMessages();
+        self.saveLastSessionPointer();
     }
 
     /// Compact older messages to reduce token usage.
@@ -3865,6 +4048,13 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.auto_scroll = true;
     app.streaming_idx = null;
     app.text_input = zz.components.TextInput.init(alloc);
+    app.text_area = blk: {
+        var ta = zz.components.TextArea.init(alloc);
+        ta.setSize(74, 3);
+        ta.placeholder = "Type a message, or / for commands";
+        ta.word_wrap = true;
+        break :blk ta;
+    };
     app.palette = zz.components.CommandPalette.init(alloc) catch unreachable;
     for (SlashDispatcher.Dispatcher.commands()) |cmd| {
         app.palette.addCommand(.{
@@ -3888,7 +4078,7 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.stream_thread = null;
     app.api_key = "";
     app.io = undefined;
-    app.session_id = "test";
+    app.session_id = alloc.dupe(u8, "test") catch unreachable;
     app.session_dir = "";
     app.should_quit = false;
     app.turn = 0;

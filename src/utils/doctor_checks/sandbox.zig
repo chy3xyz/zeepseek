@@ -121,9 +121,13 @@ test "run returns pass on a platform with a real backend" {
     };
 
     const result = try run(&ctx);
+    // Free the optional hint first (immediately, since nothing else uses
+    // it), then defer the required strings. `defer` cannot appear in an
+    // `if (cond) |x| defer …` capture pattern in Zig, so we use a direct
+    // `if … free …` statement here instead.
+    if (result.hint) |h| std.testing.allocator.free(h);
     defer std.testing.allocator.free(result.name);
     defer std.testing.allocator.free(result.detail);
-    if (result.hint) |h| defer std.testing.allocator.free(h);
 
     try std.testing.expectEqualStrings("sandbox", result.name);
     try std.testing.expect(result.status == .pass);
@@ -146,9 +150,9 @@ test "run returns warn with hint on platforms without a backend" {
     };
 
     const result = try run(&ctx);
+    if (result.hint) |h| std.testing.allocator.free(h);
     defer std.testing.allocator.free(result.name);
     defer std.testing.allocator.free(result.detail);
-    if (result.hint) |h| defer std.testing.allocator.free(h);
 
     try std.testing.expectEqualStrings("sandbox", result.name);
     try std.testing.expect(result.status == .warn);

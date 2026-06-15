@@ -3185,24 +3185,34 @@ pub const App = struct {
                 out.appendSlice(a, R) catch {};
             }
 
-            // Thinking collapse toggle (only for assistant with thinking)
+            // Thinking collapse toggle (only for assistant with thinking).
+            //
+            // During streaming we force the toggle open so the user can
+            // watch the reasoning being typed in real time — the rate-limited
+            // drain already reveals it ~30 bytes per tick, but if the toggle
+            // stays in its default-collapsed state the user only sees a
+            // static "▸ thinking..." label and concludes the app is frozen.
+            // Once streaming completes, the user's own think_collapsed
+            // preference is honored again and they can collapse the block
+            // to clean up the view.
             if (m.thinking) |th| {
                 if (th.len > 0) {
+                    const show_thinking = !m.think_collapsed or is_streaming;
                     out.appendSlice(a, "\n") catch {};
                     out.appendSlice(a, D) catch {};
                     out.appendSlice(a, "│   ") catch {};
                     out.appendSlice(a, R) catch {};
-                    const toggle_icon: []const u8 = if (m.think_collapsed) "▸" else "▾";
+                    const toggle_icon: []const u8 = if (show_thinking) "▾" else "▸";
                     out.appendSlice(a, Pal.cyan) catch {};
                     out.appendSlice(a, toggle_icon) catch {};
                     out.appendSlice(a, " ") catch {};
                     out.appendSlice(a, Pal.fg_dim) catch {};
-                    if (m.think_collapsed) {
-                        out.appendSlice(a, "thinking...") catch {};
-                    } else {
+                    if (show_thinking) {
                         out.appendSlice(a, "thinking: ") catch {};
                         out.appendSlice(a, Pal.orange) catch {};
                         out.appendSlice(a, th) catch {};
+                    } else {
+                        out.appendSlice(a, "thinking...") catch {};
                     }
                     out.appendSlice(a, R) catch {};
                 }

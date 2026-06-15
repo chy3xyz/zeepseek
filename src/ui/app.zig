@@ -1564,16 +1564,15 @@ pub const App = struct {
                 // very little content, or the API explicitly reported a length
                 // stop, retry synchronously.
                 //
-                // Only the truncation signal triggers a sync retry. The
-                // previous "or total_content_len < 120" clause was added when
-                // DeepSeek Chat was returning ~20 chars due to a bad
-                // max_tokens request; that bug is fixed by
-                // maxTokensForModel, but the length guard was silently
-                // replacing every short (< 120 byte) reply with a
-                // single-shot full copy, which bypasses the rate-limited
-                // drain and makes the typing effect impossible to see.
+                // The "< 120" guard covers the case where the stream stalls
+                // early or returns very little (the original DeepSeek Chat
+                // "20 chars" bug we saw before maxTokensForModel existed);
+                // the truncation guard covers finish_reason == "length".
+                // The fallback content is NOT spliced in all at once — it
+                // is pushed through the rate-limited queue in pollStream so
+                // the typing effect is preserved.
                 const was_truncated = std.mem.eql(u8, stream.finish_reason, "length");
-                if (was_truncated and !stream.has_tool_calls) {
+                if ((state.total_content_len < 120 or was_truncated) and !stream.has_tool_calls) {
                     if (debug_stream) std.debug.print("[zeepseek stream] streaming response truncated (finish_reason={s}, {d} bytes), trying sync fallback\n", .{ stream.finish_reason, state.total_content_len });
                     const fallback = client.sendMessageSync(api_k, prompt, ctx, mdl, cache_d, sys, reason) catch |err| blk: {
                         if (debug_stream) std.debug.print("[zeepseek stream] sync fallback failed: {s}\n", .{@errorName(err)});
@@ -1635,20 +1634,39 @@ pub const App = struct {
 
         // Check done
         if (ss.isDone()) {
-            // If the streaming endpoint returned a truncated response and the
-            // sync fallback produced a full response, replace the assistant's
-            // content with the fallback version.
+            // If the streaming endpoint returned a truncated / very short
+            // response and the sync fallback produced a full reply, splice
+            // the full text into the rate-limited queue instead of
+            // replacing the message wholesale. This keeps the typing effect
+            // intact on the fallback path too. The stream stays alive
+            // (streaming_idx is preserved) until the fallback text has
+            // fully drained out of the queue.
             if (ss.fallback_content) |fb| {
+                // 1. Drop the partial stream content from the message —
+                //    the fallback is the authoritative full reply.
                 if (self.streaming_idx) |idx| {
                     const msg = &self.messages.items[idx];
-                    if (msg.owns and msg.content.len > 0) self.alloc.free(msg.content);
-                    msg.content = self.alloc.dupe(u8, fb) catch msg.content;
-                    msg.owns = true;
+                    if (msg.owns and msg.content.len > 0) {
+                        self.alloc.free(msg.content);
+                        msg.content = "";
+                    }
                 }
+                // 2. Drop any remaining stream bytes still in the queue.
+                if (ss.drainContent(self.alloc, std.math.maxInt(usize))) |leftover| self.alloc.free(leftover);
+                // 3. Push the fallback text into the queue; the normal
+                //    rate-limited drain at the top of pollStream will
+                //    reveal it across the next several ticks.
+                ss.pushContent(fb);
                 self.alloc.free(fb);
                 ss.fallback_content = null;
-                if (ss.drainContent(self.alloc, std.math.maxInt(usize))) |leftover| self.alloc.free(leftover);
+                // Don't finalize yet — the fallback text still needs to
+                // drain. Next tick will continue here.
+                return;
             }
+
+            // If the queue (fallback text or late stream bytes) still has
+            // content waiting to be revealed, hold off on finalizing.
+            if (ss.content_queue.items.len > 0) return;
 
             // Check for tool calls BEFORE marking done
             const has_tc = ss.has_tool_calls.load(.acquire);

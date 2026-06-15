@@ -37,6 +37,7 @@ const _clipboard = @import("utils/clipboard.zig");
 const _doctor = @import("utils/doctor.zig");
 const _doctor_config = @import("utils/doctor_checks/config.zig");
 const _doctor_network = @import("utils/doctor_checks/network.zig");
+const _session_catalog = @import("storage/session_catalog.zig");
 const _reasonix = @import("cache/reasonix.zig");
 const _context_manager = @import("dispatch/context_manager.zig");
 const _cache_first_loop = @import("dispatch/cache_first_loop.zig");

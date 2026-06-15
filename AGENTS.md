@@ -262,6 +262,7 @@ These are slash commands available in the TUI input area:
 | `/compact` | Summarize old messages to reduce token usage |
 | `/save` | Save current session to disk |
 | `/load` | Load a saved session |
+| `/sessions` | Browse and reload a saved session by id |
 | `/status` | Show context usage and budget |
 | `/new` | Start a fresh session |
 

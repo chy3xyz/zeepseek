@@ -2,6 +2,8 @@ const std = @import("std");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
 const Sandbox = @import("../utils/sandbox.zig").Sandbox;
 
+const session_catalog = @import("../storage/session_catalog.zig");
+
 pub const CommandKind = enum {
     instant,
     prompt,
@@ -52,6 +54,15 @@ pub const ConfirmPrompt = struct {
     action: []const u8,
 };
 
+/// Result payload for `/sessions`. The UI consumes this to populate a
+/// picker over the saved session files; the dispatcher is responsible
+/// for freeing `items` via `session_catalog.deinitList` after the UI
+/// has copied what it needs.
+pub const SessionPickerInit = struct {
+    title: []const u8,
+    items: []session_catalog.SessionMeta,
+};
+
 pub const Result = union(enum) {
     none,
     set_input: []const u8,
@@ -78,6 +89,7 @@ pub const Result = union(enum) {
     pick_provider,
     confirm: ConfirmPrompt,
     run_doctor,
+    show_sessions_picker: SessionPickerInit,
 };
 
 const commands_table = [_]Command{
@@ -89,7 +101,7 @@ const commands_table = [_]Command{
     .{ .id = "models", .label = "/models", .desc = "List available models", .kind = .output },
     .{ .id = "save", .label = "/save", .desc = "Save current session" },
     .{ .id = "load", .label = "/load", .desc = "Load a session from file" },
-    .{ .id = "sessions", .label = "/sessions", .desc = "List saved sessions", .kind = .output },
+    .{ .id = "sessions", .label = "/sessions", .desc = "Browse and reload saved sessions", .kind = .output },
     .{ .id = "workspace", .label = "/workspace", .desc = "Show workspace path", .kind = .output },
     .{ .id = "context", .label = "/context", .desc = "Show context usage statistics", .kind = .output },
     .{ .id = "status", .label = "/status", .desc = "Show system status", .kind = .output },
@@ -342,37 +354,19 @@ fn handleProviders(ctx: CommandContext) !Result {
 }
 
 fn handleSessions(ctx: CommandContext) !Result {
-    const home_ptr = std.c.getenv("HOME") orelse {
-        return .{ .notify = try ctx.allocator.dupe(u8, "HOME not set") };
+    const metas = session_catalog.list(ctx.allocator) catch |err| {
+        const msg = try std.fmt.allocPrint(
+            ctx.allocator,
+            "Failed to list sessions: {s}",
+            .{@errorName(err)},
+        );
+        return .{ .notify = msg };
     };
-    const home = std.mem.sliceTo(home_ptr, 0);
-    const dir_path = try std.fmt.allocPrint(ctx.allocator, "{s}/.zeepseek/sessions", .{home});
-    defer ctx.allocator.free(dir_path);
+    errdefer session_catalog.deinitList(ctx.allocator, metas);
 
-    var items: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (items.items) |it| ctx.allocator.free(it);
-        items.deinit(ctx.allocator);
-    }
-
-    var dir = std.Io.Dir.cwd().openDir(ctx.io, dir_path, .{ .iterate = true }) catch {
-        return .{ .show_list = .{
-            .title = "Saved sessions",
-            .items = try items.toOwnedSlice(ctx.allocator),
-        } };
-    };
-    defer dir.close(ctx.io);
-
-    var it = dir.iterate();
-    while (it.next(ctx.io) catch null) |entry| {
-        if (entry.kind == .file or entry.kind == .unknown) {
-            try items.append(ctx.allocator, try ctx.allocator.dupe(u8, entry.name));
-        }
-    }
-
-    return .{ .show_list = .{
+    return .{ .show_sessions_picker = .{
         .title = "Saved sessions",
-        .items = try items.toOwnedSlice(ctx.allocator),
+        .items = metas,
     } };
 }
 
@@ -573,4 +567,32 @@ test "clear/new/compact return confirmation" {
 
     const compact_res = try Dispatcher.execute(ctx, "compact", "");
     try std.testing.expect(compact_res == .confirm);
+}
+
+test "/sessions returns show_sessions_picker with empty list via stub" {
+    const alloc = std.testing.allocator;
+    var pm = ProviderManager.init(alloc);
+    defer pm.deinit();
+    var sandbox: Sandbox = undefined;
+    const ctx = CommandContext{
+        .allocator = alloc,
+        .io = undefined,
+        .provider = "deepseek",
+        .model = "deepseek-chat",
+        .subsystems_initialized = false,
+        .provider_mgr = &pm,
+        .sandbox = &sandbox,
+        .tokens_used = 0,
+        .ctx_max = 64000,
+        .cache_hit_rate = 0,
+        .session_id = "test",
+    };
+
+    const res = try Dispatcher.execute(ctx, "sessions", "");
+    try std.testing.expect(res == .show_sessions_picker);
+    try std.testing.expectEqualStrings("Saved sessions", res.show_sessions_picker.title);
+    // Stub returns an empty list, but it must still be a valid slice
+    // that the deinit contract can accept.
+    try std.testing.expectEqual(@as(usize, 0), res.show_sessions_picker.items.len);
+    session_catalog.deinitList(alloc, @constCast(res.show_sessions_picker.items));
 }

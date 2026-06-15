@@ -35,6 +35,9 @@ const tokenizer_mod = @import("../utils/tokenizer.zig");
 const clipboard = @import("../utils/clipboard.zig");
 const doctor = @import("../utils/doctor.zig");
 
+// ── Session catalog access ────────────────────────────────────────────
+const session_catalog = @import("../storage/session_catalog.zig");
+
 const join = zz.join;
 
 const CacheDecision = enum { none, hit, miss };
@@ -813,6 +816,14 @@ pub const App = struct {
     model_picker: zz.components.List([]const u8) = undefined,
     provider_picker: zz.components.List([]const u8) = undefined,
 
+    // --- Saved-sessions picker (`/sessions`)
+    sessions_picker_active: bool = false,
+    sessions_picker: zz.components.List([]const u8) = undefined,
+    /// Owned copies of every `id` and `title` string stored in
+    /// `sessions_picker.items`. The picker's `clear()` does not free
+    /// them, so we track and free them ourselves on close / repopulate.
+    sessions_picker_owned: std.ArrayListUnmanaged([]const u8) = .empty,
+
     // --- Confirm modal for destructive commands
     confirm_modal: zz.components.Modal = undefined,
     confirm_action: ?ConfirmAction = null,
@@ -837,6 +848,7 @@ pub const App = struct {
             .palette = zz.components.CommandPalette.init(ctx.persistent_allocator) catch unreachable,
             .model_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
             .provider_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
+            .sessions_picker = zz.components.List([]const u8).init(ctx.persistent_allocator),
             .confirm_modal = zz.components.Modal.confirm("Confirm", ""),
             .show_thinking = true,
             .search_active = false,
@@ -893,6 +905,7 @@ pub const App = struct {
             .slash_output_data = null,
             .model_picker_active = false,
             .provider_picker_active = false,
+            .sessions_picker_active = false,
             .confirm_action = null,
         };
         // Try loading saved API key from disk
@@ -946,6 +959,7 @@ pub const App = struct {
         if (self.cached_history_text) |c| self.alloc.free(c);
         self.model_picker.deinit();
         self.provider_picker.deinit();
+        self.closeSessionsPicker();
         self.confirm_modal = undefined;
         if (self.slash_awaiting_cmd) |s| self.alloc.free(s);
         if (self.slash_prompt_title) |s| self.alloc.free(s);
@@ -1221,6 +1235,23 @@ pub const App = struct {
                 return .none;
             }
             self.provider_picker.handleKey(key);
+            return .none;
+        }
+
+        // --- Saved-sessions picker (`/sessions`)
+        if (self.sessions_picker_active) {
+            if (k == .escape) {
+                self.closeSessionsPicker();
+                return .none;
+            }
+            if (k == .enter) {
+                if (self.sessions_picker.selectedValue()) |id| {
+                    self.closeSessionsPicker();
+                    self.loadSessionById(id);
+                }
+                return .none;
+            }
+            self.sessions_picker.handleKey(key);
             return .none;
         }
 
@@ -2399,6 +2430,14 @@ pub const App = struct {
                 }
                 self.provider_picker_active = true;
             },
+
+            .show_sessions_picker => |sp| {
+                // Hand the metas off to the picker (which dupes what it
+                // needs into its own owned string table), then release
+                // the catalog's allocation per the documented contract.
+                self.showSessionsPicker(sp.items);
+                session_catalog.deinitList(self.alloc, @constCast(sp.items));
+            },
         }
     }
 
@@ -2420,6 +2459,126 @@ pub const App = struct {
 
         self.slash_prompt_input.setValue("") catch {};
         self.slash_prompt_input.setPlaceholder(self.slash_prompt_placeholder.?);
+    }
+
+    // ── Saved-sessions picker ───────────────────────────────────────
+
+    /// Free every owned string the sessions picker is currently holding
+    /// and reset it to an empty state. Safe to call repeatedly.
+    fn closeSessionsPicker(self: *App) void {
+        for (self.sessions_picker_owned.items) |s| {
+            self.alloc.free(s);
+        }
+        self.sessions_picker_owned.deinit(self.alloc);
+        self.sessions_picker_owned = .empty;
+        self.sessions_picker.clear();
+        self.sessions_picker_active = false;
+    }
+
+    /// Populate the saved-sessions picker from the catalog metas.
+    /// Each row stores the session id as its `value` (so Enter can
+    /// pass it to `loadSessionById`) and a human-readable summary as
+    /// its title. Both strings are duped with `self.alloc` and
+    /// tracked in `sessions_picker_owned` so the next repopulate or
+    /// shutdown can release them.
+    fn showSessionsPicker(self: *App, metas: []const session_catalog.SessionMeta) void {
+        // Always start from a clean slate so previous items are freed
+        // before we attach new ones.
+        self.closeSessionsPicker();
+
+        if (metas.len == 0) {
+            self.setNotification("No saved sessions found");
+            return;
+        }
+
+        for (metas) |m| {
+            const title = std.fmt.allocPrint(
+                self.alloc,
+                "{s}  ({d} msg)  {d}",
+                .{ m.id, m.message_count, m.timestamp },
+            ) catch continue;
+
+            const id_owned = self.alloc.dupe(u8, m.id) catch {
+                self.alloc.free(title);
+                continue;
+            };
+
+            // Track both strings so the next repopulate (or shutdown)
+            // can release them. If either append fails, clean up both
+            // buffers and skip the row.
+            self.sessions_picker_owned.append(self.alloc, title) catch {
+                self.alloc.free(title);
+                self.alloc.free(id_owned);
+                continue;
+            };
+            self.sessions_picker_owned.append(self.alloc, id_owned) catch {
+                if (self.sessions_picker_owned.pop()) |prev| self.alloc.free(prev);
+                self.alloc.free(id_owned);
+                continue;
+            };
+
+            const item = zz.components.List([]const u8).Item.init(id_owned, title);
+            self.sessions_picker.addItem(item) catch {};
+        }
+
+        if (self.sessions_picker.items.items.len > 0) {
+            self.sessions_picker.cursor = 0;
+            self.sessions_picker.y_offset = 0;
+            self.sessions_picker_active = true;
+        }
+    }
+
+    /// Load a session file by its bare id (no path, no extension).
+    /// Mirrors `loadSessionFromDefault` but takes the id from the
+    /// sessions picker instead of `self.session_id`.
+    fn loadSessionById(self: *App, id: []const u8) void {
+        const home_ptr = std.c.getenv("HOME") orelse {
+            self.setNotification("HOME not set");
+            return;
+        };
+        const home = std.mem.sliceTo(home_ptr, 0);
+        var path_buf: [512:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(
+            &path_buf,
+            "{s}/.zeepseek/sessions/{s}.zsess",
+            .{ home, id },
+            0,
+        ) catch return;
+
+        // Probe for existence before swapping in the new id, so a
+        // missing file doesn't leave the user's current session id
+        // pointing at a non-existent path.
+        const probe = std.c.open(
+            &path_buf,
+            .{ .ACCMODE = .RDONLY },
+            @as(std.c.mode_t, 0),
+        );
+        if (probe < 0) {
+            const msg = std.fmt.allocPrint(
+                self.alloc,
+                "No saved session found at {s}",
+                .{std.mem.sliceTo(&path_buf, 0)},
+            ) catch return;
+            defer self.alloc.free(msg);
+            self.setNotification(msg);
+            return;
+        }
+        _ = std.c.close(probe);
+
+        self.alloc.free(self.session_id);
+        self.session_id = self.alloc.dupe(u8, id) catch return;
+        self.saveLastSessionPointer();
+        self.loadSession(std.mem.sliceTo(&path_buf, 0));
+
+        if (self.messages.items.len > 0) {
+            const msg = std.fmt.allocPrint(
+                self.alloc,
+                "Restored '{s}' ({d} messages)",
+                .{ id, self.messages.items.len },
+            ) catch return;
+            defer self.alloc.free(msg);
+            self.setNotification(msg);
+        }
     }
 
     fn closeSlashPrompt(self: *App) void {
@@ -2946,6 +3105,12 @@ pub const App = struct {
         // Provider picker overlay
         if (self.provider_picker_active) {
             const overlay = self.renderPicker(a, w, h, "Select provider", &self.provider_picker);
+            result = ansiOverlay(a, result, overlay, 0, 0) catch result;
+        }
+
+        // Saved-sessions picker overlay
+        if (self.sessions_picker_active) {
+            const overlay = self.renderPicker(a, w, h, "Saved sessions", &self.sessions_picker);
             result = ansiOverlay(a, result, overlay, 0, 0) catch result;
         }
 
@@ -4103,8 +4268,10 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.pending_data = .empty;
     app.model_picker_active = false;
     app.provider_picker_active = false;
+    app.sessions_picker_active = false;
     app.model_picker = zz.components.List([]const u8).init(alloc);
     app.provider_picker = zz.components.List([]const u8).init(alloc);
+    app.sessions_picker = zz.components.List([]const u8).init(alloc);
     app.confirm_modal = zz.components.Modal.confirm("Confirm", "");
     app.confirm_action = null;
     return app;
@@ -4669,4 +4836,121 @@ test "/clear opens confirm modal" {
     app.executeSlashCommand("clear", "");
     try std.testing.expect(app.confirm_modal.isVisible());
     try std.testing.expectEqual(App.ConfirmAction.clear, app.confirm_action.?);
+}
+
+test "/sessions with empty catalog stays inactive but is handled" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+        // closeSessionsPicker will be a no-op but the picker's deinit
+        // still runs through `App.deinit`.
+        app.sessions_picker.deinit();
+        app.model_picker.deinit();
+        app.provider_picker.deinit();
+    }
+
+    // The stub catalog returns no sessions, so the picker should not
+    // activate but the command must still complete cleanly.
+    app.executeSlashCommand("sessions", "");
+    try std.testing.expect(!app.sessions_picker_active);
+    try std.testing.expectEqual(@as(usize, 0), app.sessions_picker.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.sessions_picker_owned.items.len);
+}
+
+test "showSessionsPicker populates rows from metas and tracks ownership" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+        app.sessions_picker.deinit();
+        app.model_picker.deinit();
+        app.provider_picker.deinit();
+    }
+
+    // Build a hand-rolled metas slice whose strings we own. The picker
+    // will dupe them, but the originals still need to be freed by us
+    // so we don't leak — this mimics the catalog's ownership contract.
+    const metas = [_]session_catalog.SessionMeta{
+        .{
+            .id = "default",
+            .message_count = 7,
+            .first_user_prompt = @constCast(alloc.dupe(u8, "hi") catch unreachable),
+            .timestamp = 1700000000,
+            .path = @constCast(alloc.dupe(u8, "/tmp/default.zsess") catch unreachable),
+        },
+        .{
+            .id = "session-42",
+            .message_count = 3,
+            .first_user_prompt = @constCast(alloc.dupe(u8, "again") catch unreachable),
+            .timestamp = 1700000100,
+            .path = @constCast(alloc.dupe(u8, "/tmp/session-42.zsess") catch unreachable),
+        },
+    };
+    defer for (metas) |m| {
+        alloc.free(m.first_user_prompt);
+        alloc.free(m.path);
+    };
+
+    app.showSessionsPicker(&metas);
+
+    try std.testing.expect(app.sessions_picker_active);
+    try std.testing.expectEqual(@as(usize, 2), app.sessions_picker.items.items.len);
+    // Two owned strings per row (id + title).
+    try std.testing.expectEqual(@as(usize, 4), app.sessions_picker_owned.items.len);
+    try std.testing.expectEqualStrings("default", app.sessions_picker.items.items[0].value);
+    try std.testing.expectEqualStrings(
+        "default  (7 msg)  1700000000",
+        app.sessions_picker.items.items[0].title,
+    );
+
+    // Closing must free every owned string and leave the picker empty.
+    app.closeSessionsPicker();
+    try std.testing.expect(!app.sessions_picker_active);
+    try std.testing.expectEqual(@as(usize, 0), app.sessions_picker.items.items.len);
+    try std.testing.expectEqual(@as(usize, 0), app.sessions_picker_owned.items.len);
+}
+
+test "closeSessionsPicker is idempotent" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+        app.sessions_picker.deinit();
+        app.model_picker.deinit();
+        app.provider_picker.deinit();
+    }
+
+    // Calling close on an inactive picker must not double-free.
+    app.closeSessionsPicker();
+    app.closeSessionsPicker();
+    try std.testing.expect(!app.sessions_picker_active);
+    try std.testing.expectEqual(@as(usize, 0), app.sessions_picker_owned.items.len);
 }

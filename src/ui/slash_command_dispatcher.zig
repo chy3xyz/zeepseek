@@ -77,6 +77,7 @@ pub const Result = union(enum) {
     pick_model,
     pick_provider,
     confirm: ConfirmPrompt,
+    run_doctor,
 };
 
 const commands_table = [_]Command{
@@ -107,6 +108,7 @@ const commands_table = [_]Command{
     .{ .id = "skills", .label = "/skills", .desc = "List available skills", .kind = .output },
     .{ .id = "sandbox", .label = "/sandbox", .desc = "Show sandbox status", .kind = .output },
     .{ .id = "providers", .label = "/providers", .desc = "List configured providers", .kind = .output },
+    .{ .id = "doctor", .label = "/doctor", .desc = "Run health checks (build, config, network, storage, sandbox)", .kind = .output },
 };
 
 pub const Dispatcher = struct {
@@ -180,6 +182,7 @@ pub const Dispatcher = struct {
         if (std.mem.eql(u8, id, "providers")) return try handleProviders(ctx);
         if (std.mem.eql(u8, id, "skills")) return handleSkills(ctx);
         if (std.mem.eql(u8, id, "sandbox")) return try handleSandbox(ctx);
+        if (std.mem.eql(u8, id, "doctor")) return .run_doctor;
 
         if (std.mem.eql(u8, id, "note")) return .{ .set_input = try ctx.allocator.dupe(u8, "/note ") };
         if (std.mem.eql(u8, id, "memory")) return .{ .set_input = try ctx.allocator.dupe(u8, "/memory ") };

@@ -33,6 +33,7 @@ const reasonix_mod = @import("../cache/reasonix.zig");
 const models_catalog = @import("../providers/models.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
 const clipboard = @import("../utils/clipboard.zig");
+const doctor = @import("../utils/doctor.zig");
 
 const join = zz.join;
 
@@ -2092,6 +2093,57 @@ pub const App = struct {
         self.toast.push(msg, .info, 2000, 0) catch {};
     }
 
+    /// `/doctor` — run the health-check battery and inject the rendered
+    /// report as a system message in the chat. The user can scroll up to
+    /// see it, or it lives in history on the next render.
+    fn runDoctor(self: *App) void {
+        // Pull the endpoint from the active provider; fall back to a
+        // sensible DeepSeek default if subsystems aren't ready yet.
+        const provider_id: []const u8 = if (self.provider_mgr.getActive()) |cfg| cfg.provider_id else "deepseek";
+        const endpoint: []const u8 = if (self.subsystems_initialized)
+            self.provider_mgr.resolveEndpoint(provider_id)
+        else
+            "https://api.deepseek.com/chat/completions";
+        const data_dir: []const u8 = ".zeepseek_data";
+
+        const doctor_ctx = doctor.Ctx{
+            .allocator = self.alloc,
+            .io = self.io,
+            .api_key = self.api_key,
+            .provider = provider_id,
+            .model = self.model,
+            .endpoint = endpoint,
+            .data_dir = data_dir,
+        };
+
+        var report = doctor.runAll(&doctor_ctx);
+        defer report.deinit(self.alloc);
+
+        const rendered = report.render(self.alloc) catch {
+            self.setNotification("/doctor: failed to render report");
+            return;
+        };
+        defer self.alloc.free(rendered);
+
+        // Inject as a system message so the user can scroll, and surface
+        // the pass/warn/fail summary as a toast for at-a-glance status.
+        const s = report.summary();
+        const summary_msg = std.fmt.allocPrint(
+            self.alloc,
+            "/doctor: {d} pass, {d} warn, {d} fail",
+            .{ s.pass, s.warn, s.fail },
+        ) catch "doctor complete";
+        self.setNotification(summary_msg);
+        if (summary_msg.ptr != "doctor complete".ptr) self.alloc.free(summary_msg);
+
+        self.messages.append(self.alloc, .{
+            .role = .system,
+            .content = rendered,
+            .status = .complete,
+        }) catch {};
+        self.invalidateRenderCache();
+    }
+
     fn executeSlashCommand(self: *App, id: []const u8, args: []const u8) void {
         const ctx = SlashDispatcher.CommandContext{
             .allocator = self.alloc,
@@ -2139,6 +2191,7 @@ pub const App = struct {
             .scroll_bottom => { self.scroll_offset = 0; self.auto_scroll = true; },
             .compact_context => self.compactContext(),
             .show_help => { self.updateHelpModal(); self.help_modal.show(); },
+            .run_doctor => self.runDoctor(),
 
             .set_model => |name| {
                 self.model = self.alloc.dupe(u8, name) catch self.model;

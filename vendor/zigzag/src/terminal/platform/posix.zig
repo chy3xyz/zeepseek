@@ -57,9 +57,11 @@ pub fn getSize(fd: posix.fd_t) !Size {
         }
         return TerminalError.IoctlFailed;
     }
+    // Some PTYs report a zero winsize (e.g. pty.fork without TIOCSWINSZ).
+    // Fall back to sane defaults so the UI never renders with 0 width/height.
     return .{
-        .rows = wsz.row,
-        .cols = wsz.col,
+        .rows = if (wsz.row == 0) 24 else wsz.row,
+        .cols = if (wsz.col == 0) 80 else wsz.col,
     };
 }
 

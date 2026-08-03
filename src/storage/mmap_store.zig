@@ -36,6 +36,8 @@ pub const MmapStore = struct {
     entries: std.StringHashMap(Entry),
     seq: u64 = 0,
     hot_size: usize,
+    next_hot_offset: usize = 0,
+    next_cold_offset: usize = 0,
     cold_size: usize,
 
     const Entry = struct {
@@ -131,9 +133,17 @@ pub const MmapStore = struct {
         self.wal_seq = 0;
     }
 
+    /// Max WAL entry size (op + 2 len fields + key + value + seq + ts).
+    /// Keeps entries well under walReplay's read buffer.
+    const MAX_WAL_ENTRY: usize = 64 * 1024;
+
     pub fn walAppend(self: *MmapStore, op: enum(u8) { put = 1, delete = 2 }, key: []const u8, value: []const u8) !void {
         if (self.wal_file) |f| {
-            var buf: [8192]u8 = undefined;
+            const total: usize = 1 + 4 + key.len + 4 + value.len + 8 + 8;
+            if (total > MAX_WAL_ENTRY) return error.WalEntryTooLarge;
+
+            const buf = try self.allocator.alloc(u8, total);
+            defer self.allocator.free(buf);
             var offset: usize = 0;
 
             buf[offset] = @as(u8, if (op == .put) 1 else 2);
@@ -163,7 +173,7 @@ pub const MmapStore = struct {
 
     pub fn walReplay(self: *MmapStore) !void {
         if (self.wal_file) |f| {
-            var buf: [8192]u8 = undefined;
+            var buf: [MAX_WAL_ENTRY + 64]u8 = undefined;
             var pos: u64 = 0;
 
             while (true) {
@@ -178,6 +188,7 @@ pub const MmapStore = struct {
                     if (offset + 4 > n) break;
                     const kl = std.mem.readInt(u32, buf[offset..][0..4], .little);
                     offset += 4;
+                    if (kl > MAX_WAL_ENTRY) break; // corrupt/untrusted length
 
                     if (offset + kl > n) break;
                     const k = try self.allocator.alloc(u8, kl);
@@ -190,6 +201,7 @@ pub const MmapStore = struct {
                     }
                     const vl = std.mem.readInt(u32, buf[offset..][0..4], .little);
                     offset += 4;
+                    if (vl > MAX_WAL_ENTRY) break; // corrupt/untrusted length
 
                     if (offset + vl > n) {
                         self.allocator.free(k);
@@ -388,11 +400,18 @@ pub const MmapStore = struct {
         _ = threshold;
     }
 
+    /// Sequential cursor allocation per tier. Slots are never reclaimed
+    /// (no bitmap) — acceptable for a WAL-backed store where entries are
+    /// rewritten in place by key; a full region returns OutOfMemory.
     fn findFreeSlot(self: *MmapStore, region_size: usize, size: usize) ?usize {
-        _ = self;
-        _ = region_size;
-        _ = size;
-        return 0;
+        const is_hot = self.entries.count() < 4096;
+        const next = if (is_hot) self.next_hot_offset else self.next_cold_offset;
+        if (next + size > region_size) return null;
+        if (is_hot)
+            self.next_hot_offset = next + size
+        else
+            self.next_cold_offset = next + size;
+        return next;
     }
 
     pub fn persistMeta(self: *MmapStore, meta_path: []const u8) !void {

@@ -15,6 +15,7 @@ const zz = @import("zigzag");
 const cc = @import("c");
 const stream_client_mod = @import("stream_client");
 const dangerous_patterns = @import("dangerous_patterns");
+const tools_mod = @import("tools");
 
 const CacheDecision = enum { none, hit, miss };
 
@@ -418,6 +419,77 @@ const StreamState = struct {
 // Application Model (ZigZag Elm Architecture)
 // ═══════════════════════════════════════════════════════════════════════
 
+
+/// Pending tool-call run state: survives user-approval pauses between calls.
+const ToolRunState = struct {
+    /// All duplicated tool calls awaiting execution
+    calls: std.ArrayList(tools_mod.ToolCall),
+    idx: usize,
+    /// Accumulated "Tool X result:\n..." text for re-submission
+    results: std.ArrayList(u8),
+};
+
+const PendingTool = struct {
+    /// Index into tool_run.calls of the call awaiting user approval
+    idx: usize,
+    /// Duplicated working directory
+    cwd: []const u8,
+};
+
+/// Background LLM run for one sub-agent. The UI polls completion in tick().
+/// Owns a dedicated arena backed by page_allocator: if a run is still blocked
+/// in a network connect when the app exits, its pages are reclaimed by the OS
+/// and never reach the GPA leak checker (which would otherwise block exit by
+/// printing a huge stack trace to a full stderr pipe).
+const SubAgentRun = struct {
+    thread: std.Thread = undefined,
+    /// Index into App.subagents (stable: the panel never removes entries)
+    sa_index: usize,
+    arena: std.heap.ArenaAllocator,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    summary: std.ArrayList(u8) = .empty,
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn init(alloc: std.mem.Allocator, sa_index: usize) SubAgentRun {
+        return .{ .sa_index = sa_index, .arena = std.heap.ArenaAllocator.init(alloc) };
+    }
+    fn allocator(self: *SubAgentRun) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+    fn lock(self: *SubAgentRun) void {
+        while (self.locked.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {}
+    }
+    fn unlock(self: *SubAgentRun) void {
+        self.locked.store(false, .release);
+    }
+    fn pushSummary(self: *SubAgentRun, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.summary.appendSlice(self.arena.allocator(), text) catch {};
+    }
+    fn setDone(self: *SubAgentRun) void {
+        self.done.store(true, .release);
+    }
+    fn setFailed(self: *SubAgentRun) void {
+        self.failed.store(true, .release);
+        self.done.store(true, .release);
+    }
+    fn isDone(self: *SubAgentRun) bool {
+        return self.done.load(.acquire);
+    }
+    fn drainSummary(self: *SubAgentRun, alloc: std.mem.Allocator) ?[]const u8 {
+        self.lock();
+        defer self.unlock();
+        if (self.summary.items.len == 0) return null;
+        return alloc.dupe(u8, self.summary.items) catch null;
+    }
+    fn deinit(self: *SubAgentRun) void {
+        self.summary.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+};
+
 pub const App = struct {
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
@@ -473,8 +545,17 @@ pub const App = struct {
     api_key_alloc: ?std.mem.Allocator = null,
     io: std.Io,
 
+    // --- Tool execution (sandbox + approval) 
+    sandbox: ?*tools_mod.Sandbox = null,
+    tool_run: ?*ToolRunState = null,
+    pending_tool: ?PendingTool = null,
+
+    // --- Sub-agent runs (background LLM threads) 
+    subagent_runs: std.ArrayList(*SubAgentRun) = .empty,
+
     // --- Session state 
     session_id: []const u8,
+    session_id_alloc: ?std.mem.Allocator = null,
     session_dir: []const u8,
     should_quit: bool,
 
@@ -544,6 +625,11 @@ pub const App = struct {
         };
         // Try loading saved API key from disk
         self.loadSavedApiKey();
+
+        // Initialize sandbox for tool approval. Platform-level sandboxing
+        // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
+        // requiresApproval/allowShell still gate every tool call.
+        self.sandbox = tools_mod.Sandbox.init(tools_mod.Policy.host(), &.{}) catch null;
         return .enter_alt_screen;
     }
 
@@ -585,11 +671,12 @@ pub const App = struct {
             .tool_output => |t| self.onToolOutput(t.name, t.output, t.success),
             .subagent_start => |s| self.onSubAgentStart(s.id, s.role, s.goal),
             .subagent_update => |s| self.onSubAgentUpdate(s.id, s.summary, s.status),
-            .save_session => self.saveSession(),
+            .save_session => self.saveSession(self.session_id),
             .load_session => |path| self.loadSession(path),
             .tick => |t| {
                 self.cursor_visible = (t.timestamp / 500_000_000) % 2 == 0; // blink every 500ms
                 self.pollStream();
+                self.pollSubAgents();
                 // Auto-dismiss notification after ~2 seconds (4 ticks at 60fps≈2s)
                 if (self.notif != null) {
                     self.notif_tick += 1;
@@ -610,6 +697,13 @@ pub const App = struct {
     fn onKey(self: *App, key: zz.KeyEvent) zz.Cmd(Msg) {
         const k = key.key;
         const m = key.modifiers;
+
+        // --- Tool approval overlay (highest priority)
+        if (self.pending_tool != null) {
+            if (k == .enter) { self.approvePendingTool(); return .none; }
+            if (k == .escape) { self.rejectPendingTool(); return .none; }
+            return .none;
+        }
 
         // --- Palette overlay 
         if (self.show_palette) {
@@ -693,13 +787,9 @@ pub const App = struct {
             return .none;
         }
 
-        // --- / for command palette (when input empty) 
-        if (k == .char and k.char == '/' and self.input.items.len == 0) {
-            self.show_palette = true;
-            self.palette_sel = 0;
-            self.palette_buf.clearRetainingCapacity();
-            return .none;
-        }
+        // NOTE: '/' is intentionally a plain character here so users can type
+        // slash commands directly (e.g. "/model deepseek-v4"). The command
+        // palette is opened with Ctrl+P only.
 
         // --- F1 / ? for help (when input empty) 
         if (k == .f1 or (k == .char and k.char == '?' and self.input.items.len == 0)) {
@@ -1039,39 +1129,108 @@ pub const App = struct {
 
         if (parse_result.calls.len == 0) return;
 
-        // Get working directory
+        // Duplicate calls into a run state that survives approval pauses.
+        const tr = self.alloc.create(ToolRunState) catch return;
+        tr.* = .{
+            .calls = std.ArrayList(tools_mod.ToolCall).empty,
+            .idx = 0,
+            .results = std.ArrayList(u8).empty,
+        };
+        for (parse_result.calls) |call| {
+            const name = self.alloc.dupe(u8, call.name) catch continue;
+            const arguments = self.alloc.dupe(u8, call.arguments) catch {
+                self.alloc.free(name);
+                continue;
+            };
+            tr.calls.append(self.alloc, .{ .index = call.index, .name = name, .arguments = arguments }) catch {
+                self.alloc.free(name);
+                self.alloc.free(arguments);
+            };
+        }
+        if (tr.calls.items.len == 0) {
+            self.alloc.destroy(tr);
+            return;
+        }
+        self.tool_run = tr;
+
+        self.processNextTool();
+    }
+
+    /// Process the next queued tool call. Pauses at the first call that
+    /// requires user approval (pending_tool) and resumes on Enter/Esc.
+    fn processNextTool(self: *App) void {
+        const tr = self.tool_run orelse return;
+        if (tr.idx >= tr.calls.items.len) {
+            self.finishToolRun();
+            return;
+        }
+        const call = tr.calls.items[tr.idx];
+        self.onToolStart(call.name, call.arguments);
+
+        if (tools_mod.requiresApproval(self.sandbox, call)) {
+            const cwd_ptr = std.c.getenv("PWD") orelse ".";
+            const cwd = std.mem.sliceTo(cwd_ptr, 0);
+            self.pending_tool = .{
+                .idx = tr.idx,
+                .cwd = self.alloc.dupe(u8, cwd) catch return,
+            };
+            return;
+        }
+
+        self.executeCurrentTool();
+    }
+
+    fn executeCurrentTool(self: *App) void {
+        const tr = self.tool_run orelse return;
+        const call = tr.calls.items[tr.idx];
         const cwd_ptr = std.c.getenv("PWD") orelse ".";
         const cwd = std.mem.sliceTo(cwd_ptr, 0);
 
-        // Execute each tool call and collect results
-        var tool_results = std.ArrayList(u8).empty;
-        defer tool_results.deinit(self.alloc);
-
-        for (parse_result.calls) |call| {
-            // Notify UI about tool call
-            self.onToolStart(call.name, call.arguments);
-
-            // Execute the tool
-            const result = self.executeToolCall(call.name, call.arguments, cwd);
-            if (result.len > 0) {
-                defer self.alloc.free(result);
-            }
-            const success = result.len > 0 and !std.mem.startsWith(u8, result, "Error:");
-
-            // Notify UI about result
-            self.onToolOutput(call.name, result, success);
-
-            // Accumulate results for re-submission
-            tool_results.appendSlice(self.alloc, "Tool ") catch {};
-            tool_results.appendSlice(self.alloc, call.name) catch {};
-            tool_results.appendSlice(self.alloc, " result:\n") catch {};
-            tool_results.appendSlice(self.alloc, result) catch {};
-            tool_results.appendSlice(self.alloc, "\n\n") catch {};
+        const result = self.runTool(call, cwd);
+        defer {
+            if (result.len > 0) self.alloc.free(result);
         }
+        const success = result.len > 0 and !std.mem.startsWith(u8, result, "Error:");
+        self.onToolOutput(call.name, result, success);
 
-        // Re-submit with tool results to continue the conversation
-        if (tool_results.items.len > 0) {
-            const result_text = self.alloc.dupe(u8, tool_results.items) catch return;
+        tr.results.appendSlice(self.alloc, "Tool ") catch {};
+        tr.results.appendSlice(self.alloc, call.name) catch {};
+        tr.results.appendSlice(self.alloc, " result:\n") catch {};
+        tr.results.appendSlice(self.alloc, result) catch {};
+        tr.results.appendSlice(self.alloc, "\n\n") catch {};
+
+        tr.idx += 1;
+        self.processNextTool();
+    }
+
+    fn approvePendingTool(self: *App) void {
+        const pt = self.pending_tool orelse return;
+        self.alloc.free(pt.cwd);
+        self.pending_tool = null;
+        self.executeCurrentTool();
+    }
+
+    fn rejectPendingTool(self: *App) void {
+        const pt = self.pending_tool orelse return;
+        const tr = self.tool_run orelse return;
+        const call = tr.calls.items[pt.idx];
+        const denied = self.toolErr("Rejected by user", .{});
+        defer self.alloc.free(denied);
+        self.onToolOutput(call.name, denied, false);
+        tr.results.appendSlice(self.alloc, "Tool ") catch {};
+        tr.results.appendSlice(self.alloc, call.name) catch {};
+        tr.results.appendSlice(self.alloc, " result:\nRejected by user\n\n") catch {};
+        self.alloc.free(pt.cwd);
+        self.pending_tool = null;
+        tr.idx += 1;
+        self.processNextTool();
+    }
+
+    /// All calls executed (or rejected) — re-submit the accumulated results.
+    fn finishToolRun(self: *App) void {
+        const tr = self.tool_run orelse return;
+        if (tr.results.items.len > 0) {
+            const result_text = self.alloc.dupe(u8, tr.results.items) catch return;
             self.messages.append(self.alloc, .{
                 .role = .tool,
                 .content = result_text,
@@ -1081,6 +1240,50 @@ pub const App = struct {
             // Start a new stream with the tool results in context
             self.startStreaming("(tool results)");
         }
+        // Cleanup run state
+        for (tr.calls.items) |c| {
+            self.alloc.free(c.name);
+            self.alloc.free(c.arguments);
+        }
+        tr.calls.deinit(self.alloc);
+        tr.results.deinit(self.alloc);
+        self.alloc.destroy(tr);
+        self.tool_run = null;
+    }
+
+    /// Execute one tool through the unified tools/ pipeline with extra guards.
+    /// Returns a caller-owned string (empty slice on failure).
+    fn runTool(self: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 {
+        // Extra guards on top of the sandbox: dangerous shell commands and
+        // sensitive paths are refused before anything executes.
+        if (std.mem.eql(u8, call.name, "shell")) {
+            if (self.extractJsonString(call.arguments, "command")) |cmd| {
+                if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
+                    return self.toolErr("Error: blocked dangerous command ({s})", .{p.description});
+                }
+            }
+        }
+        if (std.mem.eql(u8, call.name, "file_read") or
+            std.mem.eql(u8, call.name, "file_write") or
+            std.mem.eql(u8, call.name, "file_edit"))
+        {
+            if (self.extractJsonString(call.arguments, "path")) |path| {
+                if (isSensitivePath(path)) {
+                    return self.toolErr("Error: blocked sensitive path", .{});
+                }
+            }
+        }
+
+        const res = tools_mod.executeTool(self.alloc, self.sandbox, cwd, call) catch {
+            return self.toolErr("Error: tool execution failed", .{});
+        };
+        // ToolResult.output is allocator-owned when non-empty, static "" on error.
+        if (res.output.len > 0) {
+            const owned = self.alloc.dupe(u8, res.output) catch "";
+            self.alloc.free(res.output);
+            return owned;
+        }
+        return self.toolErr("Error: {s}", .{res.err_msg orelse "tool failed"});
     }
 
     /// Allocate an error/status string owned by the caller (freed by
@@ -1090,95 +1293,6 @@ pub const App = struct {
         return std.fmt.allocPrint(self.alloc, fmt, args) catch "";
     }
 
-    fn executeToolCall(self: *App, name: []const u8, args: []const u8, cwd: []const u8) []const u8 {
-        // Simple tool execution — shell, file_read, file_write
-        if (std.mem.eql(u8, name, "shell")) {
-            return self.execShell(args, cwd);
-        } else if (std.mem.eql(u8, name, "file_read")) {
-            return self.execFileRead(args);
-        } else if (std.mem.eql(u8, name, "file_write")) {
-            return self.execFileWrite(args);
-        }
-        return self.toolErr("Error: Unknown tool", .{});
-    }
-
-    fn execShell(self: *App, args_json: []const u8, cwd: []const u8) []const u8 {
-        // Extract "command" from JSON args
-        const cmd = self.extractJsonString(args_json, "command") orelse return self.toolErr("Error: no command", .{});
-
-        // Safety gate: refuse known-dangerous commands (prompt-injection guard).
-        if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
-            return self.toolErr("Error: blocked dangerous command ({s})", .{p.description});
-        }
-
-        // Execute via popen
-        var cmd_buf: [4096]u8 = undefined;
-        const full_cmd = std.fmt.bufPrint(&cmd_buf, "cd {s} && {s} 2>&1", .{ cwd, cmd }) catch return self.toolErr("Error: cmd too long", .{});
-
-        const result = cc.popen(full_cmd.ptr, "r") orelse return self.toolErr("Error: popen failed", .{});
-        defer _ = cc.pclose(result);
-
-        var output = std.ArrayList(u8).empty;
-        defer output.deinit(self.alloc);
-        var read_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = cc.fread(&read_buf, 1, read_buf.len, result);
-            if (n == 0) break;
-            if (output.items.len >= MAX_TOOL_OUTPUT) break; // cap output (yes, cat /dev/zero)
-            const room = MAX_TOOL_OUTPUT - output.items.len;
-            const take = @min(n, room);
-            output.appendSlice(self.alloc, read_buf[0..take]) catch break;
-        }
-
-        if (output.items.len == 0) return self.alloc.dupe(u8, "(no output)") catch "";
-        return self.alloc.dupe(u8, output.items) catch "";
-    }
-
-    fn execFileRead(self: *App, args_json: []const u8) []const u8 {
-        const path = self.extractJsonString(args_json, "path") orelse return self.toolErr("Error: no path", .{});
-        if (isSensitivePath(path)) return self.toolErr("Error: reading this path is not allowed", .{});
-        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return self.toolErr("Error: alloc", .{});
-        defer self.alloc.free(path_z);
-
-        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return self.toolErr("Error: file not found", .{});
-        defer _ = std.c.close(fd);
-
-        var data = std.ArrayList(u8).empty;
-        defer data.deinit(self.alloc);
-        var read_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = std.c.read(fd, &read_buf, read_buf.len);
-            if (n <= 0) break;
-            if (data.items.len >= MAX_TOOL_OUTPUT) break; // cap oversized files
-            const room = MAX_TOOL_OUTPUT - data.items.len;
-            const take = @min(@as(usize, @intCast(n)), room);
-            data.appendSlice(self.alloc, read_buf[0..take]) catch break;
-        }
-
-        if (data.items.len == 0) return self.alloc.dupe(u8, "(empty file)") catch "";
-        return self.alloc.dupe(u8, data.items) catch "";
-    }
-
-    fn execFileWrite(self: *App, args_json: []const u8) []const u8 {
-        const path = self.extractJsonString(args_json, "path") orelse return self.toolErr("Error: no path", .{});
-        const content = self.extractJsonString(args_json, "content") orelse return self.toolErr("Error: no content", .{});
-        if (isSensitivePath(path)) return self.toolErr("Error: writing to this path is not allowed", .{});
-        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return self.toolErr("Error: alloc", .{});
-        defer self.alloc.free(path_z);
-
-        const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-        const fd = std.c.open(path_z.ptr, flags, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return self.toolErr("Error: cannot create file", .{});
-        defer _ = std.c.close(fd);
-
-        _ = std.c.write(fd, content.ptr, content.len);
-        return self.alloc.dupe(u8, "OK") catch "";
-    }
-
-    /// Reject access to credentials, keys, and OS internals for file tools.
-/// Matches on path segments (not bare substrings) to avoid false positives
-/// like "my_project_system" or "id_rsa.pub" documentation files.
 fn isSensitivePath(path: []const u8) bool {
     const sensitive_dirs = [_][]const u8{ ".ssh", ".aws", ".gnupg", ".kube", ".config" };
     const sensitive_files = [_][]const u8{ "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "sudoers", "apikey" };
@@ -1351,6 +1465,121 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         }
     }
 
+    fn startSubAgent(self: *App, goal: []const u8) void {
+        const g = std.mem.trim(u8, goal, " ");
+        if (g.len == 0) {
+            self.setNotification("Usage: /subagent <goal>");
+            return;
+        }
+        if (self.api_key.len == 0) {
+            self.setNotification("Set an API key first (/apikey sk-...)");
+            return;
+        }
+        if (self.subagent_runs.items.len >= 4) {
+            self.setNotification("Too many concurrent sub-agents (max 4)");
+            return;
+        }
+
+        const sa_index = self.subagents.items.len;
+        const id = std.fmt.allocPrint(self.alloc, "sa-{d}", .{sa_index}) catch return;
+        const goal_owned = self.alloc.dupe(u8, g) catch {
+            self.alloc.free(id);
+            return;
+        };
+        // id/goal ownership moves into subagents (released by deinit)
+        self.onSubAgentStart(id, .researcher, goal_owned);
+
+        const run = std.heap.page_allocator.create(SubAgentRun) catch return;
+        run.* = SubAgentRun.init(std.heap.page_allocator, sa_index);
+        const ra = run.allocator();
+
+        const api_key_owned = ra.dupe(u8, self.api_key) catch {
+            std.heap.page_allocator.destroy(run);
+            return;
+        };
+        const model_owned = ra.dupe(u8, self.model) catch {
+            std.heap.page_allocator.destroy(run);
+            return;
+        };
+        const prompt_owned = ra.dupe(u8, g) catch {
+            std.heap.page_allocator.destroy(run);
+            return;
+        };
+
+        const thread = std.Thread.spawn(.{}, struct {
+            fn runSubAgent(api_k: []const u8, prompt: []const u8, mdl: []const u8, a: std.mem.Allocator, rr: *SubAgentRun) void {
+                // a is the run's arena allocator — freed wholesale by deinit.
+                // Use a dedicated Io so a blocked network connect cannot stall
+                // the UI thread's shared std.Io (would deadlock Ctrl+C exit).
+                var threaded = std.Io.Threaded.init(a, .{ .argv0 = .empty, .environ = .empty });
+                const sio_own = threaded.io();
+                defer threaded.deinit();
+                var client = stream_client_mod.DeepSeekStreamClient.init(a, sio_own, null, null);
+                defer client.deinit();
+
+                const role_prompt = "You are a focused research sub-agent. Complete the assigned goal, then reply with a concise summary of what you did and found.";
+                const ctx_empty = [_]stream_client_mod.CtxItem{};
+                var stream = client.streamMessage(api_k, prompt, &ctx_empty, mdl, CacheDecision.none, role_prompt, null) catch {
+                    rr.setFailed();
+                    return;
+                };
+                defer stream.deinit();
+
+                while (true) {
+                    const chunk = stream.nextChunk() catch {
+                        rr.setFailed();
+                        return;
+                    };
+                    if (chunk == null) break;
+                    switch (chunk.?) {
+                        .content => |c| rr.pushSummary(c),
+                        .reasoning => {},
+                    }
+                }
+                rr.setDone();
+            }
+        }.runSubAgent, .{ api_key_owned, prompt_owned, model_owned, ra, run }) catch {
+            std.heap.page_allocator.destroy(run);
+            self.setNotification("Failed to start sub-agent thread");
+            return;
+        };
+        run.thread = thread;
+        self.subagent_runs.append(self.alloc, run) catch {
+            std.heap.page_allocator.destroy(run);
+            self.setNotification("Failed to register sub-agent");
+            return;
+        };
+        self.setNotification("Sub-agent started");
+    }
+
+    fn pollSubAgents(self: *App) void {
+        var i: usize = 0;
+        while (i < self.subagent_runs.items.len) {
+            const run = self.subagent_runs.items[i];
+            if (run.isDone()) {
+                run.thread.join();
+                const failed = run.failed.load(.acquire);
+                const summary = run.drainSummary(self.alloc);
+                defer {
+                    if (summary) |s| self.alloc.free(s);
+                }
+                if (run.sa_index < self.subagents.items.len) {
+                    const sa = &self.subagents.items[run.sa_index];
+                    sa.status = if (failed) .failed else .complete;
+                    if (summary) |s| {
+                        if (s.len > 0) {
+                            if (sa.summary.len > 0) self.alloc.free(sa.summary);
+                            sa.summary = self.alloc.dupe(u8, s) catch "";
+                        }
+                    }
+                }
+                run.deinit();
+                std.heap.page_allocator.destroy(run);
+                _ = self.subagent_runs.orderedRemove(i);
+            } else i += 1;
+        }
+    }
+
     // ═════════════════════════════════════════════════════════════════
     // Command Palette
     // ═════════════════════════════════════════════════════════════════
@@ -1369,13 +1598,14 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         .{ .id = "model", .label = "/model", .desc = "Switch model (e.g. /model deepseek-v4)", .kind = .insert },
         .{ .id = "provider", .label = "/provider", .desc = "Custom providers not supported yet", .kind = .insert },
         .{ .id = "models", .label = "/models", .desc = "List available models" },
-        .{ .id = "save", .label = "/save", .desc = "Save current session" },
-        .{ .id = "load", .label = "/load", .desc = "Load a session from file" },
+        .{ .id = "save", .label = "/save", .desc = "Save session (/save name)", .kind = .insert },
+        .{ .id = "load", .label = "/load", .desc = "Load session (/load name)", .kind = .insert },
         .{ .id = "sessions", .label = "/sessions", .desc = "List saved sessions" },
         .{ .id = "workspace", .label = "/workspace", .desc = "Show/set workspace path", .kind = .insert },
         .{ .id = "context", .label = "/context", .desc = "Show context usage statistics" },
         .{ .id = "status", .label = "/status", .desc = "Show system status" },
         .{ .id = "compact", .label = "/compact", .desc = "Compact conversation context" },
+        .{ .id = "subagent", .label = "/subagent", .desc = "Start a sub-agent (/subagent <goal>)", .kind = .insert },
         .{ .id = "subagents", .label = "/subagents", .desc = "Show sub-agent panel" },
         .{ .id = "think", .label = "/think", .desc = "Toggle reasoning visibility" },
         .{ .id = "tools", .label = "/tools", .desc = "Toggle tool call visibility" },
@@ -1426,6 +1656,19 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             }
             if (std.mem.eql(u8, id, "apikey") or std.mem.eql(u8, id, "key")) {
                 self.setApiKey(args);
+                return;
+            }
+            if (std.mem.eql(u8, id, "save")) {
+                if (args.len > 0) self.setSessionName(args);
+                self.saveSession(self.session_id);
+                return;
+            }
+            if (std.mem.eql(u8, id, "load")) {
+                self.loadSession(args);
+                return;
+            }
+            if (std.mem.eql(u8, id, "subagent")) {
+                self.startSubAgent(args);
                 return;
             }
         }
@@ -1487,7 +1730,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         } else if (std.mem.eql(u8, id, "clear") or std.mem.eql(u8, id, "new")) {
             self.clearMessages();
         } else if (std.mem.eql(u8, id, "save")) {
-            self.saveSession();
+            self.saveSession(self.session_id);
         } else if (std.mem.eql(u8, id, "think")) {
             self.show_thinking = !self.show_thinking;
         } else if (std.mem.eql(u8, id, "tools")) {
@@ -1515,16 +1758,9 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             const msg = std.fmt.allocPrint(self.alloc, "Workspace: {s}", .{cwd}) catch return;
             self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
         } else if (std.mem.eql(u8, id, "sessions")) {
-            // Show saved sessions
-            const home_ptr = std.c.getenv("HOME") orelse return;
-            const home = std.mem.sliceTo(home_ptr, 0);
-            const sessions_dir = std.fmt.allocPrint(self.alloc, "{s}/.zeepseek/sessions", .{home}) catch return;
-            defer self.alloc.free(sessions_dir);
-            const msg = std.fmt.allocPrint(self.alloc, "Sessions directory: {s}", .{sessions_dir}) catch return;
-            self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
+            self.listSessions();
         } else if (std.mem.eql(u8, id, "load")) {
-            // Will be triggered from palette with a file picker
-            self.loadSessionFromDefault();
+            self.loadSession("default");
         } else if (std.mem.eql(u8, id, "models")) {
             const msg = "Available models:\n  deepseek-chat    V4 Flash (default)\n  deepseek-v4-pro  V4 Pro\n  deepseek-reasoner Reasoning model";
             self.messages.append(self.alloc, .{ .role = .system, .content = msg }) catch {};
@@ -1552,54 +1788,81 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         return out[0..count];
     }
 
-    fn saveSession(self: *App) void {
+    fn saveSession(self: *App, name: []const u8) void {
+        if (!isValidSessionName(name)) {
+            self.setNotification("Invalid session name (letters, digits, - and _ only)");
+            return;
+        }
         const home_ptr = std.c.getenv("HOME") orelse return;
         const home = std.mem.sliceTo(home_ptr, 0);
         if (home.len == 0) return;
-        // Ensure dir exists
+        // Ensure dirs exist (mkdir is not recursive; both levels needed)
+        var home_dir_buf: [512:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&home_dir_buf, "{s}/.zeepseek", .{home}, 0) catch return;
+        _ = std.c.mkdir(&home_dir_buf, 0o755);
         var dir_buf: [512:0]u8 = undefined;
         _ = std.fmt.bufPrintSentinel(&dir_buf, "{s}/.zeepseek/sessions", .{home}, 0) catch return;
         _ = std.c.mkdir(&dir_buf, 0o755);
         // Build file path
         var path_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, self.session_id }, 0) catch return;
-        // Write messages using C API
+        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, name }, 0) catch return;
+        // Write messages using C API. Format per message:
+        //   "ROLE <len>\n<content>\n" — the length prefix survives any
+        //   newlines / colons inside content.
         const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
         const fd = std.c.open(&path_buf, flags, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return;
+        if (fd < 0) {
+            self.setNotification("Save failed: cannot open session file");
+            return;
+        }
         defer _ = std.c.close(fd);
         for (self.messages.items) |m| {
             const role_str: []const u8 = switch (m.role) {
                 .user => "USER", .assistant => "ASSISTANT", .system => "SYSTEM", .tool => "TOOL",
             };
-            // Write role:content\n using write()
-            var line_buf: [4096]u8 = undefined;
-            const line = std.fmt.bufPrint(&line_buf, "{s}:{s}\n", .{ role_str, m.content }) catch &.{};
-            _ = std.c.write(fd, line.ptr, line.len);
+            var hdr: [64]u8 = undefined;
+            const header = std.fmt.bufPrint(&hdr, "{s} {d}\n", .{ role_str, m.content.len }) catch continue;
+            _ = std.c.write(fd, header.ptr, header.len);
+            _ = std.c.write(fd, m.content.ptr, m.content.len);
+            _ = std.c.write(fd, "\n", 1);
         }
+        const note = std.fmt.allocPrint(self.alloc, "Session saved: {s}", .{name}) catch return;
+        defer self.alloc.free(note);
+        self.setNotification(note);
     }
 
-    fn loadSessionFromDefault(self: *App) void {
+    fn isValidSessionName(name: []const u8) bool {
+        if (name.len == 0 or name.len > 100) return false;
+        for (name) |c| {
+            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
+        }
+        return true;
+    }
+
+    fn setSessionName(self: *App, name: []const u8) void {
+        if (!isValidSessionName(name)) return;
+        const new = self.alloc.dupe(u8, name) catch return;
+        if (self.session_id_alloc) |a| a.free(self.session_id);
+        self.session_id = new;
+        self.session_id_alloc = self.alloc;
+    }
+
+    fn loadSession(self: *App, name: []const u8) void {
+        if (!isValidSessionName(name)) {
+            self.setNotification("Invalid session name (letters, digits, - and _ only)");
+            return;
+        }
         const home_ptr = std.c.getenv("HOME") orelse return;
         const home = std.mem.sliceTo(home_ptr, 0);
         var path_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, self.session_id }, 0) catch return;
-        // Check if file exists
+        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, name }, 0) catch return;
         const fd = std.c.open(&path_buf, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
         if (fd < 0) {
-            const msg = std.fmt.allocPrint(self.alloc, "No saved session found at {s}", .{&path_buf}) catch return;
+            const msg = std.fmt.allocPrint(self.alloc, "No saved session \"{s}\"", .{name}) catch return;
+            defer self.alloc.free(msg);
             self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
             return;
         }
-        _ = std.c.close(fd);
-        self.loadSession(std.mem.sliceTo(&path_buf, 0));
-    }
-
-    fn loadSession(self: *App, path: []const u8) void {
-        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return;
-        defer self.alloc.free(path_z);
-        const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return;
         defer _ = std.c.close(fd);
         // Read entire file
         var data = std.ArrayList(u8).empty;
@@ -1611,24 +1874,64 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             data.appendSlice(self.alloc, read_buf[0..@intCast(n)]) catch break;
         }
         self.clearMessages();
-        var line_iter = std.mem.splitScalar(u8, data.items, '\n');
-        while (line_iter.next()) |line| {
-            if (line.len == 0) continue;
-            if (std.mem.indexOfScalar(u8, line, ':')) |colon| {
-                const role_str = line[0..colon];
-                const content = if (colon + 1 < line.len) line[colon + 1 ..] else "";
+        // Parse "ROLE <len>\n<content>\n" records with a cursor.
+        var i: usize = 0;
+        while (i < data.items.len) {
+            if (std.mem.indexOfScalarPos(u8, data.items, i, '\n')) |nl| {
+                const hdr = data.items[i..nl];
+                const space = std.mem.indexOfScalar(u8, hdr, ' ') orelse break;
+                const role_str = hdr[0..space];
+                const content_len = std.fmt.parseInt(usize, hdr[space + 1 ..], 10) catch break;
+                const content_start = nl + 1;
+                if (content_start + content_len > data.items.len) break;
+                const content = data.items[content_start .. content_start + content_len];
                 const role: Role = if (std.mem.eql(u8, role_str, "USER")) .user
                     else if (std.mem.eql(u8, role_str, "ASSISTANT")) .assistant
                     else if (std.mem.eql(u8, role_str, "SYSTEM")) .system
                     else .tool;
                 self.messages.append(self.alloc, .{
                     .role = role,
-                    .content = self.alloc.dupe(u8, content) catch continue,
+                    .content = self.alloc.dupe(u8, content) catch break,
                     .owns = true,
                 }) catch {};
-            }
+                i = content_start + content_len + 1; // skip content + trailing '\n'
+            } else break;
         }
+        self.setSessionName(name);
         self.auto_scroll = true;
+        self.streaming_idx = null;
+    }
+
+    fn listSessions(self: *App) void {
+        const home_ptr = std.c.getenv("HOME") orelse return;
+        const home = std.mem.sliceTo(home_ptr, 0);
+        var dir_buf: [512:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&dir_buf, "{s}/.zeepseek/sessions", .{home}, 0) catch return;
+        var out = std.ArrayList(u8).empty;
+        defer out.deinit(self.alloc);
+        out.appendSlice(self.alloc, "Saved sessions:\n") catch {};
+        var dir = std.Io.Dir.openDirAbsolute(self.io, std.mem.sliceTo(&dir_buf, 0), .{}) catch {
+            out.appendSlice(self.alloc, "  (no sessions directory yet)\n") catch {};
+            const msg = self.alloc.dupe(u8, out.items) catch return;
+            self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
+            return;
+        };
+        defer dir.close(self.io);
+        var it = dir.iterate();
+        var count: usize = 0;
+        while (it.next(self.io) catch null) |e| {
+            if (e.kind != .file) continue;
+            if (!std.mem.endsWith(u8, e.name, ".txt")) continue;
+            const name = e.name[0 .. e.name.len - 4];
+            if (name.len == 0) continue;
+            out.appendSlice(self.alloc, "  ") catch {};
+            out.appendSlice(self.alloc, name) catch {};
+            out.appendSlice(self.alloc, "\n") catch {};
+            count += 1;
+        }
+        if (count == 0) out.appendSlice(self.alloc, "  (none)\n") catch {};
+        const msg = self.alloc.dupe(u8, out.items) catch return;
+        self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
     }
 
     fn jumpToMatch(self: *App) void {
@@ -1797,6 +2100,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
         // Input area
         self.renderInput(&out, a, w);
+        if (self.pending_tool != null) self.renderToolApproval(&out, a, w);
 
         // Status bar
         self.renderStatus(&out, a, w);
@@ -2089,6 +2393,19 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     }
 
     // --- Input area 
+
+    fn renderToolApproval(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+        _ = w;
+        const pt = self.pending_tool orelse return;
+        const tr = self.tool_run orelse return;
+        if (pt.idx >= tr.calls.items.len) return;
+        const call = tr.calls.items[pt.idx];
+        const desc = tools_mod.describeToolCall(a, call) catch return;
+        defer a.free(desc);
+        appendFmt(buf, a, "{s}{s}[Approve tool?] {s}{s}{s}\n{s}Enter={s}Allow  {s}Esc={s}Deny{s}\n", .{
+            Pal.gold, B, R, desc, R, Pal.fg_dim, R, Pal.fg_dim, R, R,
+        });
+    }
 
     fn renderInput(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         // Thin separator
@@ -2476,6 +2793,12 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         self.palette_buf.deinit(self.alloc);
         self.search_query.deinit(self.alloc);
 
+        // Sub-agent threads may be blocked in a network connect (no request
+        // timeout configured yet — known L3 limitation). Joining here would
+        // deadlock Ctrl+C exit, so leave unfinished runs to be reclaimed by
+        // process exit. Completed runs were already cleaned up by pollSubAgents.
+        self.subagent_runs.deinit(self.alloc);
+
         for (self.subagents.items) |sa| {
             if (sa.id.len > 0) self.alloc.free(sa.id);
             if (sa.goal.len > 0) self.alloc.free(sa.goal);
@@ -2485,6 +2808,21 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
         if (self.notif) |n| self.alloc.free(n);
         if (self.api_key_alloc) |ka| ka.free(self.api_key);
+        if (self.session_id_alloc) |a| a.free(self.session_id);
+
+        if (self.tool_run) |tr| {
+            for (tr.calls.items) |c| {
+                self.alloc.free(c.name);
+                self.alloc.free(c.arguments);
+            }
+            tr.calls.deinit(self.alloc);
+            tr.results.deinit(self.alloc);
+            self.alloc.destroy(tr);
+        }
+        if (self.pending_tool) |pt| {
+            self.alloc.free(pt.cwd);
+        }
+        if (self.sandbox) |sb| sb.deinit();
     }
 };
 

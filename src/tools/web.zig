@@ -2,7 +2,7 @@ const std = @import("std");
 const tools_mod = @import("mod.zig");
 const ToolCall = tools_mod.ToolCall;
 const ToolResult = tools_mod.ToolResult;
-const sandbox_mod = @import("../utils/sandbox.zig");
+const sandbox_mod = @import("sandbox");
 const Sandbox = sandbox_mod.Sandbox;
 
 pub fn executeSearch(alloc: std.mem.Allocator, sandbox: ?*Sandbox, call: ToolCall) !ToolResult {

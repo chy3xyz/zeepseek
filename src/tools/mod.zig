@@ -1,12 +1,15 @@
 const std = @import("std");
-const sandbox_mod = @import("../utils/sandbox.zig");
-const Sandbox = sandbox_mod.Sandbox;
-const ApprovalMode = sandbox_mod.ApprovalMode;
+const sandbox_mod = @import("sandbox");
 
 pub const shell = @import("shell.zig");
 pub const file = @import("file.zig");
 pub const git = @import("git.zig");
 pub const web = @import("web.zig");
+
+pub const Sandbox = sandbox_mod.Sandbox;
+pub const ApprovalMode = sandbox_mod.ApprovalMode;
+pub const CommandValidator = sandbox_mod.CommandValidator;
+pub const Policy = sandbox_mod.Policy;
 
 pub const ToolCall = struct {
     index: usize,

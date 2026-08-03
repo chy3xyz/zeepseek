@@ -34,6 +34,24 @@ pub fn build(b: *std.Build) void {
     });
     zz_mod.addImport("dangerous_patterns", dangerous_patterns_mod);
 
+    // Unified tool execution + sandbox (used by app.zig's tool calls)
+    const sandbox_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/sandbox.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    sandbox_mod.addImport("c", c_mod);
+    const tools_mod = b.createModule(.{
+        .root_source_file = b.path("src/tools/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tools_mod.addImport("sandbox", sandbox_mod);
+    tools_mod.addImport("c", c_mod);
+    zz_mod.addImport("tools", tools_mod);
+
     // Expose net modules for streaming integration
     const http_client_file = b.createModule(.{
         .root_source_file = b.path("src/net/http_client.zig"),

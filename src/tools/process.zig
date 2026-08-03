@@ -108,3 +108,42 @@ pub fn runGit(
     try argv.appendSlice(alloc, args);
     return runArgv(alloc, repo, argv.items);
 }
+
+test "runArgv executes a command and captures output" {
+    const alloc = std.testing.allocator;
+    const result = try runArgv(alloc, "/tmp", &.{ "sh", "-c", "echo hello" });
+    defer alloc.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualSlices(u8, "hello\n", result.output);
+}
+
+test "runArgv reports non-zero exit as failure" {
+    const alloc = std.testing.allocator;
+    const result = try runArgv(alloc, "/tmp", &.{ "sh", "-c", "exit 3" });
+    defer alloc.free(result.output);
+    try std.testing.expect(!result.success);
+}
+
+test "runArgv merges stderr into output" {
+    const alloc = std.testing.allocator;
+    const result = try runArgv(alloc, "/tmp", &.{ "sh", "-c", "echo out; echo oops >&2" });
+    defer alloc.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "oops") != null);
+}
+
+test "runShell without sandbox runs /bin/sh -c" {
+    const alloc = std.testing.allocator;
+    const result = try runShell(alloc, null, "/tmp", "echo shell-ok");
+    defer alloc.free(result.output);
+    try std.testing.expect(result.success);
+    try std.testing.expectEqualSlices(u8, "shell-ok\n", result.output);
+}
+
+test "runShell output is capped" {
+    const alloc = std.testing.allocator;
+    const result = try runShell(alloc, null, "/tmp", "yes x | head -c 200000");
+    defer alloc.free(result.output);
+    try std.testing.expect(result.output.len < 200000);
+    try std.testing.expect(std.mem.indexOf(u8, result.output, "truncated") != null);
+}

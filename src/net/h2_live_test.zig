@@ -103,15 +103,18 @@ test "streamMessageH2 live" {
         alloc: std.mem.Allocator,
         content: std.ArrayList(u8),
         reasoning: std.ArrayList(u8),
+        tool: std.ArrayList(u8),
         fn onChunk(ctx: *anyopaque, kind: stream_client.ChunkKind, data: []const u8) void {
             const c: *@This() = @ptrCast(@alignCast(ctx));
             switch (kind) {
                 .content => c.content.appendSlice(c.alloc, data) catch {},
                 .reasoning => c.reasoning.appendSlice(c.alloc, data) catch {},
+                .tool => c.tool.appendSlice(c.alloc, data) catch {},
             }
         }
     };
-    var ctx = Ctx{ .alloc = alloc, .content = .empty, .reasoning = .empty };
+    var ctx = Ctx{ .alloc = alloc, .content = .empty, .reasoning = .empty, .tool = .empty };
+    defer ctx.tool.deinit(alloc);
     defer ctx.content.deinit(alloc);
     defer ctx.reasoning.deinit(alloc);
 

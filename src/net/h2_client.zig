@@ -169,7 +169,7 @@ pub const H2Client = struct {
                 .entropy = &random_buf,
                 .realtime_now = std.Io.Timestamp.now(self.io, .real),
             },
-        ) catch |e| {
+        ) catch {
             return error.TlsFailed;
         };
         // 3) HTTP/2 preface + SETTINGS
@@ -184,7 +184,7 @@ pub const H2Client = struct {
         var got_settings = false;
         var frames_read: usize = 0;
         while (frames_read < 4 and !got_settings) : (frames_read += 1) {
-            const frame = self.readFrame(&tls, &header_buf, &payload_buf) catch |e| {
+            const frame = self.readFrame(&tls, &header_buf, &payload_buf) catch {
                 return error.H2Protocol;
             };
             if (frame.header.typ == .settings) {
@@ -244,7 +244,7 @@ pub const H2Client = struct {
         defer hpack_dec.deinit();
 
         while (!end_stream) {
-            const frame = self.readFrame(&tls, &header_buf, &payload_buf) catch |e| {
+            const frame = self.readFrame(&tls, &header_buf, &payload_buf) catch {
                 return error.H2Protocol;
             };
             switch (frame.header.typ) {

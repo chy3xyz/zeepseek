@@ -961,11 +961,10 @@ pub const App = struct {
             return;
         };
         const alloc = self.alloc;
-        const io = self.io;
 
         // Spawn streaming thread
         const thread = std.Thread.spawn(.{}, struct {
-            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
+            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, a: std.mem.Allocator, state: *StreamState) void {
                 defer {
                     for (ctx) |ci| a.free(ci.content);
                     a.free(ctx);
@@ -973,7 +972,12 @@ pub const App = struct {
                     a.free(api_k);
                     a.free(mdl);
                 }
-                var client = stream_client_mod.DeepSeekStreamClient.init(a, sio, null, null);
+                // Dedicated Io so blocking network reads never stall the UI
+                // thread's shared std.Io (threaded-io socket hang on macOS).
+                var threaded = std.Io.Threaded.init(a, .{ .argv0 = .empty, .environ = .empty });
+                const sio_own = threaded.io();
+                defer threaded.deinit();
+                var client = stream_client_mod.DeepSeekStreamClient.init(a, sio_own, null, null);
                 defer client.deinit();
 
                 var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
@@ -989,8 +993,14 @@ pub const App = struct {
                     };
                     if (chunk == null) break;
                     switch (chunk.?) {
-                        .content => |c| state.pushContent(c),
-                        .reasoning => |r| state.pushReasoning(r),
+                        .content => |c| {
+                                    state.pushContent(c);
+                            a.free(c);
+                        },
+                        .reasoning => |r| {
+                            state.pushReasoning(r);
+                            a.free(r);
+                        },
                     }
                 }
                 // Capture tool call JSON if present
@@ -999,7 +1009,7 @@ pub const App = struct {
                 }
                 state.setDone();
             }
-        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, alloc, io, ss }) catch {
+        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, alloc, ss }) catch {
             // Thread failed to spawn: reclaim the data we duplicated for it
             for (ctx_slice) |ci| alloc.free(ci.content);
             alloc.free(ctx_slice);

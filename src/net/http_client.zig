@@ -78,7 +78,7 @@ pub fn buildDeepSeekRequestBody(
     if (reasoning_effort) |effort| {
         try body.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try body.appendSlice(allocator, effort);
-        try body.append('"');
+        try body.append(allocator, '"');
     }
 
     try body.append(allocator, '}');

@@ -72,14 +72,12 @@ pub const DeepSeekStreamClient = struct {
             try rl.wait();
         }
 
-        const completions_uri = if (std.mem.endsWith(u8, self.endpoint, "/v1"))
-            std.fmt.allocPrint(self.allocator, "{s}/chat/completions", .{self.endpoint}) catch return error.AllocationFailed
-        else
-            std.fmt.allocPrint(self.allocator, "{s}/v1/chat/completions", .{self.endpoint}) catch return error.AllocationFailed;
-        defer self.allocator.free(completions_uri);
-        const uri = std.Uri.parse(completions_uri) catch return error.InvalidUri;
+        // endpoint is the full request URL (e.g.
+        // "https://api.deepseek.com/chat/completions"). Use its path as-is.
+        const uri = std.Uri.parse(self.endpoint) catch return error.InvalidUri;
 
         const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort);
+        defer self.allocator.free(body);
 
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
         defer self.allocator.free(auth_value);
@@ -134,7 +132,7 @@ pub const DeepSeekStreamClient = struct {
 
         try body.appendSlice(self.allocator, "{\"model\":\"");
         try body.appendSlice(self.allocator, model);
-        try body.appendSlice(self.allocator, "\",\"stream\":true,\"messages\":[");
+        try body.appendSlice(self.allocator, "\",\"stream\":false,\"messages\":[");
 
         if (system_prompt.len > 0) {
             const cache_tag = switch (cache_decision) {
@@ -216,7 +214,66 @@ pub const StreamIterator = struct {
     tool_call_json: std.ArrayList(u8),
     has_tool_calls: bool = false,
 
+    /// Non-streaming response mode (stream:false). std.http + Threaded io
+    /// mis-report EOF on chunked streaming bodies on macOS (see zigmodu's
+    /// sockread notes), so we request a complete JSON response instead and
+    /// parse message.content here.
+    fn extractMessageContent(self: *StreamIterator, json: []const u8) !struct { content: []const u8, reasoning: []const u8 } {
+        var content_result: []const u8 = "";
+        var reasoning_result: []const u8 = "";
+        // tool_calls detection
+        if (std.mem.indexOf(u8, json, "\"tool_calls\"") != null or
+            std.mem.indexOf(u8, json, "\"tool_call\"") != null)
+        {
+            self.has_tool_calls = true;
+            try self.tool_call_json.appendSlice(self.allocator, json);
+        }
+        // find "message":{ ... }
+        if (std.mem.indexOf(u8, json, "\"message\"")) |mi| {
+            const brace = std.mem.indexOfScalarPos(u8, json, mi, '{') orelse return .{ .content = content_result, .reasoning = reasoning_result };
+            const end = try self.findMatchingBrace(json, brace) orelse return .{ .content = content_result, .reasoning = reasoning_result };
+            const msg = json[brace..end];
+            if (std.mem.indexOf(u8, msg, "\"content\":\"")) |ci| {
+                const vs = ci + 11;
+                if (std.mem.indexOfScalarPos(u8, msg, vs, '"')) |ve| {
+                    content_result = try unescapeJsonString(self.allocator, msg[vs..ve]);
+                }
+            }
+            if (std.mem.indexOf(u8, msg, "\"reasoning_content\":\"")) |ri| {
+                const vs = ri + 22;
+                if (std.mem.indexOfScalarPos(u8, msg, vs, '"')) |ve| {
+                    reasoning_result = try unescapeJsonString(self.allocator, msg[vs..ve]);
+                }
+            }
+        }
+        return .{ .content = content_result, .reasoning = reasoning_result };
+    }
+
     pub fn nextChunk(self: *StreamIterator) !?StreamChunk {
+        if (self.done) return null;
+        // Read the complete body (non-streaming JSON).
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(self.allocator);
+        var read_buf: [8192]u8 = undefined;
+        while (true) {
+            const n = self.resp.readBody(&read_buf) catch |err| return err;
+            if (n == 0) break;
+            try body.appendSlice(self.allocator, read_buf[0..n]);
+        }
+        self.done = true;
+
+        const parsed = try self.extractMessageContent(body.items);
+        if (parsed.reasoning.len > 0) {
+            const r = parsed.reasoning;
+            return StreamChunk{ .reasoning = r };
+        }
+        if (parsed.content.len > 0) {
+            return StreamChunk{ .content = parsed.content };
+        }
+        return null;
+    }
+
+    pub fn nextChunkStreaming(self: *StreamIterator) !?StreamChunk {
         if (self.done and self.content_buffer.len == 0 and self.reasoning_buffer.len == 0) return null;
         if (self.reasoning_buffer.len > 0) {
             const chunk = self.reasoning_buffer;
@@ -230,6 +287,63 @@ pub const StreamIterator = struct {
         }
 
         while (true) {
+            // Process every complete line already buffered before reading more,
+            // so an EOF (read -> 0) never drops trailing SSE events.
+            while (true) {
+                const nl = std.mem.indexOfScalar(u8, self.line_accumulator.items, '\n');
+                if (nl == null) break;
+                const newline_idx = nl.?;
+                // NOTE: `line`/`data_value` alias line_accumulator.items, so all
+                // decisions and any needed copy must happen BEFORE the buffer is
+                // cleared/rewritten with the remainder.
+                const line = self.line_accumulator.items[0 .. newline_idx + 1];
+                const remainder_len = self.line_accumulator.items.len - (newline_idx + 1);
+                const remainder = self.line_accumulator.items[newline_idx + 1 ..];
+
+                const trimmed = std.mem.trim(u8, line, "\r\n");
+                if (trimmed.len == 0 or trimmed[0] == ':' or
+                    !std.mem.startsWith(u8, trimmed, "data:"))
+                {
+                    // Not a data line: keep the remainder for the next line.
+                    self.line_accumulator.clearRetainingCapacity();
+                    if (remainder_len > 0) {
+                        const owned = try self.allocator.dupe(u8, remainder);
+                        defer self.allocator.free(owned);
+                        try self.line_accumulator.appendSlice(self.allocator, owned);
+                    }
+                    continue;
+                }
+
+                // Duplicate the payload so it survives the buffer rewrite.
+                const data_value = std.mem.trim(u8, trimmed[5..], " ");
+                const data_owned = try self.allocator.dupe(u8, data_value);
+                defer self.allocator.free(data_owned);
+
+                self.line_accumulator.clearRetainingCapacity();
+                if (remainder_len > 0) {
+                    const owned = try self.allocator.dupe(u8, remainder);
+                    defer self.allocator.free(owned);
+                    try self.line_accumulator.appendSlice(self.allocator, owned);
+                }
+
+                if (data_owned.len == 0) continue;
+                if (std.mem.eql(u8, data_owned, "[DONE]")) {
+                    self.done = true;
+                    return null;
+                }
+
+                const extracted = try self.extractContentAndReasoning(data_owned);
+                // Chunks are caller-owned once returned; free any unconsumed
+                // buffer before overwriting it with a newer extraction.
+                if (self.reasoning_buffer.len > 0) self.allocator.free(self.reasoning_buffer);
+                if (self.content_buffer.len > 0) self.allocator.free(self.content_buffer);
+                self.reasoning_buffer = extracted.reasoning;
+                self.content_buffer = extracted.content;
+                if (self.reasoning_buffer.len > 0 or self.content_buffer.len > 0) {
+                    return self.nextChunk();
+                }
+            }
+
             var read_buf: [4096]u8 = undefined;
             const n = self.resp.readBody(&read_buf) catch |err| return err;
             if (n == 0) {
@@ -237,38 +351,6 @@ pub const StreamIterator = struct {
                 return null;
             }
             try self.line_accumulator.appendSlice(self.allocator, read_buf[0..n]);
-
-            if (std.mem.indexOfScalar(u8, self.line_accumulator.items, '\n')) |newline_idx| {
-                const line = self.line_accumulator.items[0 .. newline_idx + 1];
-                const remainder = self.line_accumulator.items[newline_idx + 1 ..];
-                self.line_accumulator.clearRetainingCapacity();
-                if (remainder.len > 0) {
-                    try self.line_accumulator.appendSlice(self.allocator, remainder);
-                }
-                const trimmed = std.mem.trim(u8, line, "\r\n");
-                if (trimmed.len == 0) continue;
-                if (trimmed[0] == ':') continue;
-                if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
-
-                const data_value = std.mem.trim(u8, trimmed[5..], " ");
-                if (data_value.len == 0) continue;
-                if (std.mem.eql(u8, data_value, "[DONE]")) {
-                    self.done = true;
-                    return null;
-                }
-
-                const extracted = try self.extractContentAndReasoning(data_value);
-                if (extracted.reasoning.len > 0) {
-                    self.reasoning_buffer = extracted.reasoning;
-                }
-                if (extracted.content.len > 0) {
-                    self.content_buffer = extracted.content;
-                }
-                if (self.reasoning_buffer.len > 0 or self.content_buffer.len > 0) {
-                    return self.nextChunk();
-                }
-                continue;
-            }
         }
     }
 
@@ -322,9 +404,9 @@ pub const StreamIterator = struct {
 
                         var ci: usize = 0;
                         while (ci < delta_json.len) : (ci += 1) {
-                            if (ci + 9 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+9], "\"content\":")) {
-                                ci += 9;
-                                while (ci < delta_json.len and (delta_json[ci] == ' ' or delta_json[ci] == '"')) : (ci += 1) {}
+                            if (ci + 10 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+10], "\"content\":")) {
+                                ci += 10;
+                                while (ci < delta_json.len and delta_json[ci] == ' ') : (ci += 1) {}
                                 if (ci < delta_json.len and delta_json[ci] == '"') {
                                     ci += 1;
                                     const value_start = ci;
@@ -335,9 +417,9 @@ pub const StreamIterator = struct {
                                 }
                             }
 
-                            if (ci + 18 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+18], "\"reasoning_content\":")) {
-                                ci += 18;
-                                while (ci < delta_json.len and (delta_json[ci] == ' ' or delta_json[ci] == '"')) : (ci += 1) {}
+                            if (ci + 20 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+20], "\"reasoning_content\":")) {
+                                ci += 20;
+                                while (ci < delta_json.len and delta_json[ci] == ' ') : (ci += 1) {}
                                 if (ci < delta_json.len and delta_json[ci] == '"') {
                                     ci += 1;
                                     const value_start = ci;
@@ -770,5 +852,74 @@ test "tool call repair pipeline repair and parse" {
     const result = try pipeline.repairAndParse(truncated);
     try std.testing.expect(result != null);
     try std.testing.expectEqualSlices(u8, "bash", result.?.name);
+}
+
+
+// ── SSE delta parsing tests ──────────────────────────────────────────────
+
+fn makeTestIterator(alloc: std.mem.Allocator) StreamIterator {
+    return .{
+        .allocator = alloc,
+        .resp = undefined,
+        .buffer = .empty,
+        .line_accumulator = .empty,
+        .done = false,
+        .tool_call_json = .empty,
+    };
+}
+
+fn deinitTestIterator(iter: *StreamIterator, alloc: std.mem.Allocator) void {
+    iter.line_accumulator.deinit(alloc);
+    iter.buffer.deinit(alloc);
+    iter.tool_call_json.deinit(alloc);
+}
+
+test "extract plain content from delta" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expectEqualSlices(u8, "Hello", result.content);
+}
+
+test "extract deepseek real chunk format" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    // Real DeepSeek SSE chunk: delta carries role + content.
+    const json = "{\"id\":\"x\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\\u4f60\\u597d\"},\"logprobs\":null,\"finish_reason\":null}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expect(result.content.len > 0);
+}
+
+test "extract reasoning from delta" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expectEqualSlices(u8, "thinking hard", result.reasoning);
+}
+
+test "detect tool_calls in delta" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"shell\"}}]}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expect(iter.has_tool_calls);
 }
 

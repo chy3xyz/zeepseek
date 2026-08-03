@@ -66,6 +66,7 @@ pub const StreamingResponse = struct {
     // std_http mode
     https_client: ?*std.http.Client = null,
     https_req: ?*std.http.Client.Request = null,
+    https_response: ?*std.http.Client.Response = null,
     https_reader: ?*std.Io.Reader = null,
     https_transfer: ?[]u8 = null,
 
@@ -188,6 +189,7 @@ pub const StreamingResponse = struct {
             },
             .std_http => {
                 if (self.https_transfer) |t| self.allocator.free(t);
+                if (self.https_response) |response| self.allocator.destroy(response);
                 if (self.https_req) |req| {
                     req.deinit();
                     self.allocator.destroy(req);
@@ -253,10 +255,12 @@ pub const HttpClient = struct {
             req.sendBodyComplete(body_owned) catch return error.ConnectionFailed;
         }
 
-        var response = req.receiveHead(undefined) catch return error.ConnectionFailed;
+        const response = self.allocator.create(std.http.Client.Response) catch return error.OutOfMemory;
+        errdefer self.allocator.destroy(response);
+        response.* = req.receiveHead(undefined) catch return error.ConnectionFailed;
         const status: u16 = @intFromEnum(response.head.status);
 
-        const transfer = self.allocator.alloc(u8, 8192) catch return error.OutOfMemory;
+        const transfer = self.allocator.alloc(u8, 64 * 1024) catch return error.OutOfMemory;
         errdefer self.allocator.free(transfer);
         const reader = response.reader(transfer);
 
@@ -266,6 +270,7 @@ pub const HttpClient = struct {
             .status = status,
             .https_client = client,
             .https_req = req,
+            .https_response = response,
             .https_reader = reader,
             .https_transfer = transfer,
         };

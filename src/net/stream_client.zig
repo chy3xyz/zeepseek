@@ -906,3 +906,97 @@ pub const StreamIteratorOld = struct {
         self.buffer.deinit(self.allocator);
     }
 };
+// ── SSE delta parsing tests ──────────────────────────────────────────────
+
+fn makeTestIterator(alloc: std.mem.Allocator) StreamIterator {
+    return .{
+        .allocator = alloc,
+        .reader = undefined,
+        .buffer = .empty,
+        .line_accumulator = .empty,
+        .transfer_buffer = undefined,
+        .done = false,
+        .tool_call_json = .empty,
+    };
+}
+
+fn deinitTestIterator(iter: *StreamIterator, alloc: std.mem.Allocator) void {
+    iter.line_accumulator.deinit(alloc);
+    iter.buffer.deinit(alloc);
+    iter.tool_call_json.deinit(alloc);
+}
+
+test "extract plain content from delta" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expectEqualSlices(u8, "Hello", result.content);
+    try std.testing.expectEqual(@as(usize, 0), result.reasoning.len);
+}
+
+test "extract reasoning from delta" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expectEqualSlices(u8, "thinking hard", result.reasoning);
+    try std.testing.expectEqual(@as(usize, 0), result.content.len);
+}
+
+test "extract content and reasoning together" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"r\",\"content\":\"c\"}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expectEqualSlices(u8, "c", result.content);
+    try std.testing.expectEqualSlices(u8, "r", result.reasoning);
+}
+
+test "unescape content with escapes" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"content\":\"line1\\nline2\\t\\\"q\\\"\"}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expectEqualSlices(u8, "line1\nline2\t\"q\"", result.content);
+}
+
+test "detect tool_calls and accumulate raw json" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"shell\"}}]}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    defer if (result.content.len > 0) alloc.free(result.content);
+    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
+    try std.testing.expect(iter.has_tool_calls);
+    try std.testing.expect(std.mem.indexOf(u8, iter.tool_call_json.items, "tool_calls") != null);
+}
+
+test "missing delta yields empty result" {
+    const alloc = std.testing.allocator;
+    var iter = makeTestIterator(alloc);
+    defer deinitTestIterator(&iter, alloc);
+
+    const json = "{\"choices\":[{\"delta\":{}}]}";
+    const result = try iter.extractContentAndReasoning(json);
+    try std.testing.expectEqual(@as(usize, 0), result.content.len);
+    try std.testing.expectEqual(@as(usize, 0), result.reasoning.len);
+}

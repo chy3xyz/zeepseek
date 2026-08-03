@@ -1018,6 +1018,10 @@ fn flush(w: *Writer) Writer.Error!void {
     const prepared = prepareCiphertextRecord(c, ciphertext_buf, w.buffered(), .application_data);
     output.advance(prepared.ciphertext_end);
     w.end = 0;
+    // Flush the ciphertext to the underlying output (RawWriter) — without this
+    // the app-data records sit in the output buffer and never reach the socket
+    // (the handshake path calls output.flush() itself, so only app data broke).
+    try output.flush();
 }
 
 /// Sends a `close_notify` alert, which is necessary for the server to

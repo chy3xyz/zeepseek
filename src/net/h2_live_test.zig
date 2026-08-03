@@ -29,3 +29,26 @@ test "h2 example live" {
         std.debug.print("H2 BODY: {s}\n", .{resp.body.items[0..@min(resp.body.items.len, 200)]});
     }
 }
+
+test "h2 deepseek live" {
+    const alloc = std.testing.allocator;
+    const key_env = std.c.getenv("DEEPSEEK_API_KEY") orelse return;
+    const key = try alloc.dupe(u8, std.mem.span(key_env));
+    defer alloc.free(key);
+    var io = std.Io.Threaded.init(alloc, .{});
+    var client = h2c.H2Client.init(alloc, io.io());
+    const body = "{\"model\":\"deepseek-chat\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}";
+    var headers: [2]struct { []const u8, []const u8 } = .{
+        .{ "authorization", std.fmt.allocPrint(alloc, "Bearer {s}", .{key}) catch return },
+        .{ "content-type", "application/json" },
+    };
+    defer alloc.free(headers[0][1]);
+    var resp = client.request("api.deepseek.com", 443, "/chat/completions", &headers, body) catch |e| {
+        std.debug.print("DEEPSEEK ERR: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer resp.deinit();
+    std.debug.print("DEEPSEEK STATUS: {d} BODY: {d} bytes\n", .{ resp.status, resp.body.items.len });
+    const idx = std.mem.indexOf(u8, resp.body.items, "Hello") orelse std.mem.indexOf(u8, resp.body.items, "hello");
+    std.debug.print("DEEPSEEK has hello: {any}\n", .{idx != null});
+}

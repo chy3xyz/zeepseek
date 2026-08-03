@@ -33,12 +33,24 @@ pub const H2Response = struct {
     allocator: std.mem.Allocator,
     fd: posix.fd_t,
     tls: tls_mod,
+    raw_reader: *raw_io.RawReader,
+    raw_writer: *raw_io.RawWriter,
+    socket_read_buf: []u8,
+    socket_write_buf: []u8,
+    read_buf: []u8,
+    write_buf: []u8,
     status: u16 = 0,
     body: std.ArrayList(u8) = .empty,
 
     pub fn deinit(self: *H2Response) void {
         self.tls.end() catch {};
         self.body.deinit(self.allocator);
+        self.allocator.destroy(self.raw_reader);
+        self.allocator.destroy(self.raw_writer);
+        self.allocator.free(self.socket_read_buf);
+        self.allocator.free(self.socket_write_buf);
+        self.allocator.free(self.read_buf);
+        self.allocator.free(self.write_buf);
         _ = libc.close(@intCast(self.fd));
     }
 };
@@ -144,17 +156,24 @@ pub const H2Client = struct {
         setReadTimeout(fd, self.read_timeout_ms);
 
         // 2) TLS (vendored client with ALPN "h2")
+        // Buffers/raw IO are owned by the returned H2Response (freed in
+        // deinit); on the error path they are released here instead.
+        var owned_by_resp = false;
+        errdefer { if (!owned_by_resp) _ = libc.close(fd); }
         const socket_read_buf = try alloc.alloc(u8, tls_mod.min_buffer_len);
-        defer alloc.free(socket_read_buf);
+        errdefer { if (!owned_by_resp) alloc.free(socket_read_buf); }
         const socket_write_buf = try alloc.alloc(u8, tls_mod.min_buffer_len);
-        defer alloc.free(socket_write_buf);
-        var raw_reader = raw_io.RawReader.init(fd, socket_read_buf);
-        var raw_writer = raw_io.RawWriter.init(fd, socket_write_buf);
-
+        errdefer { if (!owned_by_resp) alloc.free(socket_write_buf); }
         const read_buf = try alloc.alloc(u8, tls_mod.min_buffer_len);
-        defer alloc.free(read_buf);
+        errdefer { if (!owned_by_resp) alloc.free(read_buf); }
         const write_buf = try alloc.alloc(u8, tls_mod.min_buffer_len);
-        defer alloc.free(write_buf);
+        errdefer { if (!owned_by_resp) alloc.free(write_buf); }
+        const raw_reader = try alloc.create(raw_io.RawReader);
+        errdefer { if (!owned_by_resp) alloc.destroy(raw_reader); }
+        const raw_writer = try alloc.create(raw_io.RawWriter);
+        errdefer { if (!owned_by_resp) alloc.destroy(raw_writer); }
+        raw_reader.* = raw_io.RawReader.init(fd, socket_read_buf);
+        raw_writer.* = raw_io.RawWriter.init(fd, socket_write_buf);
         var random_buf: [tls_mod.Options.entropy_len]u8 = undefined;
         self.io.random(&random_buf);
 
@@ -233,8 +252,15 @@ pub const H2Client = struct {
             .allocator = alloc,
             .fd = fd,
             .tls = tls,
+            .raw_reader = raw_reader,
+            .raw_writer = raw_writer,
+            .socket_read_buf = socket_read_buf,
+            .socket_write_buf = socket_write_buf,
+            .read_buf = read_buf,
+            .write_buf = write_buf,
             .body = .empty,
         };
+        owned_by_resp = true;
         errdefer response.deinit();
 
         var end_stream = false;

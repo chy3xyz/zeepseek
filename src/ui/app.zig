@@ -490,6 +490,54 @@ const SubAgentRun = struct {
     }
 };
 
+/// Background LLM summarization for /compact. Same ownership model as
+/// SubAgentRun: dedicated page-allocator arena so a run blocked on the
+/// network at exit never reaches the GPA leak checker.
+const CompactRun = struct {
+    thread: std.Thread = undefined,
+    /// Number of leading messages to replace with the summary
+    keep_end: usize,
+    arena: std.heap.ArenaAllocator,
+    done: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    result: std.ArrayList(u8) = .empty,
+    locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+
+    fn init(alloc: std.mem.Allocator, keep_end: usize) CompactRun {
+        return .{ .keep_end = keep_end, .arena = std.heap.ArenaAllocator.init(alloc) };
+    }
+    fn allocator(self: *CompactRun) std.mem.Allocator {
+        return self.arena.allocator();
+    }
+    fn lock(self: *CompactRun) void {
+        while (self.locked.cmpxchgStrong(false, true, .acquire, .monotonic) != null) {}
+    }
+    fn unlock(self: *CompactRun) void {
+        self.locked.store(false, .release);
+    }
+    fn pushResult(self: *CompactRun, text: []const u8) void {
+        self.lock();
+        defer self.unlock();
+        self.result.appendSlice(self.arena.allocator(), text) catch {};
+    }
+    fn setDone(self: *CompactRun) void { self.done.store(true, .release); }
+    fn setFailed(self: *CompactRun) void {
+        self.failed.store(true, .release);
+        self.done.store(true, .release);
+    }
+    fn isDone(self: *CompactRun) bool { return self.done.load(.acquire); }
+    fn drainResult(self: *CompactRun, alloc: std.mem.Allocator) ?[]const u8 {
+        self.lock();
+        defer self.unlock();
+        if (self.result.items.len == 0) return null;
+        return alloc.dupe(u8, self.result.items) catch null;
+    }
+    fn deinit(self: *CompactRun) void {
+        self.result.deinit(self.arena.allocator());
+        self.arena.deinit();
+    }
+};
+
 pub const App = struct {
     pub const Msg = union(enum) {
         key: zz.KeyEvent,
@@ -552,6 +600,9 @@ pub const App = struct {
 
     // --- Sub-agent runs (background LLM threads) 
     subagent_runs: std.ArrayList(*SubAgentRun) = .empty,
+
+    // --- Context compaction (background LLM summarization) 
+    compact_run: ?*CompactRun = null,
 
     // --- Session state 
     session_id: []const u8,
@@ -677,6 +728,7 @@ pub const App = struct {
                 self.cursor_visible = (t.timestamp / 500_000_000) % 2 == 0; // blink every 500ms
                 self.pollStream();
                 self.pollSubAgents();
+                self.pollCompact();
                 // Auto-dismiss notification after ~2 seconds (4 ticks at 60fps≈2s)
                 if (self.notif != null) {
                     self.notif_tick += 1;
@@ -1971,34 +2023,25 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     /// Compact older messages to reduce token usage.
     /// Keeps the last KEEP_EXCHANGES exchanges intact, collapses older ones
     /// into a single compacted summary system message.
+    /// Start a background LLM summarization of older messages (/compact).
+    /// The result replaces the compacted range once the thread finishes.
     fn compactContext(self: *App) void {
         const KEEP_EXCHANGES: usize = 6; // last 6 user↔assistant rounds
         const total = self.messages.items.len;
         if (total <= KEEP_EXCHANGES * 2) {
-            // Not enough messages to compact meaningfully
-            self.messages.append(self.alloc, .{
-                .role = .system,
-                .content = "Not enough context to compact (need >{d} messages).",
-                .owns = false,
-            }) catch {};
+            self.setNotification("Not enough context to compact (need >12 messages)");
+            return;
+        }
+        if (self.compact_run != null) {
+            self.setNotification("Compaction already in progress");
+            return;
+        }
+        if (self.api_key.len == 0) {
+            self.setNotification("Set an API key first (/apikey sk-...)");
             return;
         }
 
-        // Count non-system messages to determine how many to keep
-        var non_system_count: usize = 0;
-        for (self.messages.items) |m| {
-            if (m.role != .system) non_system_count += 1;
-        }
-        if (non_system_count <= KEEP_EXCHANGES * 2) {
-            self.messages.append(self.alloc, .{
-                .role = .system,
-                .content = "Not enough conversation history to compact.",
-                .owns = false,
-            }) catch {};
-            return;
-        }
-
-        // Count backwards: find how many messages to keep
+        // Count backwards: how many leading messages to replace
         var keep_count: usize = 0;
         var keep_end: usize = total;
         var i: usize = total;
@@ -2011,35 +2054,102 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             }
         }
 
-        // Build compacted summary of messages before keep_end
-        var summary = std.ArrayList(u8).empty;
-        defer summary.deinit(self.alloc);
+        const run = std.heap.page_allocator.create(CompactRun) catch return;
+        run.* = CompactRun.init(std.heap.page_allocator, keep_end);
+        const ra = run.allocator();
 
-        const compact_prefix = "[Compacted: local preview — LLM summarization not implemented]\n\n";
-        summary.appendSlice(self.alloc, compact_prefix) catch {};
-
-        var compacted_count: usize = 0;
+        // Snapshot the old messages into the run's arena
+        var ctx = std.ArrayList(stream_client_mod.CtxItem).empty;
+        defer ctx.deinit(ra);
         for (self.messages.items[0..keep_end]) |m| {
-            const role_label: []const u8 = switch (m.role) {
-                .user => "User",
-                .assistant => "Assistant",
-                .system => "System",
-                .tool => "Tool",
+            const role_str: []const u8 = switch (m.role) {
+                .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
             };
-            // Truncate each message to 200 chars for the summary
-            const content_preview = if (m.content.len > 200) m.content[0..200] else m.content;
-            summary.appendSlice(self.alloc, role_label) catch {};
-            summary.appendSlice(self.alloc, ": ") catch {};
-            summary.appendSlice(self.alloc, content_preview) catch {};
-            if (m.content.len > 200) {
-                summary.appendSlice(self.alloc, "...") catch {};
-            }
-            summary.appendSlice(self.alloc, "\n") catch {};
-            compacted_count += 1;
+            const content = ra.dupe(u8, m.content) catch continue;
+            ctx.append(ra, .{ .role = role_str, .content = content }) catch {
+                ra.free(content);
+            };
         }
+        if (ctx.items.len == 0) {
+            std.heap.page_allocator.destroy(run);
+            self.setNotification("Nothing to compact");
+            return;
+        }
+        const ctx_slice = ctx.toOwnedSlice(ra) catch {
+            std.heap.page_allocator.destroy(run);
+            return;
+        };
+        const api_key_owned = ra.dupe(u8, self.api_key) catch {
+            std.heap.page_allocator.destroy(run);
+            return;
+        };
+        const model_owned = ra.dupe(u8, self.model) catch {
+            std.heap.page_allocator.destroy(run);
+            return;
+        };
 
-        // Free old compacted messages
-        for (self.messages.items[0..keep_end]) |*m| {
+        const thread = std.Thread.spawn(.{}, struct {
+            fn runCompact(api_k: []const u8, mdl: []const u8, ctxs: []const stream_client_mod.CtxItem, a: std.mem.Allocator, rr: *CompactRun) void {
+                // Dedicated Io: a blocked connect must not stall the UI thread.
+                var threaded = std.Io.Threaded.init(a, .{ .argv0 = .empty, .environ = .empty });
+                const sio_own = threaded.io();
+                defer threaded.deinit();
+                var client = stream_client_mod.DeepSeekStreamClient.init(a, sio_own, null, null);
+                defer client.deinit();
+
+                const prompt = "Summarize the following conversation history into one concise paragraph. Preserve key decisions, facts, code intent, and any unresolved questions. Reply with only the summary.";
+                var stream = client.streamMessage(api_k, prompt, ctxs, mdl, CacheDecision.none, "", null) catch {
+                    rr.setFailed();
+                    return;
+                };
+                defer stream.deinit();
+
+                while (true) {
+                    const chunk = stream.nextChunk() catch {
+                        rr.setFailed();
+                        return;
+                    };
+                    if (chunk == null) break;
+                    switch (chunk.?) {
+                        .content => |c| rr.pushResult(c),
+                        .reasoning => {},
+                    }
+                }
+                rr.setDone();
+            }
+        }.runCompact, .{ api_key_owned, model_owned, ctx_slice, ra, run }) catch {
+            std.heap.page_allocator.destroy(run);
+            self.setNotification("Failed to start compaction");
+            return;
+        };
+        run.thread = thread;
+        self.compact_run = run;
+        self.setNotification("Compacting context in background...");
+    }
+
+    fn pollCompact(self: *App) void {
+        const run = self.compact_run orelse return;
+        if (!run.isDone()) return;
+        run.thread.join();
+        const failed = run.failed.load(.acquire);
+        const result = run.drainResult(self.alloc);
+        defer {
+            if (result) |r| self.alloc.free(r);
+        }
+        if (failed or result == null or result.?.len == 0) {
+            self.setNotification("Compaction failed (check API key / network)");
+        } else {
+            self.applyCompact(run.keep_end, result.?);
+        }
+        run.deinit();
+        std.heap.page_allocator.destroy(run);
+        self.compact_run = null;
+    }
+
+    fn applyCompact(self: *App, keep_end: usize, summary: []const u8) void {
+        const replaced = @min(keep_end, self.messages.items.len);
+        // Free the compacted messages
+        for (self.messages.items[0..replaced]) |*m| {
             if (m.owns and m.content.len > 0) self.alloc.free(m.content);
             if (m.thinking) |t| self.alloc.free(t);
             for (m.tool_calls.items) |tc| {
@@ -2047,32 +2157,18 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             }
             m.tool_calls.deinit(self.alloc);
         }
-
-        // Replace compacted range with a single system summary message
-        const summary_text = summary.items;
-        const duped = self.alloc.dupe(u8, summary_text) catch return;
-        const compacted_msg = ChatMsg{
+        for (0..replaced) |_| {
+            _ = self.messages.orderedRemove(0);
+        }
+        // Insert the LLM summary as a system message
+        const duped = self.alloc.dupe(u8, summary) catch return;
+        self.messages.insert(self.alloc, 0, .{
             .role = .system,
             .content = duped,
             .owns = true,
             .status = .complete,
-        };
-
-        // Remove old range and insert summary
-        for (0..keep_end) |_| {
-            _ = self.messages.orderedRemove(0);
-        }
-        self.messages.insert(self.alloc, 0, compacted_msg) catch {};
-
-        // Notify user
-        const note = std.fmt.allocPrint(self.alloc, "Compacted {d} messages into summary. {d} messages remain.", .{
-            compacted_count, self.messages.items.len,
-        }) catch return;
-        self.messages.append(self.alloc, .{
-            .role = .system,
-            .content = note,
-            .owns = true,
         }) catch {};
+        self.setNotification("Context compacted via LLM summary");
     }
 
     // ═════════════════════════════════════════════════════════════════════

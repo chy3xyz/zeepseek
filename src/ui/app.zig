@@ -561,7 +561,11 @@ pub const App = struct {
         // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
         // requiresApproval/allowShell still gate every tool call.
         self.sandbox = tools_mod.Sandbox.init(tools_mod.Policy.host(), &.{}) catch null;
-        return .enter_alt_screen;
+
+        // Enter the alternate screen AND schedule a repeating tick (~60fps):
+        // pollStream/pollSubAgents/pollCompact all run from the .tick message,
+        // so without .every the streaming UI never updates.
+        return .{ .batch = &.{ .{ .enter_alt_screen = {} }, .{ .every = 16_666_666 } } };
     }
 
     fn loadSavedApiKey(self: *App) void {

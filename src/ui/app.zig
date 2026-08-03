@@ -898,6 +898,51 @@ pub const App = struct {
         if (self.api_key.len > 0) {
             std.heap.page_allocator.free(self.api_key);
         }
+
+        // Free tool approval/run state
+        if (self.pending_tool) |pt| {
+            if (pt.cwd.len > 0) self.alloc.free(pt.cwd);
+            self.pending_tool = null;
+        }
+        if (self.tool_run) |tr| {
+            for (tr.calls.items) |c| {
+                self.alloc.free(c.name);
+                self.alloc.free(c.arguments);
+            }
+            tr.calls.deinit(self.alloc);
+            tr.results.deinit(self.alloc);
+            self.alloc.destroy(tr);
+            self.tool_run = null;
+        }
+
+        // Background threads: join only threads that already finished.
+        // A still-running thread may be blocked in a network call with no
+        // timeout; the process is exiting so the OS reclaims its arena
+        // (page_allocator pages never reach the leak checker).
+        while (self.subagent_runs.items.len > 0) {
+            const run = self.subagent_runs.items[0];
+            if (run.isDone()) {
+                run.thread.join();
+                run.deinit();
+                std.heap.page_allocator.destroy(run);
+                _ = self.subagent_runs.orderedRemove(0);
+            } else break;
+        }
+        self.subagent_runs.deinit(self.alloc);
+
+        if (self.compact_run) |cr| {
+            if (cr.isDone()) {
+                cr.thread.join();
+                cr.deinit();
+                std.heap.page_allocator.destroy(cr);
+            }
+            self.compact_run = null;
+        }
+
+        if (self.sandbox) |sb| {
+            sb.deinit();
+            self.sandbox = null;
+        }
     }
 
     fn textInputAppend(self: *App, bytes: []const u8) void {
@@ -925,28 +970,14 @@ pub const App = struct {
                 .api_key = self.api_key,
                 .default_model = "deepseek-chat",
             }) catch {};
-            // Sandbox: skip on macOS due to Seatbelt policy issues
-            // self.sandbox stays null; tools work without sandbox
-            // Initialize dispatch layer
-            const cm = ctx.persistent_allocator.create(ContextManager) catch null;
-            if (cm) |c| {
-                c.* = ContextManager.init(ctx.persistent_allocator);
-                self.ctx_mgr = c;
-            }
-            const cl = ctx.persistent_allocator.create(dispatch_loop.CacheFirstLoop) catch null;
-            if (cl) |c| {
-                const prefix = ImmutablePrefix.init(ctx.persistent_allocator, "", "", "");
-                c.* = dispatch_loop.CacheFirstLoop.init(ctx.persistent_allocator, .{
-                    .prefix = prefix,
-                    .context = self.ctx_mgr.?,
-                    .reasonix = undefined,
-                    .model = .deepseek_chat,
-                    .io = self.io,
-                    .api_key = self.api_key,
-                    .stream = true,
-                });
-                self.cache_loop = c;
-            }
+            // Sandbox is initialized in App.init (workspace allow-list);
+            // if the platform sandbox fails (macOS Seatbelt), tool calls
+            // that mutate or execute fall back to explicit user approval
+            // (requiresApproval fails closed on null sandbox).
+            // NOTE: dispatch/cache subsystems (ContextManager, CacheFirstLoop,
+            // reasonix) are experimental and not wired into the streaming
+            // path; they are intentionally left uninitialized (see
+            // docs/ARCHITECTURE.md for wiring status).
             for (SlashDispatcher.Dispatcher.commands()) |cmd| {
                 self.palette.addCommand(.{
                     .id = cmd.id,
@@ -1124,12 +1155,9 @@ pub const App = struct {
             return .none;
         }
 
-        // --- / at start of input opens palette; otherwise type as normal
-        if (k == .char and k.char == '/' and self.text_input.getValue().len == 0) {
-            self.palette.open();
-            return .none;
-        }
-
+        // '/' is typed as a normal character so parameterized commands
+        // (/save name, /model x, /apikey sk-...) can be entered directly;
+        // Ctrl+P opens the command palette for quick selection.
         // --- F1 / ? for help (when input empty)
         if (k == .f1 or (k == .char and k.char == '?' and self.text_input.getValue().len == 0)) {
             self.updateHelpModal();
@@ -1248,7 +1276,14 @@ pub const App = struct {
             .role = .assistant,
             .content = "",
             .status = .streaming,
-        }) catch return;
+        }) catch {
+            // OOM: roll back the stream state we just created so no dangling
+            // stream_state is left behind.
+            ss.deinit();
+            self.alloc.destroy(ss);
+            self.stream_state = null;
+            return;
+        };
         self.streaming_idx = idx;
 
         // Build context from recent messages. Content is duplicated so the
@@ -1576,26 +1611,6 @@ pub const App = struct {
         tr.results.deinit(self.alloc);
         self.alloc.destroy(tr);
         self.tool_run = null;
-    }
-
-    fn executeToolCall(self: *App, name: []const u8, args: []const u8, cwd: []const u8) []const u8 {
-        // Use tools/mod.zig unified execution (shell, file, git, web with sandbox)
-        const call = tools_mod.ToolCall{
-            .index = 0,
-            .name = name,
-            .arguments = args,
-        };
-        // Check sandbox approval
-        if (tools_mod.requiresApproval(self.sandbox, call)) {
-            // Auto-allow for now (future: prompt user via TUI overlay)
-        }
-        const result = tools_mod.executeTool(self.alloc, self.sandbox, cwd, call) catch {
-            return "Error: tool execution failed";
-        };
-        if (result.success) {
-            return if (result.output.len > 0) result.output else "(no output)";
-        }
-        return result.err_msg orelse "Error: unknown tool error";
     }
 
     /// Execute one tool through the unified tools/ pipeline with extra guards.
@@ -2035,8 +2050,8 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
             .quit => self.should_quit = true,
             .clear_chat => self.clearMessages(),
-            .save_session => self.saveSession(self.session_id),
-            .load_session => self.loadSession(self.session_id),
+            .save_session => self.saveSession(if (args.len > 0) args else self.session_id),
+            .load_session => self.loadSession(if (args.len > 0) args else self.session_id),
             .toggle_thinking => self.show_thinking = !self.show_thinking,
             .toggle_tools => self.toggleToolCollapse(),
             .toggle_subagents => self.show_subagents = !self.show_subagents,
@@ -2186,14 +2201,31 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         };
         defer self.alloc.free(blob);
 
+        // Atomic write: tmp file + full write with error checks + fsync +
+        // rename, so a crash never leaves a truncated/partial session file.
+        var tmp_buf: [512:0]u8 = undefined;
+        _ = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/.zeepseek/sessions/.{s}.tmp", .{ home, name }, 0) catch return;
         const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-        const fd = std.c.open(&path_buf, flags, @as(std.c.mode_t, 0o644));
+        const fd = std.c.open(&tmp_buf, flags, @as(std.c.mode_t, 0o644));
         if (fd < 0) {
             self.setNotification("Save failed: cannot open session file");
             return;
         }
         defer _ = std.c.close(fd);
-        _ = std.c.write(fd, blob.ptr, blob.len);
+        var off: usize = 0;
+        while (off < blob.len) {
+            const n = std.c.write(fd, blob.ptr + off, blob.len - off);
+            if (n <= 0) {
+                self.setNotification("Save failed: write error");
+                return;
+            }
+            off += @intCast(n);
+        }
+        _ = std.c.fsync(fd);
+        if (std.c.rename(&tmp_buf, &path_buf) != 0) {
+            self.setNotification("Save failed: rename error");
+            return;
+        }
         const note = std.fmt.allocPrint(self.alloc, "Session saved: {s}", .{name}) catch return;
         defer self.alloc.free(note);
         self.setNotification(note);

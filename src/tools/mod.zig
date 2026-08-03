@@ -120,7 +120,15 @@ pub fn freeArgs(alloc: std.mem.Allocator, map: *std.StringHashMap([]const u8)) v
 
 /// Check if a tool call requires approval based on sandbox policy.
 pub fn requiresApproval(sandbox: ?*Sandbox, call: ToolCall) bool {
-    const sb = sandbox orelse return false;
+    const sb = sandbox orelse {
+        // No platform sandbox (e.g. macOS Seatbelt failed to init): fail
+        // closed — anything mutating or executing requires explicit user
+        // approval instead of silently allowing it.
+        return std.mem.eql(u8, call.name, "shell") or
+            std.mem.eql(u8, call.name, "file_write") or
+            std.mem.eql(u8, call.name, "file_edit") or
+            std.mem.eql(u8, call.name, "git_commit");
+    };
     if (std.mem.eql(u8, call.name, "shell")) {
         return sb.shell_mode == .prompt;
     }

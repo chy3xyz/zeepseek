@@ -1,3 +1,6 @@
+//! EXPERIMENTAL: not wired into the app (zero imports). Kept for
+//! reference; see docs/ARCHITECTURE.md.
+
 const std = @import("std");
 const storage_mod = @import("../storage/store.zig");
 const Store = storage_mod.Store;

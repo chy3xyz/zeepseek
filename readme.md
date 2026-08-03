@@ -16,7 +16,17 @@ Zeepseek is a TUI (terminal UI) application that lets you chat with DeepSeek's l
 - **Context compaction** — `/compact` summarizes older messages in the background via the LLM
 - **Right sidebar** — Live metrics: model, turn, estimated context %
 - **Sub-agent panel** — `/subagent <goal>` spawns a background research sub-agent
+- **Multi-provider** — ProviderManager with `/provider` switching (defaults to DeepSeek)
+- **Themes** — Ctrl+T cycles semantic color themes
+- **Streaming via own h2-over-TLS client** — no std.http chunked-EOF quirks;
+  automatic fallback to the buffered path
 - **Single static binary** — No runtime dependencies
+
+> **Experimental (not wired into the runtime yet):** semantic cache
+> (`cache/reasonix`), the `agent/` scheduler, `skills/`, `acp/`, `rlm/`
+> (long-term memory), and the TurboDB `storage/session_manager`/`mmap_store`
+> layer. They compile and have unit tests, but are documented in
+> `docs/ARCHITECTURE.md` as isolated until integrated.
 
 ## Requirements
 

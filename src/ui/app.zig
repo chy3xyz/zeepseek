@@ -859,6 +859,15 @@ pub const App = struct {
             return;
         }
 
+        // Guard: sending a new message while the previous response is still
+        // streaming would startStreaming -> join a possibly blocked network
+        // thread, freezing the UI (no request timeout). Keep the input so the
+        // user can retry after the current response finishes.
+        if (self.streaming_idx != null) {
+            self.setNotification("Wait for the current response to finish");
+            return;
+        }
+
         const text = self.alloc.dupe(u8, text_slice) catch return;
         self.messages.append(self.alloc, .{
             .role = .user,
@@ -2746,13 +2755,20 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     }
 
     pub fn deinit(self: *App) void {
-        // Stop the streaming thread first so nothing touches App state afterwards.
-        if (self.stream_thread) |t| t.join();
+        // Streaming thread: join only if it already finished. A thread blocked
+        // in a network connect (no request timeout yet — known L3 limitation)
+        // would freeze Ctrl+C exit; the OS reclaims it at process exit.
         if (self.stream_state) |ss| {
-            ss.deinit();
-            self.alloc.destroy(ss);
-            self.stream_state = null;
+            if (ss.isDone()) {
+                if (self.stream_thread) |t| t.join();
+                ss.deinit();
+                self.alloc.destroy(ss);
+            }
+            // else: leave for process exit (memory reclaimed by the OS)
+        } else if (self.stream_thread) |t| {
+            t.join();
         }
+        self.stream_state = null;
         self.stream_thread = null;
 
         for (self.messages.items) |*m| {

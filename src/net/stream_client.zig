@@ -125,7 +125,13 @@ pub const DeepSeekStreamClient = struct {
 
         var h2 = http2.HttpClient.init(self.allocator, self.io);
         h2.config = .{ .read_timeout_ms = 60_000 };
-        var resp = h2.open(scheme, host, port, "POST", uri.path.percent_encoded, &headers, body) catch return error.HttpError;
+        var path_buf: [256]u8 = undefined;
+        const base_path = uri.path.percent_encoded;
+        const req_path = if (std.mem.endsWith(u8, base_path, "/chat/completions"))
+            base_path
+        else
+            std.fmt.bufPrint(&path_buf, "{s}/chat/completions", .{base_path}) catch base_path;
+        var resp = h2.open(scheme, host, port, "POST", req_path, &headers, body) catch return error.HttpError;
         errdefer resp.deinit();
         self.last_http_status = @intCast(resp.status);
         if (resp.status < 200 or resp.status >= 300) {
@@ -1134,7 +1140,12 @@ pub fn streamMessageH2(
     defer self.allocator.free(auth_value);
     const host = uri.host.?.percent_encoded;
     const port: u16 = uri.port orelse 443;
-    const path = uri.path.percent_encoded;
+    var path_buf: [256]u8 = undefined;
+    const base_path = uri.path.percent_encoded;
+    const path = if (std.mem.endsWith(u8, base_path, "/chat/completions"))
+        base_path
+    else
+        std.fmt.bufPrint(&path_buf, "{s}/chat/completions", .{base_path}) catch base_path;
 
     const headers = [_]struct { []const u8, []const u8 }{
         .{ "authorization", auth_value },

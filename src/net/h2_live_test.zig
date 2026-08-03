@@ -1,5 +1,6 @@
 const std = @import("std");
 const h2c = @import("h2_client.zig");
+const stream_client = @import("stream_client.zig");
 
 test "h2 example live" {
     const alloc = std.testing.allocator;
@@ -88,4 +89,41 @@ test "h2 deepseek streaming" {
     var total: usize = 0;
     for (ctx.chunks.items) |c| total += c.len;
     std.debug.print("STREAM via-callback={d} has hello: {any}\n", .{ total, std.mem.indexOf(u8, resp.body.items, "Hello") != null });
+}
+
+test "streamMessageH2 live" {
+    const alloc = std.testing.allocator;
+    const key_env = std.c.getenv("DEEPSEEK_API_KEY") orelse return;
+    const key = try alloc.dupe(u8, std.mem.span(key_env));
+    defer alloc.free(key);
+    var io = std.Io.Threaded.init(alloc, .{});
+    var client = stream_client.DeepSeekStreamClient.init(alloc, io.io(), null, null);
+
+    const Ctx = struct {
+        alloc: std.mem.Allocator,
+        content: std.ArrayList(u8),
+        reasoning: std.ArrayList(u8),
+        fn onChunk(ctx: *anyopaque, kind: stream_client.ChunkKind, data: []const u8) void {
+            const c: *@This() = @ptrCast(@alignCast(ctx));
+            switch (kind) {
+                .content => c.content.appendSlice(c.alloc, data) catch {},
+                .reasoning => c.reasoning.appendSlice(c.alloc, data) catch {},
+            }
+        }
+    };
+    var ctx = Ctx{ .alloc = alloc, .content = .empty, .reasoning = .empty };
+    defer ctx.content.deinit(alloc);
+    defer ctx.reasoning.deinit(alloc);
+
+    const sink = stream_client.ChunkSink{ .ctx = &ctx, .on_chunk = Ctx.onChunk };
+    const model = "deepseek-chat";
+    const CacheDecision = enum { none, hit, miss };
+    stream_client.streamMessageH2(&client, key, "hi", &.{}, model, CacheDecision.none, "", null, sink) catch |e| {
+        std.debug.print("SMH2 ERR: {s}\n", .{@errorName(e)});
+        return;
+    };
+    std.debug.print("SMH2 content={d} bytes reasoning={d} has hello: {any}\n", .{
+        ctx.content.items.len, ctx.reasoning.items.len,
+        std.mem.indexOf(u8, ctx.content.items, "Hello") != null,
+    });
 }

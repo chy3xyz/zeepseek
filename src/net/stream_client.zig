@@ -5,6 +5,7 @@ const RateLimiter = @import("http_client.zig").RateLimiter;
 const CircuitBreaker = @import("http_client.zig").CircuitBreaker;
 const CacheConfig = @import("http_client.zig").CacheConfig;
 const http2 = @import("http_client2.zig");
+const h2_client = @import("h2_client.zig");
 
 fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8, output: *std.ArrayList(u8)) !void {
     for (input) |c| {
@@ -26,6 +27,30 @@ pub const ThinkingConfig = struct {
     render_inline: bool = true,
 };
 
+fn unescapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+        var result = std.ArrayList(u8).empty;
+        errdefer result.deinit(allocator);
+        var i: usize = 0;
+        while (i < input.len) : (i += 1) {
+            if (input[i] == '\\' and i + 1 < input.len) {
+                i += 1;
+                switch (input[i]) {
+                    '"' => try result.append(allocator, '"'),
+                    '\\' => try result.append(allocator, '\\'),
+                    'n' => try result.append(allocator, '\n'),
+                    'r' => try result.append(allocator, '\r'),
+                    't' => try result.append(allocator, '\t'),
+                    else => {
+                        try result.append(allocator, '\\');
+                        try result.append(allocator, input[i]);
+                    },
+                }
+            } else {
+                try result.append(allocator, input[i]);
+            }
+        }
+        return result.toOwnedSlice(allocator);
+    }
 pub const DeepSeekStreamClient = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -76,7 +101,7 @@ pub const DeepSeekStreamClient = struct {
         // "https://api.deepseek.com/chat/completions"). Use its path as-is.
         const uri = std.Uri.parse(self.endpoint) catch return error.InvalidUri;
 
-        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort);
+        const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, false);
         defer self.allocator.free(body);
 
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
@@ -126,13 +151,16 @@ pub const DeepSeekStreamClient = struct {
         cache_decision: anytype,
         system_prompt: []const u8,
         reasoning_effort: ?[]const u8,
+        stream: bool,
     ) ![]u8 {
         var body = try std.ArrayList(u8).initCapacity(self.allocator, 2048);
         errdefer body.deinit(self.allocator);
 
         try body.appendSlice(self.allocator, "{\"model\":\"");
         try body.appendSlice(self.allocator, model);
-        try body.appendSlice(self.allocator, "\",\"stream\":false,\"messages\":[");
+        try body.appendSlice(self.allocator, "\",\"stream\":");
+        try body.appendSlice(self.allocator, if (stream) "true" else "false");
+        try body.appendSlice(self.allocator, ",\"messages\":[");
 
         if (system_prompt.len > 0) {
             const cache_tag = switch (cache_decision) {
@@ -354,30 +382,7 @@ pub const StreamIterator = struct {
         }
     }
 
-    fn unescapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
-        var result = std.ArrayList(u8).empty;
-        errdefer result.deinit(allocator);
-        var i: usize = 0;
-        while (i < input.len) : (i += 1) {
-            if (input[i] == '\\' and i + 1 < input.len) {
-                i += 1;
-                switch (input[i]) {
-                    '"' => try result.append(allocator, '"'),
-                    '\\' => try result.append(allocator, '\\'),
-                    'n' => try result.append(allocator, '\n'),
-                    'r' => try result.append(allocator, '\r'),
-                    't' => try result.append(allocator, '\t'),
-                    else => {
-                        try result.append(allocator, '\\');
-                        try result.append(allocator, input[i]);
-                    },
-                }
-            } else {
-                try result.append(allocator, input[i]);
-            }
-        }
-        return result.toOwnedSlice(allocator);
-    }
+
 
     fn extractContentAndReasoning(self: *StreamIterator, json_data: []const u8) !struct { content: []const u8, reasoning: []const u8 } {
         var content_result: []const u8 = "";
@@ -923,3 +928,175 @@ test "detect tool_calls in delta" {
     try std.testing.expect(iter.has_tool_calls);
 }
 
+// ── h2-over-TLS streaming (H2Client + SSE line parsing) ───────────────
+
+pub const ChunkKind = enum { content, reasoning };
+
+pub const ChunkSink = struct {
+    ctx: *anyopaque,
+    on_chunk: *const fn (ctx: *anyopaque, kind: ChunkKind, data: []const u8) void,
+};
+
+fn findMatchingBracePlain(json_data: []const u8, start: usize) !?usize {
+    if (start >= json_data.len or json_data[start] != '{') return null;
+    var count: i32 = 1;
+    var i = start + 1;
+    while (i < json_data.len and count > 0) : (i += 1) {
+        switch (json_data[i]) {
+            '{' => count += 1,
+            '}' => count -= 1,
+            '"' => {
+                i += 1;
+                while (i < json_data.len and json_data[i] != '"') : (i += 1) {
+                    if (json_data[i] == '\\') i += 1;
+                }
+            },
+            else => {},
+        }
+    }
+    if (count == 0) return i;
+    return null;
+}
+
+/// Module-level delta extraction (content/reasoning only; tool_calls handled
+/// separately by the buffered StreamIterator path).
+pub fn extractContentAndReasoningPlain(allocator: std.mem.Allocator, json_data: []const u8) !struct { content: []const u8, reasoning: []const u8 } {
+    var content_result: []const u8 = "";
+    var reasoning_result: []const u8 = "";
+    var i: usize = 0;
+    while (i < json_data.len) : (i += 1) {
+        if (i + 7 <= json_data.len and std.mem.eql(u8, json_data[i..i+7], "\"delta\"")) {
+            i += 7;
+            while (i < json_data.len and json_data[i] != '{') : (i += 1) {}
+            if (i < json_data.len) {
+                const brace_count = try findMatchingBracePlain(json_data, i);
+                if (brace_count) |end| {
+                    const delta_json = json_data[i..end];
+                            var ci: usize = 0;
+                    while (ci < delta_json.len) : (ci += 1) {
+                        if (ci + 10 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+10], "\"content\":")) {
+                            ci += 10;
+                            while (ci < delta_json.len and delta_json[ci] == ' ') : (ci += 1) {}
+                            if (ci < delta_json.len and delta_json[ci] == '"') {
+                                ci += 1;
+                                const value_start = ci;
+                                while (ci < delta_json.len and delta_json[ci] != '"') : (ci += 1) {
+                                    if (delta_json[ci] == '\\' and ci + 1 < delta_json.len) ci += 1;
+                                }
+                                content_result = try unescapeJsonString(allocator, delta_json[value_start..ci]);
+                            }
+                        }
+                        if (ci + 20 <= delta_json.len and std.mem.eql(u8, delta_json[ci..ci+20], "\"reasoning_content\":")) {
+                            ci += 20;
+                            while (ci < delta_json.len and delta_json[ci] == ' ') : (ci += 1) {}
+                            if (ci < delta_json.len and delta_json[ci] == '"') {
+                                ci += 1;
+                                const value_start = ci;
+                                while (ci < delta_json.len and delta_json[ci] != '"') : (ci += 1) {
+                                    if (delta_json[ci] == '\\' and ci + 1 < delta_json.len) ci += 1;
+                                }
+                                reasoning_result = try unescapeJsonString(allocator, delta_json[value_start..ci]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return .{ .content = content_result, .reasoning = reasoning_result };
+}
+
+const H2SseCtx = struct {
+    alloc: std.mem.Allocator,
+    buf: [16384]u8,
+    buf_len: usize,
+    done: bool,
+    sink: ChunkSink,
+
+    fn onData(ctx_ptr: *anyopaque, data: []const u8) void {
+        const c: *H2SseCtx = @ptrCast(@alignCast(ctx_ptr));
+        // Append, compacting when full.
+        if (c.buf_len + data.len > c.buf.len) {
+            // Drop already-consumed prefix if any (should not normally happen).
+            if (c.buf_len > 0) {
+                const kept = c.buf[0..c.buf_len];
+                c.buf_len = 0;
+                _ = kept;
+            }
+            return;
+        }
+        @memcpy(c.buf[c.buf_len..][0..data.len], data);
+        c.buf_len += data.len;
+
+        var consumed: usize = 0;
+        while (!c.done) {
+            const nl = std.mem.indexOfScalar(u8, c.buf[consumed..c.buf_len], '\n') orelse break;
+            const line_end = consumed + nl + 1; // inclusive of '\n'
+            const line = c.buf[consumed..line_end];
+            consumed = line_end;
+            const trimmed = std.mem.trim(u8, line, "\r\n");
+            if (trimmed.len == 0 or trimmed[0] == ':' or
+                !std.mem.startsWith(u8, trimmed, "data:"))
+            {
+                continue;
+            }
+            const data_value = std.mem.trim(u8, trimmed[5..], " ");
+            if (data_value.len == 0) continue;
+            if (std.mem.eql(u8, data_value, "[DONE]")) {
+                c.done = true;
+                break;
+            }
+            const extracted = extractContentAndReasoningPlain(c.alloc, data_value) catch continue;
+            defer {
+                if (extracted.content.len > 0) c.alloc.free(extracted.content);
+                if (extracted.reasoning.len > 0) c.alloc.free(extracted.reasoning);
+            }
+            if (extracted.reasoning.len > 0) c.sink.on_chunk(c.sink.ctx, .reasoning, extracted.reasoning);
+            if (extracted.content.len > 0) c.sink.on_chunk(c.sink.ctx, .content, extracted.content);
+        }
+        // Compact consumed bytes.
+        if (consumed > 0) {
+            const remaining = c.buf_len - consumed;
+            std.mem.copyForwards(u8, c.buf[0..remaining], c.buf[consumed..c.buf_len]);
+            c.buf_len = remaining;
+        }
+    }
+};
+
+/// Synchronous h2-over-TLS streaming request: the caller provides an
+/// on_chunk sink; each extracted delta (content/reasoning) is delivered as it
+/// arrives. Blocks until the stream completes or fails.
+pub fn streamMessageH2(
+    self: *DeepSeekStreamClient,
+    api_key: []const u8,
+    prompt: []const u8,
+    context: []const CtxItem,
+    model: []const u8,
+    cache_decision: anytype,
+    system_prompt: []const u8,
+    reasoning_effort: ?[]const u8,
+    sink: ChunkSink,
+) !void {
+    const uri = std.Uri.parse(self.endpoint) catch return error.InvalidUri;
+    const body = try self.buildRequestBody(prompt, context, model, cache_decision, system_prompt, reasoning_effort, true);
+    defer self.allocator.free(body);
+    const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
+    defer self.allocator.free(auth_value);
+    const host = uri.host.?.percent_encoded;
+    const port: u16 = uri.port orelse 443;
+    const path = uri.path.percent_encoded;
+
+    const headers = [_]struct { []const u8, []const u8 }{
+        .{ "authorization", auth_value },
+        .{ "content-type", "application/json" },
+        .{ "accept", "text/event-stream" },
+    };
+
+    var ctx = H2SseCtx{ .alloc = self.allocator, .buf = undefined, .buf_len = 0, .done = false, .sink = sink };
+    var h2sink = h2_client.StreamSink{ .ctx = &ctx, .on_data = H2SseCtx.onData };
+
+    var h2c = h2_client.H2Client.init(self.allocator, self.io);
+    var resp = try h2c.request(host, port, path, &headers, body, &h2sink);
+    defer resp.deinit();
+    if (resp.status < 200 or resp.status >= 300) return error.HttpError;
+}

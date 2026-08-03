@@ -102,3 +102,37 @@ pub fn executeCommit(alloc: std.mem.Allocator, sandbox: ?*Sandbox, cwd: []const 
 
     return runGitCommand(alloc, resolved, &.{ "commit", "-m", message });
 }
+
+test "git status reports untracked files in a temp repository" {
+    const alloc = std.testing.allocator;
+
+    var rnd: [8]u8 = undefined;
+    std.crypto.random.bytes(&rnd);
+    const dir_name = try std.fmt.allocPrint(alloc, "/tmp/zz-git-{s}", .{std.fmt.fmtSliceHexLower(&rnd)});
+    defer alloc.free(dir_name);
+    defer {
+        _ = process_mod.runArgv(alloc, "/tmp", &.{ "rm", "-rf", dir_name }) catch {};
+    }
+
+    const dir_z = try alloc.dupeSentinel(u8, dir_name, 0);
+    defer alloc.free(dir_z);
+    if (std.c.mkdir(dir_z.ptr, 0o755) != 0) return error.SkipZigTest;
+
+    const init_res = process_mod.runArgv(alloc, dir_name, &.{ "git", "init", "-q" }) catch return error.SkipZigTest;
+    defer alloc.free(init_res.output);
+    if (!init_res.success) return error.SkipZigTest;
+
+    const file_path = try std.fmt.allocPrint(alloc, "{s}/tracked.txt", .{dir_name});
+    defer alloc.free(file_path);
+    const file_z = try alloc.dupeSentinel(u8, file_path, 0);
+    defer alloc.free(file_z);
+    const fd = std.c.open(file_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    if (fd < 0) return error.SkipZigTest;
+    _ = std.c.write(fd, "hello", 5);
+    _ = std.c.close(fd);
+
+    const st = try executeStatus(alloc, null, dir_name, .{ .index = 0, .name = "git_status", .arguments = "{}" });
+    defer alloc.free(st.output);
+    try std.testing.expect(st.success);
+    try std.testing.expect(std.mem.indexOf(u8, st.output, "tracked.txt") != null);
+}

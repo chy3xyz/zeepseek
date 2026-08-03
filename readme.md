@@ -82,8 +82,7 @@ Session data is stored in `~/.zeepseek/sessions/`.
 ```
 src/
 ├── ui/          — ZigZag TUI (Elm Architecture)
-│   ├── app.zig  — Main model, update, view
-│   ├── layout.zig / chat_panel.zig / input_area.zig / ...
+│   ├── app.zig  — Main model, update, view (ZigZag-native, self-rendering)
 ├── cache/       — Reasonix semantic caching
 ├── dispatch/    — Cache-first agent loop, context manager
 ├── net/         — HTTP client, SSE parser, rate limiter, circuit breaker

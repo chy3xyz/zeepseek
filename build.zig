@@ -49,9 +49,7 @@ pub fn build(b: *std.Build) void {
 
     const zz_run = b.addRunArtifact(zz_exe);
     zz_run.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        zz_run.addArgs(args);
-    }
+    zz_run.addPassthruArgs();
     const zz_step = b.step("run", "Run zeepseek TUI");
     zz_step.dependOn(&zz_run.step);
 

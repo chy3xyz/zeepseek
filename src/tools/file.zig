@@ -9,18 +9,18 @@ const process_mod = @import("process.zig");
 
 const c = @import("c");
 
+/// Resolve a path against cwd (or $HOME for ~/). Uses std.fs.path.resolve,
+/// which normalizes "." and ".." so sandbox prefix checks cannot be bypassed
+/// with traversal components (e.g. cwd/../etc/...).
 fn resolvePath(alloc: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]const u8 {
-    if (std.mem.startsWith(u8, path, "/")) {
-        return alloc.dupe(u8, path);
-    }
     if (std.mem.startsWith(u8, path, "~/")) {
         const home_ptr = std.c.getenv("HOME") orelse {
             return alloc.dupe(u8, path);
         };
         const home = std.mem.sliceTo(home_ptr, 0);
-        return std.fs.path.join(alloc, &.{ home, path[2..] });
+        return std.fs.path.resolve(alloc, &.{ home, path[2..] });
     }
-    return std.fs.path.join(alloc, &.{ cwd, path });
+    return std.fs.path.resolve(alloc, &.{ cwd, path });
 }
 
 fn readFileC(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
@@ -314,4 +314,23 @@ test "file_write basic" {
     const content = try readFileC(alloc, tmp_path);
     defer alloc.free(content);
     try std.testing.expectEqualSlices(u8, "test content", content);
+}
+
+test "resolvePath normalizes traversal so sandbox prefix checks work (M3)" {
+    const alloc = std.testing.allocator;
+    const resolved = try resolvePath(alloc, "/home/user/proj", "../../etc/passwd");
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, "/etc/passwd", resolved);
+
+    // After normalization the prefix check actually rejects system files.
+    const sb = try Sandbox.init(.none, &.{});
+    defer sb.deinit();
+    try std.testing.expect(!sb.allowFileWrite(resolved));
+}
+
+test "resolvePath keeps normal relative paths" {
+    const alloc = std.testing.allocator;
+    const resolved = try resolvePath(alloc, "/home/user/proj", "src/main.zig");
+    defer alloc.free(resolved);
+    try std.testing.expectEqualSlices(u8, "/home/user/proj/src/main.zig", resolved);
 }

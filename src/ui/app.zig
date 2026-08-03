@@ -2607,6 +2607,11 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         appendFmt(buf, a, "{s}|{s}  F1/?     This help                  {s}|{s}\n", .{ bo, R, bo, R });
         appendFmt(buf, a, "{s}|{s}  Esc      Close any overlay           {s}|{s}\n", .{ bo, R, bo, R });
         appendFmt(buf, a, "{s}----------------------------------------{s}\n", .{ bo, R });
+        appendFmt(buf, a, "{s}xx Commands ------------------------------x{s}\n", .{ bo, R });
+        for (&CMDS) |cmd| {
+            appendFmt(buf, a, "{s}|{s}  {s}{s}{s}  {s}{s}{s}\n", .{ bo, R, Pal.gold, cmd.label, R, Pal.fg_dim, cmd.desc, R });
+        }
+        appendFmt(buf, a, "{s}----------------------------------------{s}\n", .{ bo, R });
     }
 
     // --- Overlay: Command Palette 

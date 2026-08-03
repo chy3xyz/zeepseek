@@ -10,11 +10,12 @@ Zeepseek is a TUI (terminal UI) application that lets you chat with DeepSeek's l
 - **Markdown rendering** — Headings, code blocks, lists, inline formatting in terminal
 - **Command palette** — Ctrl+P for quick commands (`/model`, `/apikey`, `/clear`, etc.)
 - **Thinking display** — Collapsible reasoning content from DeepSeek models
-- **Tool call support** — Execute shell/file operations from within the conversation
-- **Session management** — Save/load conversation sessions
-- **Context compaction** — `/compact` to summarize older messages and reduce token usage
-- **Right sidebar** — Live metrics: model, turn, context %, cache hit rate
-- **Sub-agent panel** — Built-in multi-agent orchestration
+- **Tool call support** — Shell/file/git tools executed through a sandboxed
+  pipeline with **per-call user approval** (`Enter` allow / `Esc` deny)
+- **Session management** — Multi-session save/load (`/save <name>`, `/load <name>`, `/sessions`)
+- **Context compaction** — `/compact` summarizes older messages in the background via the LLM
+- **Right sidebar** — Live metrics: model, turn, estimated context %
+- **Sub-agent panel** — `/subagent <goal>` spawns a background research sub-agent
 - **Single static binary** — No runtime dependencies
 
 ## Requirements
@@ -61,12 +62,26 @@ export DEEPSEEK_API_KEY=sk-xxxxxxxxxxxxxxxx
 |---------|-------------|
 | `/model <name>` | Switch model (e.g. `/model deepseek-chat`) |
 | `/apikey <key>` | Set API key |
-| `/clear` | Clear conversation |
-| `/compact` | Compact old messages to save tokens |
-| `/save` | Save current session |
-| `/load` | Load saved session |
-| `/status` | Show context usage |
-| `/new` | Start fresh session |
+| `/save [name]` | Save current session (defaults to current name) |
+| `/load <name>` | Load a saved session |
+| `/sessions` | List saved sessions |
+| `/compact` | LLM-summarize older messages in the background |
+| `/subagent <goal>` | Start a background research sub-agent |
+| `/subagents` | Toggle the sub-agent panel |
+| `/clear` / `/new` | Clear conversation / start fresh |
+| `/think` | Toggle reasoning visibility |
+| `/tools` | Toggle tool-call visibility |
+| `/models` | List available models |
+| `/status` / `/context` | Show model, provider, estimated context usage |
+| `/top` / `/bottom` | Scroll to top / bottom |
+| `/exit` | Quit |
+
+### Tool approval
+
+Shell commands, file writes/edits and git commits require confirmation:
+a preview line (`[Approve tool?] ...`) appears with `Enter` = allow, `Esc` = deny.
+Denied tools are reported back to the model. Sensitive paths (`.ssh`, `id_rsa`,
+`/etc/...`) and known-dangerous commands are blocked outright.
 
 ### Configuration
 

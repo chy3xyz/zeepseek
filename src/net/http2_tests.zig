@@ -15,7 +15,7 @@ test "content-length body" {
     defer threaded.deinit();
     var c = client(alloc, threaded.io(), 2000);
 
-    var resp = try c.open("127.0.0.1", PORT, "POST", "/echo", &.{}, "");
+    var resp = try c.open("http", "127.0.0.1", PORT, "POST", "/echo", &.{}, "");
     defer resp.deinit();
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     var buf: [256]u8 = undefined;
@@ -30,7 +30,7 @@ test "chunked body reassembled" {
     defer threaded.deinit();
     var c = client(alloc, threaded.io(), 2000);
 
-    var resp = try c.open("127.0.0.1", PORT, "POST", "/chunked", &.{}, "");
+    var resp = try c.open("http", "127.0.0.1", PORT, "POST", "/chunked", &.{}, "");
     defer resp.deinit();
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
@@ -51,7 +51,7 @@ test "read timeout returns error.Timeout" {
 
     // The server sleeps 6s before sending headers; with a 1s read timeout,
     // open() itself (which reads the status line) must time out.
-    var resp = c.open("127.0.0.1", PORT, "POST", "/slow", &.{}, "") catch |e| {
+    var resp = c.open("http", "127.0.0.1", PORT, "POST", "/slow", &.{}, "") catch |e| {
         try std.testing.expectEqual(http2.ResponseError.Timeout, e);
         return;
     };
@@ -59,4 +59,18 @@ test "read timeout returns error.Timeout" {
     var buf: [64]u8 = undefined;
     const err = resp.readBody(&buf) catch |e| e;
     try std.testing.expectEqual(http2.ResponseError.Timeout, err);
+}
+
+test "https via std.http branch works (network)" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{ .argv0 = .empty, .environ = .empty });
+    defer threaded.deinit();
+    var c = client(alloc, threaded.io(), 5000);
+
+    var resp = c.open("https", "example.com", 443, "GET", "/", &.{}, "") catch return error.SkipZigTest;
+    defer resp.deinit();
+    try std.testing.expect(resp.status >= 200 and resp.status < 400);
+    var buf: [512]u8 = undefined;
+    const n = try resp.readBody(&buf);
+    try std.testing.expect(n > 0);
 }

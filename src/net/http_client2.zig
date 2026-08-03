@@ -22,7 +22,7 @@ const libc = struct {
     extern "c" fn close(fd: i32) i32;
 };
 
-pub const Header = struct { name: []const u8, value: []const u8 };
+pub const Header = std.http.Header;
 
 pub const Config = struct {
     read_timeout_ms: u64 = 30_000,
@@ -44,20 +44,44 @@ fn setReadTimeout(fd: posix.fd_t, timeout_ms: u64) void {
 }
 
 /// Streaming HTTP response. Single-use connection; close with deinit().
+///
+/// Two modes, matching the zigmodu approach: plain HTTP uses a raw socket
+/// with read timeouts; HTTPS is delegated to std.http.Client (TLS + CA
+/// verification are internal to std and not externally reproducible).
 pub const StreamingResponse = struct {
+    const Mode = enum { raw, std_http };
+
     allocator: std.mem.Allocator,
-    fd: posix.fd_t,
-    status: u16,
-    content_length: ?u64,
+    mode: Mode = .raw,
+    status: u16 = 0,
+    // raw mode
+    fd: posix.fd_t = -1,
+    content_length: ?u64 = null,
     content_remaining: u64 = 0,
-    chunked: bool,
+    chunked: bool = false,
     chunk_remaining: u64 = 0,
-    /// Raw read buffer with cursor (raw_start..raw_end)
-    raw: []u8,
+    raw: []u8 = &.{},
     raw_start: usize = 0,
     raw_end: usize = 0,
+    // std_http mode
+    https_client: ?*std.http.Client = null,
+    https_req: ?*std.http.Client.Request = null,
+    https_reader: ?*std.Io.Reader = null,
+    https_transfer: ?[]u8 = null,
 
     pub fn readBody(self: *StreamingResponse, buf: []u8) ResponseError!usize {
+        switch (self.mode) {
+            .raw => return self.readBodyRaw(buf),
+            .std_http => {
+                const n = self.https_reader.?.readSliceShort(buf) catch |e| switch (e) {
+                    error.ReadFailed => return 0,
+                };
+                return n;
+            },
+        }
+    }
+
+    fn readBodyRaw(self: *StreamingResponse, buf: []u8) ResponseError!usize {
         if (self.chunked) {
             while (self.chunk_remaining == 0) {
                 var line = std.ArrayList(u8).empty;
@@ -157,8 +181,23 @@ pub const StreamingResponse = struct {
     }
 
     pub fn deinit(self: *StreamingResponse) void {
-        _ = libc.close(@intCast(self.fd));
-        self.allocator.free(self.raw);
+        switch (self.mode) {
+            .raw => {
+                _ = libc.close(@intCast(self.fd));
+                self.allocator.free(self.raw);
+            },
+            .std_http => {
+                if (self.https_transfer) |t| self.allocator.free(t);
+                if (self.https_req) |req| {
+                    req.deinit();
+                    self.allocator.destroy(req);
+                }
+                if (self.https_client) |c| {
+                    c.deinit();
+                    self.allocator.destroy(c);
+                }
+            },
+        }
     }
 };
 
@@ -180,7 +219,76 @@ pub const HttpClient = struct {
         }
     }
 
+    /// HTTPS via std.http.Client (TLS + CA verification handled by std).
+    pub fn openHttps(
+        self: *HttpClient,
+        host: []const u8,
+        port: u16,
+        method: []const u8,
+        path: []const u8,
+        headers: []const Header,
+        body: []const u8,
+    ) ResponseError!StreamingResponse {
+        const client = self.allocator.create(std.http.Client) catch return error.OutOfMemory;
+        client.* = std.http.Client{ .allocator = self.allocator, .io = self.io };
+        errdefer {
+            client.deinit();
+            self.allocator.destroy(client);
+        }
+
+        var url_buf: [2048]u8 = undefined;
+        const url = std.fmt.bufPrint(&url_buf, "https://{s}:{d}{s}", .{ host, port, path }) catch return error.OutOfMemory;
+        const uri = std.Uri.parse(url) catch return error.InvalidResponse;
+
+        const req = self.allocator.create(std.http.Client.Request) catch return error.OutOfMemory;
+        const http_method: std.http.Method = if (std.ascii.eqlIgnoreCase(method, "GET")) .GET else .POST;
+        req.* = client.request(http_method, uri, .{ .extra_headers = headers, .keep_alive = false }) catch return error.ConnectionFailed;
+        errdefer {
+            req.deinit();
+            self.allocator.destroy(req);
+        }
+        if (body.len > 0) {
+            const body_owned = self.allocator.dupe(u8, body) catch return error.OutOfMemory;
+            defer self.allocator.free(body_owned);
+            req.sendBodyComplete(body_owned) catch return error.ConnectionFailed;
+        }
+
+        var response = req.receiveHead(undefined) catch return error.ConnectionFailed;
+        const status: u16 = @intFromEnum(response.head.status);
+
+        const transfer = self.allocator.alloc(u8, 8192) catch return error.OutOfMemory;
+        errdefer self.allocator.free(transfer);
+        const reader = response.reader(transfer);
+
+        return StreamingResponse{
+            .allocator = self.allocator,
+            .mode = .std_http,
+            .status = status,
+            .https_client = client,
+            .https_req = req,
+            .https_reader = reader,
+            .https_transfer = transfer,
+        };
+    }
+
+    /// Unified entry: scheme "https" -> std.http, else raw socket with timeouts.
     pub fn open(
+        self: *HttpClient,
+        scheme: []const u8,
+        host: []const u8,
+        port: u16,
+        method: []const u8,
+        path: []const u8,
+        headers: []const Header,
+        body: []const u8,
+    ) ResponseError!StreamingResponse {
+        if (std.ascii.eqlIgnoreCase(scheme, "https")) {
+            return self.openHttps(host, port, method, path, headers, body);
+        }
+        return self.openRaw(host, port, method, path, headers, body);
+    }
+
+    fn openRaw(
         self: *HttpClient,
         host: []const u8,
         port: u16,

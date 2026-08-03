@@ -4,6 +4,7 @@ const http = std.http;
 const RateLimiter = @import("http_client.zig").RateLimiter;
 const CircuitBreaker = @import("http_client.zig").CircuitBreaker;
 const CacheConfig = @import("http_client.zig").CacheConfig;
+const http2 = @import("http_client2.zig");
 
 fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8, output: *std.ArrayList(u8)) !void {
     for (input) |c| {
@@ -30,7 +31,6 @@ pub const DeepSeekStreamClient = struct {
     io: std.Io,
     rate_limiter: ?*RateLimiter = null,
     circuit_breaker: ?*CircuitBreaker = null,
-    http_client: http.Client,
     endpoint: []const u8 = "https://api.deepseek.com/chat/completions",
 
     pub fn init(
@@ -44,13 +44,10 @@ pub const DeepSeekStreamClient = struct {
             .io = io,
             .rate_limiter = rate_limiter,
             .circuit_breaker = circuit_breaker,
-            .http_client = http.Client{ .allocator = allocator, .io = io },
         };
     }
 
-    pub fn deinit(self: *DeepSeekStreamClient) void {
-        self.http_client.deinit();
-    }
+    pub fn deinit(_: *DeepSeekStreamClient) void {}
 
     pub const StreamEvent = struct {
         content: []const u8,
@@ -87,23 +84,23 @@ pub const DeepSeekStreamClient = struct {
         const auth_value = try std.fmt.allocPrint(self.allocator, "Bearer {s}", .{api_key});
         defer self.allocator.free(auth_value);
 
-        const headers = [_]http.Header{
+        const headers = [_]http2.Header{
             .{ .name = "Authorization", .value = auth_value },
             .{ .name = "Content-Type", .value = "application/json" },
             .{ .name = "Accept", .value = "text/event-stream" },
         };
 
-        var request = try self.http_client.request(.POST, uri, .{
-            .extra_headers = &headers,
-        });
+        // Unified client: HTTPS -> std.http (TLS), plain HTTP -> raw socket
+        // with read timeout (L3). Matches the zigmodu approach.
+        const scheme = uri.scheme;
+        const host = uri.host.?.percent_encoded;
+        const port: u16 = uri.port orelse if (std.mem.eql(u8, scheme, "https")) 443 else 80;
 
-        try request.sendBodyComplete(body);
-        errdefer request.deinit();
-
-        var response = try request.receiveHead(undefined);
-
-        const status = @intFromEnum(response.head.status);
-        if (status < 200 or status >= 300) {
+        var h2 = http2.HttpClient.init(self.allocator, self.io);
+        h2.config = .{ .read_timeout_ms = 60_000 };
+        var resp = h2.open(scheme, host, port, "POST", uri.path.percent_encoded, &headers, body) catch return error.HttpError;
+        errdefer resp.deinit();
+        if (resp.status < 200 or resp.status >= 300) {
             if (self.circuit_breaker) |cb| {
                 cb.recordFailure();
             }
@@ -114,15 +111,11 @@ pub const DeepSeekStreamClient = struct {
             cb.recordSuccess();
         }
 
-        const transfer_buffer = try self.allocator.alloc(u8, 8192);
-        const body_reader = response.reader(transfer_buffer);
-
         return StreamIterator{
             .allocator = self.allocator,
-            .reader = body_reader,
+            .resp = resp,
             .buffer = try std.ArrayList(u8).initCapacity(self.allocator, 4096),
             .line_accumulator = try std.ArrayList(u8).initCapacity(self.allocator, 4096),
-            .transfer_buffer = transfer_buffer,
             .tool_call_json = .empty,
         };
     }
@@ -214,10 +207,9 @@ pub const StreamChunk = union(enum) {
 
 pub const StreamIterator = struct {
     allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
+    resp: http2.StreamingResponse,
     buffer: std.ArrayList(u8),
     line_accumulator: std.ArrayList(u8),
-    transfer_buffer: []u8,
     done: bool = false,
     content_buffer: []const u8 = &.{},
     reasoning_buffer: []const u8 = &.{},
@@ -239,13 +231,7 @@ pub const StreamIterator = struct {
 
         while (true) {
             var read_buf: [4096]u8 = undefined;
-            const n = self.reader.readSliceShort(&read_buf) catch |err| {
-                if (err == error.EndOfStream) {
-                    self.done = true;
-                    return null;
-                }
-                return err;
-            };
+            const n = self.resp.readBody(&read_buf) catch |err| return err;
             if (n == 0) {
                 self.done = true;
                 return null;
@@ -394,7 +380,7 @@ pub const StreamIterator = struct {
     pub fn deinit(self: *StreamIterator) void {
         if (self.content_buffer.len > 0) self.allocator.free(self.content_buffer);
         if (self.reasoning_buffer.len > 0) self.allocator.free(self.reasoning_buffer);
-        self.allocator.free(self.transfer_buffer);
+        self.resp.deinit();
         self.buffer.deinit(self.allocator);
         self.line_accumulator.deinit(self.allocator);
         self.tool_call_json.deinit(self.allocator);
@@ -786,217 +772,3 @@ test "tool call repair pipeline repair and parse" {
     try std.testing.expectEqualSlices(u8, "bash", result.?.name);
 }
 
-pub const StreamIteratorOld = struct {
-    allocator: std.mem.Allocator,
-    reader: *std.Io.Reader,
-    buffer: std.ArrayList(u8),
-    transfer_buffer: []u8,
-    done: bool = false,
-    content_buffer: []const u8 = &.{},
-
-    pub fn nextChunk(self: *StreamIterator) !?[]const u8 {
-        if (self.done and self.content_buffer.len == 0) return null;
-        if (self.content_buffer.len > 0) {
-            const chunk = self.content_buffer;
-            self.content_buffer = &.{};
-            return chunk;
-        }
-
-        var line_buf: [8192]u8 = undefined;
-        var line_len: usize = 0;
-
-        while (true) {
-            const n = self.reader.readSliceShort(line_buf[line_len..]) catch |err| {
-                if (err == error.EndOfStream) {
-                    self.done = true;
-                    return null;
-                }
-                return err;
-            };
-            if (n == 0) {
-                self.done = true;
-                return null;
-            }
-            line_len += n;
-
-            if (line_buf[line_len - 1] == '\n') break;
-
-            if (line_len >= line_buf.len) break;
-        }
-
-        const line = line_buf[0..line_len];
-        const trimmed = std.mem.trim(u8, line, "\r\n");
-        if (trimmed.len == 0) return null;
-
-        if (trimmed[0] == ':') return null;
-
-        if (!std.mem.startsWith(u8, trimmed, "data:")) return null;
-        const data_value = std.mem.trim(u8, trimmed[5..], " ");
-        if (data_value.len == 0) return null;
-        if (std.mem.eql(u8, data_value, "[DONE]")) {
-            self.done = true;
-            return null;
-        }
-
-        const content = try self.extractContent(data_value);
-        if (content.len > 0) {
-            self.content_buffer = content;
-            return self.nextChunk();
-        }
-        return null;
-    }
-
-    fn extractContent(self: *StreamIterator, json_data: []const u8) ![]const u8 {
-        var start_idx: ?usize = null;
-        var end_idx: ?usize = null;
-
-        var i: usize = 0;
-        while (i < json_data.len) : (i += 1) {
-            if (i + 7 <= json_data.len and std.mem.eql(u8, json_data[i..i+7], "\"delta\"")) {
-                i += 7;
-                while (i < json_data.len and json_data[i] != '{') : (i += 1) {}
-                if (i < json_data.len) {
-                    const brace_count = try self.findMatchingBrace(json_data, i);
-                    if (brace_count) |end| {
-                        const delta_json = json_data[i..end];
-                        start_idx = std.mem.indexOf(u8, delta_json, "\"content\":");
-                        if (start_idx) |_| {
-                            const content_start = i + 9 + start_idx.?;
-                            var j = content_start;
-                            while (j < delta_json.len and (delta_json[j] == ' ' or delta_json[j] == '"')) : (j += 1) {}
-                            const value_start = j;
-                            if (j < delta_json.len and delta_json[j] == '"') {
-                                j += 1;
-                                while (j < delta_json.len and delta_json[j] != '"') : (j += 1) {}
-                                end_idx = j;
-                                return self.allocator.dupe(u8, delta_json[value_start..j]);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        return "";
-    }
-
-    fn findMatchingBrace(self: *StreamIterator, json_data: []const u8, start: usize) !?usize {
-        _ = self;
-        if (start >= json_data.len or json_data[start] != '{') return null;
-        var count: i32 = 1;
-        var i = start + 1;
-        while (i < json_data.len and count > 0) : (i += 1) {
-            switch (json_data[i]) {
-                '{' => count += 1,
-                '}' => count -= 1,
-                '"' => {
-                    i += 1;
-                    while (i < json_data.len and json_data[i] != '"') : (i += 1) {
-                        if (json_data[i] == '\\') i += 1;
-                    }
-                },
-                else => {},
-            }
-        }
-        if (count == 0) return i;
-        return null;
-    }
-
-    pub fn deinit(self: *StreamIterator) void {
-        self.allocator.free(self.transfer_buffer);
-        self.buffer.deinit(self.allocator);
-    }
-};
-// ── SSE delta parsing tests ──────────────────────────────────────────────
-
-fn makeTestIterator(alloc: std.mem.Allocator) StreamIterator {
-    return .{
-        .allocator = alloc,
-        .reader = undefined,
-        .buffer = .empty,
-        .line_accumulator = .empty,
-        .transfer_buffer = undefined,
-        .done = false,
-        .tool_call_json = .empty,
-    };
-}
-
-fn deinitTestIterator(iter: *StreamIterator, alloc: std.mem.Allocator) void {
-    iter.line_accumulator.deinit(alloc);
-    iter.buffer.deinit(alloc);
-    iter.tool_call_json.deinit(alloc);
-}
-
-test "extract plain content from delta" {
-    const alloc = std.testing.allocator;
-    var iter = makeTestIterator(alloc);
-    defer deinitTestIterator(&iter, alloc);
-
-    const json = "{\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}";
-    const result = try iter.extractContentAndReasoning(json);
-    defer if (result.content.len > 0) alloc.free(result.content);
-    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
-    try std.testing.expectEqualSlices(u8, "Hello", result.content);
-    try std.testing.expectEqual(@as(usize, 0), result.reasoning.len);
-}
-
-test "extract reasoning from delta" {
-    const alloc = std.testing.allocator;
-    var iter = makeTestIterator(alloc);
-    defer deinitTestIterator(&iter, alloc);
-
-    const json = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking hard\"}}]}";
-    const result = try iter.extractContentAndReasoning(json);
-    defer if (result.content.len > 0) alloc.free(result.content);
-    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
-    try std.testing.expectEqualSlices(u8, "thinking hard", result.reasoning);
-    try std.testing.expectEqual(@as(usize, 0), result.content.len);
-}
-
-test "extract content and reasoning together" {
-    const alloc = std.testing.allocator;
-    var iter = makeTestIterator(alloc);
-    defer deinitTestIterator(&iter, alloc);
-
-    const json = "{\"choices\":[{\"delta\":{\"reasoning_content\":\"r\",\"content\":\"c\"}}]}";
-    const result = try iter.extractContentAndReasoning(json);
-    defer if (result.content.len > 0) alloc.free(result.content);
-    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
-    try std.testing.expectEqualSlices(u8, "c", result.content);
-    try std.testing.expectEqualSlices(u8, "r", result.reasoning);
-}
-
-test "unescape content with escapes" {
-    const alloc = std.testing.allocator;
-    var iter = makeTestIterator(alloc);
-    defer deinitTestIterator(&iter, alloc);
-
-    const json = "{\"choices\":[{\"delta\":{\"content\":\"line1\\nline2\\t\\\"q\\\"\"}}]}";
-    const result = try iter.extractContentAndReasoning(json);
-    defer if (result.content.len > 0) alloc.free(result.content);
-    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
-    try std.testing.expectEqualSlices(u8, "line1\nline2\t\"q\"", result.content);
-}
-
-test "detect tool_calls and accumulate raw json" {
-    const alloc = std.testing.allocator;
-    var iter = makeTestIterator(alloc);
-    defer deinitTestIterator(&iter, alloc);
-
-    const json = "{\"choices\":[{\"delta\":{\"tool_calls\":[{\"function\":{\"name\":\"shell\"}}]}}]}";
-    const result = try iter.extractContentAndReasoning(json);
-    defer if (result.content.len > 0) alloc.free(result.content);
-    defer if (result.reasoning.len > 0) alloc.free(result.reasoning);
-    try std.testing.expect(iter.has_tool_calls);
-    try std.testing.expect(std.mem.indexOf(u8, iter.tool_call_json.items, "tool_calls") != null);
-}
-
-test "missing delta yields empty result" {
-    const alloc = std.testing.allocator;
-    var iter = makeTestIterator(alloc);
-    defer deinitTestIterator(&iter, alloc);
-
-    const json = "{\"choices\":[{\"delta\":{}}]}";
-    const result = try iter.extractContentAndReasoning(json);
-    try std.testing.expectEqual(@as(usize, 0), result.content.len);
-    try std.testing.expectEqual(@as(usize, 0), result.reasoning.len);
-}

@@ -26,6 +26,14 @@ pub fn build(b: *std.Build) void {
     zz_mod.addImport("c", c_mod);
     zz_mod.addImport("zigzag", zigzag_dep.module("zigzag"));
 
+    // Tool-safety guard module used by app.zig's tool execution path
+    const dangerous_patterns_mod = b.createModule(.{
+        .root_source_file = b.path("src/utils/dangerous_patterns.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zz_mod.addImport("dangerous_patterns", dangerous_patterns_mod);
+
     // Expose net modules for streaming integration
     const http_client_file = b.createModule(.{
         .root_source_file = b.path("src/net/http_client.zig"),

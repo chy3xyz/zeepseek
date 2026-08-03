@@ -14,8 +14,13 @@ const std = @import("std");
 const zz = @import("zigzag");
 const cc = @import("c");
 const stream_client_mod = @import("stream_client");
+const dangerous_patterns = @import("dangerous_patterns");
 
 const CacheDecision = enum { none, hit, miss };
+
+/// Hard cap on tool output / file read size (bytes) to prevent OOM from
+/// runaway commands (yes, cat /dev/zero) or oversized files.
+const MAX_TOOL_OUTPUT: usize = 64 * 1024;
 
 // ═══════════════════════════════════════════════════════════════════════
 // ANSI helpers — Zenburn Noir palette
@@ -465,6 +470,7 @@ pub const App = struct {
     stream_state: ?*StreamState,
     stream_thread: ?std.Thread,
     api_key: []const u8,
+    api_key_alloc: ?std.mem.Allocator = null,
     io: std.Io,
 
     // --- Session state 
@@ -556,9 +562,11 @@ pub const App = struct {
         if (n <= 0) return;
         const trimmed = std.mem.trim(u8, file_buf[0..@intCast(n)], &.{ ' ', '\n', '\r' });
         if (trimmed.len > 0) {
-            // Store in page allocator since persistent_allocator isn't available yet
+            // persistent_allocator isn't available during init; track the
+            // allocator so deinit (and setApiKey) can release the key.
             const duped = std.heap.page_allocator.dupe(u8, trimmed) catch return;
             self.api_key = duped;
+            self.api_key_alloc = std.heap.page_allocator;
         }
     }
 
@@ -857,12 +865,12 @@ pub const App = struct {
     }
 
     fn startStreaming(self: *App, user_input: []const u8) void {
-        // Clean up previous stream state
+        // Join the previous thread first: it may still be pushing into ss.
+        if (self.stream_thread) |t| t.join();
         if (self.stream_state) |ss| {
             ss.deinit();
             self.alloc.destroy(ss);
         }
-        if (self.stream_thread) |t| t.join();
 
         // Create new stream state
         const ss = self.alloc.create(StreamState) catch return;
@@ -878,7 +886,9 @@ pub const App = struct {
         }) catch return;
         self.streaming_idx = idx;
 
-        // Build context from recent messages
+        // Build context from recent messages. Content is duplicated so the
+        // background thread fully owns its data: the UI thread can run
+        // /clear /new /compact /model /apikey at any time without racing.
         var ctx_items = std.ArrayList(stream_client_mod.CtxItem).empty;
         defer ctx_items.deinit(self.alloc);
         const msg_count = self.messages.items.len - 1; // exclude the empty assistant msg
@@ -887,19 +897,43 @@ pub const App = struct {
             const role_str: []const u8 = switch (m.role) {
                 .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
             };
-            ctx_items.append(self.alloc, .{ .role = role_str, .content = m.content }) catch {};
+            const content = self.alloc.dupe(u8, m.content) catch continue;
+            ctx_items.append(self.alloc, .{ .role = role_str, .content = content }) catch {
+                self.alloc.free(content);
+            };
         }
 
-        // Capture values for the thread
-        const api_key = self.api_key;
-        const model = self.model;
+        // Duplicate inputs owned by the UI (prompt, api_key, model) — the
+        // thread frees its copies when it finishes.
+        const prompt_owned = self.alloc.dupe(u8, user_input) catch return;
+        const api_key_owned = self.alloc.dupe(u8, self.api_key) catch {
+            self.alloc.free(prompt_owned);
+            return;
+        };
+        const model_owned = self.alloc.dupe(u8, self.model) catch {
+            self.alloc.free(prompt_owned);
+            self.alloc.free(api_key_owned);
+            return;
+        };
+        const ctx_slice = ctx_items.toOwnedSlice(self.alloc) catch {
+            self.alloc.free(prompt_owned);
+            self.alloc.free(api_key_owned);
+            self.alloc.free(model_owned);
+            return;
+        };
         const alloc = self.alloc;
         const io = self.io;
-        const ctx_slice = ctx_items.toOwnedSlice(self.alloc) catch &.{};
 
         // Spawn streaming thread
         const thread = std.Thread.spawn(.{}, struct {
-            fn run(api_k: []const u8, prompt: []const u8, ctx: []const stream_client_mod.CtxItem, mdl: []const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
+            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, a: std.mem.Allocator, sio: std.Io, state: *StreamState) void {
+                defer {
+                    for (ctx) |ci| a.free(ci.content);
+                    a.free(ctx);
+                    a.free(prompt);
+                    a.free(api_k);
+                    a.free(mdl);
+                }
                 var client = stream_client_mod.DeepSeekStreamClient.init(a, sio, null, null);
                 defer client.deinit();
 
@@ -926,7 +960,13 @@ pub const App = struct {
                 }
                 state.setDone();
             }
-        }.run, .{ api_key, user_input, ctx_slice, model, alloc, io, ss }) catch {
+        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, alloc, io, ss }) catch {
+            // Thread failed to spawn: reclaim the data we duplicated for it
+            for (ctx_slice) |ci| alloc.free(ci.content);
+            alloc.free(ctx_slice);
+            alloc.free(prompt_owned);
+            alloc.free(api_key_owned);
+            alloc.free(model_owned);
             ss.setError("Failed to spawn thread");
             return;
         };
@@ -1013,6 +1053,9 @@ pub const App = struct {
 
             // Execute the tool
             const result = self.executeToolCall(call.name, call.arguments, cwd);
+            if (result.len > 0) {
+                defer self.alloc.free(result);
+            }
             const success = result.len > 0 and !std.mem.startsWith(u8, result, "Error:");
 
             // Notify UI about result
@@ -1040,6 +1083,13 @@ pub const App = struct {
         }
     }
 
+    /// Allocate an error/status string owned by the caller (freed by
+    /// handleToolCalls). Returns an empty slice on allocation failure —
+    /// callers must not free empty results.
+    fn toolErr(self: *App, comptime fmt: []const u8, args: anytype) []const u8 {
+        return std.fmt.allocPrint(self.alloc, fmt, args) catch "";
+    }
+
     fn executeToolCall(self: *App, name: []const u8, args: []const u8, cwd: []const u8) []const u8 {
         // Simple tool execution — shell, file_read, file_write
         if (std.mem.eql(u8, name, "shell")) {
@@ -1049,18 +1099,23 @@ pub const App = struct {
         } else if (std.mem.eql(u8, name, "file_write")) {
             return self.execFileWrite(args);
         }
-        return "Error: Unknown tool";
+        return self.toolErr("Error: Unknown tool", .{});
     }
 
     fn execShell(self: *App, args_json: []const u8, cwd: []const u8) []const u8 {
         // Extract "command" from JSON args
-        const cmd = self.extractJsonString(args_json, "command") orelse return "Error: no command";
+        const cmd = self.extractJsonString(args_json, "command") orelse return self.toolErr("Error: no command", .{});
+
+        // Safety gate: refuse known-dangerous commands (prompt-injection guard).
+        if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
+            return self.toolErr("Error: blocked dangerous command ({s})", .{p.description});
+        }
 
         // Execute via popen
         var cmd_buf: [4096]u8 = undefined;
-        const full_cmd = std.fmt.bufPrint(&cmd_buf, "cd {s} && {s} 2>&1", .{ cwd, cmd }) catch return "Error: cmd too long";
+        const full_cmd = std.fmt.bufPrint(&cmd_buf, "cd {s} && {s} 2>&1", .{ cwd, cmd }) catch return self.toolErr("Error: cmd too long", .{});
 
-        const result = cc.popen(full_cmd.ptr, "r") orelse return "Error: popen failed";
+        const result = cc.popen(full_cmd.ptr, "r") orelse return self.toolErr("Error: popen failed", .{});
         defer _ = cc.pclose(result);
 
         var output = std.ArrayList(u8).empty;
@@ -1069,20 +1124,24 @@ pub const App = struct {
         while (true) {
             const n = cc.fread(&read_buf, 1, read_buf.len, result);
             if (n == 0) break;
-            output.appendSlice(self.alloc, read_buf[0..n]) catch break;
+            if (output.items.len >= MAX_TOOL_OUTPUT) break; // cap output (yes, cat /dev/zero)
+            const room = MAX_TOOL_OUTPUT - output.items.len;
+            const take = @min(n, room);
+            output.appendSlice(self.alloc, read_buf[0..take]) catch break;
         }
 
-        if (output.items.len == 0) return "(no output)";
-        return self.alloc.dupe(u8, output.items) catch "(alloc error)";
+        if (output.items.len == 0) return self.alloc.dupe(u8, "(no output)") catch "";
+        return self.alloc.dupe(u8, output.items) catch "";
     }
 
     fn execFileRead(self: *App, args_json: []const u8) []const u8 {
-        const path = self.extractJsonString(args_json, "path") orelse return "Error: no path";
-        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return "Error: alloc";
+        const path = self.extractJsonString(args_json, "path") orelse return self.toolErr("Error: no path", .{});
+        if (isSensitivePath(path)) return self.toolErr("Error: reading this path is not allowed", .{});
+        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return self.toolErr("Error: alloc", .{});
         defer self.alloc.free(path_z);
 
         const fd = std.c.open(path_z.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) return "Error: file not found";
+        if (fd < 0) return self.toolErr("Error: file not found", .{});
         defer _ = std.c.close(fd);
 
         var data = std.ArrayList(u8).empty;
@@ -1091,29 +1150,57 @@ pub const App = struct {
         while (true) {
             const n = std.c.read(fd, &read_buf, read_buf.len);
             if (n <= 0) break;
-            data.appendSlice(self.alloc, read_buf[0..@intCast(n)]) catch break;
+            if (data.items.len >= MAX_TOOL_OUTPUT) break; // cap oversized files
+            const room = MAX_TOOL_OUTPUT - data.items.len;
+            const take = @min(@as(usize, @intCast(n)), room);
+            data.appendSlice(self.alloc, read_buf[0..take]) catch break;
         }
 
-        if (data.items.len == 0) return "(empty file)";
-        return self.alloc.dupe(u8, data.items) catch "(alloc error)";
+        if (data.items.len == 0) return self.alloc.dupe(u8, "(empty file)") catch "";
+        return self.alloc.dupe(u8, data.items) catch "";
     }
 
     fn execFileWrite(self: *App, args_json: []const u8) []const u8 {
-        const path = self.extractJsonString(args_json, "path") orelse return "Error: no path";
-        const content = self.extractJsonString(args_json, "content") orelse return "Error: no content";
-        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return "Error: alloc";
+        const path = self.extractJsonString(args_json, "path") orelse return self.toolErr("Error: no path", .{});
+        const content = self.extractJsonString(args_json, "content") orelse return self.toolErr("Error: no content", .{});
+        if (isSensitivePath(path)) return self.toolErr("Error: writing to this path is not allowed", .{});
+        const path_z = self.alloc.dupeSentinel(u8, path, 0) catch return self.toolErr("Error: alloc", .{});
         defer self.alloc.free(path_z);
 
         const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
         const fd = std.c.open(path_z.ptr, flags, @as(std.c.mode_t, 0o644));
-        if (fd < 0) return "Error: cannot create file";
+        if (fd < 0) return self.toolErr("Error: cannot create file", .{});
         defer _ = std.c.close(fd);
 
         _ = std.c.write(fd, content.ptr, content.len);
-        return "OK";
+        return self.alloc.dupe(u8, "OK") catch "";
     }
 
-    fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
+    /// Reject access to credentials, keys, and OS internals for file tools.
+/// Matches on path segments (not bare substrings) to avoid false positives
+/// like "my_project_system" or "id_rsa.pub" documentation files.
+fn isSensitivePath(path: []const u8) bool {
+    const sensitive_dirs = [_][]const u8{ ".ssh", ".aws", ".gnupg", ".kube", ".config" };
+    const sensitive_files = [_][]const u8{ "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "sudoers", "apikey" };
+    const sensitive_prefixes = [_][]const u8{ "/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/private/" };
+
+    var it = std.mem.splitScalar(u8, path, '/');
+    while (it.next()) |seg| {
+        if (seg.len == 0) continue;
+        for (sensitive_dirs) |d| {
+            if (std.mem.eql(u8, seg, d)) return true;
+        }
+        for (sensitive_files) |f| {
+            if (std.mem.eql(u8, seg, f)) return true;
+        }
+    }
+    for (sensitive_prefixes) |p| {
+        if (std.mem.startsWith(u8, path, p)) return true;
+    }
+    return false;
+}
+
+fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         // Simple JSON string extractor: finds "key":"value"
         var search_buf: [256]u8 = undefined;
         const search = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
@@ -1199,11 +1286,31 @@ pub const App = struct {
             }) catch return;
             break :blk self.messages.items.len - 1;
         };
+        // Duplicate name/args: the stored ToolCall now owns them (released by
+        // freeToolCall in clearMessages/compactContext/deinit). The caller
+        // (handleToolCalls) keeps and frees its own copies independently.
+        const name_owned = self.alloc.dupe(u8, name) catch return;
+        const args_owned = self.alloc.dupe(u8, args) catch {
+            self.alloc.free(name_owned);
+            return;
+        };
         self.messages.items[target].tool_calls.append(self.alloc, .{
-            .name = name,
-            .args = args,
+            .name = name_owned,
+            .args = args_owned,
             .status = .running,
-        }) catch {};
+            .owns = true,
+        }) catch {
+            self.alloc.free(name_owned);
+            self.alloc.free(args_owned);
+        };
+    }
+
+    fn freeToolCall(self: *App, tc: ToolCall) void {
+        if (tc.owns) {
+            if (tc.name.len > 0) self.alloc.free(tc.name);
+            if (tc.args.len > 0) self.alloc.free(tc.args);
+            if (tc.output) |o| if (o.len > 0) self.alloc.free(o);
+        }
     }
 
     fn onToolOutput(self: *App, name: []const u8, output: []const u8, success: bool) void {
@@ -1260,7 +1367,7 @@ pub const App = struct {
         .{ .id = "clear", .label = "/clear", .desc = "Clear conversation history" },
         .{ .id = "exit", .label = "/exit", .desc = "Quit the application" },
         .{ .id = "model", .label = "/model", .desc = "Switch model (e.g. /model deepseek-v4)", .kind = .insert },
-        .{ .id = "provider", .label = "/provider", .desc = "Switch API provider", .kind = .insert },
+        .{ .id = "provider", .label = "/provider", .desc = "Custom providers not supported yet", .kind = .insert },
         .{ .id = "models", .label = "/models", .desc = "List available models" },
         .{ .id = "save", .label = "/save", .desc = "Save current session" },
         .{ .id = "load", .label = "/load", .desc = "Load a session from file" },
@@ -1269,8 +1376,6 @@ pub const App = struct {
         .{ .id = "context", .label = "/context", .desc = "Show context usage statistics" },
         .{ .id = "status", .label = "/status", .desc = "Show system status" },
         .{ .id = "compact", .label = "/compact", .desc = "Compact conversation context" },
-        .{ .id = "note", .label = "/note", .desc = "Manage notes (add/list/show)", .kind = .insert },
-        .{ .id = "memory", .label = "/memory", .desc = "Manage agent memory", .kind = .insert },
         .{ .id = "subagents", .label = "/subagents", .desc = "Show sub-agent panel" },
         .{ .id = "think", .label = "/think", .desc = "Toggle reasoning visibility" },
         .{ .id = "tools", .label = "/tools", .desc = "Toggle tool call visibility" },
@@ -1315,8 +1420,7 @@ pub const App = struct {
                 return;
             }
             if (std.mem.eql(u8, id, "provider")) {
-                self.provider = self.alloc.dupe(u8, args) catch self.provider;
-                const msg = std.fmt.allocPrint(self.alloc, "Provider switched to: {s}", .{args}) catch return;
+                const msg = std.fmt.allocPrint(self.alloc, "Custom provider not supported — endpoint is fixed to DeepSeek", .{}) catch return;
                 self.setNotification(msg);
                 return;
             }
@@ -1337,12 +1441,14 @@ pub const App = struct {
             self.setNotification("Invalid key format — expected sk-...");
             return;
         }
-        // Free old key if it was allocated by us
-        if (self.api_key.len > 0) {
-            // Check if it's a pointer we own (not the env var)
-            // We use a heuristic: if api_key was allocated, it's in our allocator
+        // Allocate the new key first; only then release the old one, so an
+        // allocation failure leaves api_key pointing at valid memory.
+        const new_key = self.alloc.dupe(u8, key) catch return;
+        if (self.api_key_alloc) |old_alloc| {
+            old_alloc.free(self.api_key);
         }
-        self.api_key = self.alloc.dupe(u8, key) catch return;
+        self.api_key = new_key;
+        self.api_key_alloc = self.alloc;
         const msg = std.fmt.allocPrint(self.alloc, "API key set ({s}...{s})", .{ key[0..6], key[key.len-4..] }) catch return;
         self.setNotification(msg);
 
@@ -1398,9 +1504,9 @@ pub const App = struct {
             self.compactContext();
         } else if (std.mem.eql(u8, id, "status") or std.mem.eql(u8, id, "context")) {
             // Show context/status info as a system message
-            const pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-            const msg = std.fmt.allocPrint(self.alloc, "Model: {s}\nProvider: {s}\nTokens: {d}/{d}K ({d:.0}%)\nCache: {d:.0}%", .{
-                self.model, self.provider, self.tokens_used / 1000, self.ctx_max / 1000, pct, self.cache_hit_rate * 100.0,
+            const pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.ctxTokens())) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
+            const msg = std.fmt.allocPrint(self.alloc, "Model: {s}\nProvider: {s}\nCtx (est): {d}/{d}K ({d:.0}%)\nCache: n/a", .{
+                self.model, self.provider, self.ctxTokens() / 1000, self.ctx_max / 1000, pct,
             }) catch return;
             self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
         } else if (std.mem.eql(u8, id, "workspace")) {
@@ -1550,9 +1656,7 @@ pub const App = struct {
             if (m.owns and m.content.len > 0) self.alloc.free(m.content);
             if (m.thinking) |t| self.alloc.free(t);
             for (m.tool_calls.items) |tc| {
-                if (tc.owns) {
-                    if (tc.output) |o| if (o.len > 0) self.alloc.free(o);
-                }
+                self.freeToolCall(tc);
             }
             m.tool_calls.deinit(self.alloc);
         }
@@ -1608,7 +1712,7 @@ pub const App = struct {
         var summary = std.ArrayList(u8).empty;
         defer summary.deinit(self.alloc);
 
-        const compact_prefix = "[Compacted: previous conversation summary]\n\n";
+        const compact_prefix = "[Compacted: local preview — LLM summarization not implemented]\n\n";
         summary.appendSlice(self.alloc, compact_prefix) catch {};
 
         var compacted_count: usize = 0;
@@ -1635,10 +1739,8 @@ pub const App = struct {
         for (self.messages.items[0..keep_end]) |*m| {
             if (m.owns and m.content.len > 0) self.alloc.free(m.content);
             if (m.thinking) |t| self.alloc.free(t);
-            for (m.tool_calls.items) |*tc| {
-                if (tc.owns) {
-                    if (tc.output) |o| if (o.len > 0) self.alloc.free(o);
-                }
+            for (m.tool_calls.items) |tc| {
+                self.freeToolCall(tc);
             }
             m.tool_calls.deinit(self.alloc);
         }
@@ -1712,10 +1814,17 @@ pub const App = struct {
 
     // --- Top header: x zeepseek · model · turn N  ctx 12% ---x ------
 
+    /// Rough token estimate for the current conversation (bytes / 4).
+    /// Used instead of fake "tokens_used" metrics that never update.
+    fn ctxTokens(self: *const App) u64 {
+        var total: usize = 0;
+        for (self.messages.items) |m| total += m.content.len;
+        return @intCast(total / 4);
+    }
+
     fn renderHeader(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         _ = w;
-        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-        const cache_pct: f64 = self.cache_hit_rate * 100.0;
+        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.ctxTokens())) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         const streaming = self.streaming_idx != null;
 
         // header bar
@@ -1752,8 +1861,8 @@ pub const App = struct {
         buf.appendSlice(a, Pal.fg_faint) catch {};
         buf.appendSlice(a, "  cache ") catch {};
         buf.appendSlice(a, R) catch {};
-        buf.appendSlice(a, Pal.teal) catch {};
-        appendFmt(buf, a, "{d:.0}%", .{cache_pct});
+        buf.appendSlice(a, Pal.fg_dim) catch {};
+        buf.appendSlice(a, "--") catch {};
         buf.appendSlice(a, R) catch {};
 
         // streaming indicator
@@ -2029,8 +2138,7 @@ pub const App = struct {
 
     fn renderStatus(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         _ = w;
-        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-        const cache_pct: f64 = self.cache_hit_rate * 100.0;
+        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.ctxTokens())) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
 
         // Bottom border
         buf.appendSlice(a, D) catch {};
@@ -2072,7 +2180,7 @@ pub const App = struct {
         buf.appendSlice(a, "  cache=") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, Pal.fg_dim) catch {};
-        appendFmt(buf, a, "{d:.0}%", .{cache_pct});
+        buf.appendSlice(a, "--") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, "\n") catch {};
     }
@@ -2081,8 +2189,7 @@ pub const App = struct {
 
     fn renderSidebarRow(self: *const App, buf: *std.ArrayList(u8), a: std.mem.Allocator, row: u16) void {
         const sidebar_w: u16 = 22;
-        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-        const cache_pct: f64 = self.cache_hit_rate * 100.0;
+        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.ctxTokens())) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         const is_active = self.streaming_idx != null;
         const d = Pal.fg_faint; // dim text color for labels
 
@@ -2132,8 +2239,8 @@ pub const App = struct {
             buf.appendSlice(a, d) catch {};
             buf.appendSlice(a, "cache   ") catch {};
             buf.appendSlice(a, R) catch {};
-            buf.appendSlice(a, Pal.teal) catch {};
-            appendFmt(buf, a, "{d:.0}%", .{cache_pct});
+            buf.appendSlice(a, Pal.fg_dim) catch {};
+            buf.appendSlice(a, "--") catch {};
             buf.appendSlice(a, R) catch {};
             padSidebar(buf, a, sidebar_w, label_w + 3);
         } else if (row == 5) {
@@ -2345,6 +2452,39 @@ pub const App = struct {
             }
         }
         return len;
+    }
+
+    pub fn deinit(self: *App) void {
+        // Stop the streaming thread first so nothing touches App state afterwards.
+        if (self.stream_thread) |t| t.join();
+        if (self.stream_state) |ss| {
+            ss.deinit();
+            self.alloc.destroy(ss);
+            self.stream_state = null;
+        }
+        self.stream_thread = null;
+
+        for (self.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) self.alloc.free(m.content);
+            if (m.thinking) |t| self.alloc.free(t);
+            for (m.tool_calls.items) |tc| self.freeToolCall(tc);
+            m.tool_calls.deinit(self.alloc);
+        }
+        self.messages.deinit(self.alloc);
+
+        self.input.deinit(self.alloc);
+        self.palette_buf.deinit(self.alloc);
+        self.search_query.deinit(self.alloc);
+
+        for (self.subagents.items) |sa| {
+            if (sa.id.len > 0) self.alloc.free(sa.id);
+            if (sa.goal.len > 0) self.alloc.free(sa.goal);
+            if (sa.summary.len > 0) self.alloc.free(sa.summary);
+        }
+        self.subagents.deinit(self.alloc);
+
+        if (self.notif) |n| self.alloc.free(n);
+        if (self.api_key_alloc) |ka| ka.free(self.api_key);
     }
 };
 

@@ -110,10 +110,12 @@ pub const Sandbox = struct {
         var rules = try std.ArrayList(u8).initCapacity(std.heap.page_allocator, 8192);
         defer rules.deinit(std.heap.page_allocator);
 
-        // SBPL booleans are #t / #f — bare `true` is an unbound variable and fails to compile.
-        // Each (allow …) form must be fully parenthesized; the old profile had dangling "(".
+        // SBPL: (allow default) keeps the app fully usable; the deny rules
+        // below enforce OS-level write protection on system directories even
+        // if the user-approval layer is bypassed. NOTE: "(with no-sandbox)"
+        // is not valid on deny actions — sandbox_init would reject the whole
+        // profile, so it must not be used here.
         rules.appendSliceAssumeCapacity("(version 1)(allow default)");
-        rules.appendSliceAssumeCapacity("(deny process-exec* (with no-sandbox))");
         rules.appendSliceAssumeCapacity("(deny sysctl-read)");
         rules.appendSliceAssumeCapacity("(allow network*)");
         rules.appendSliceAssumeCapacity("(allow process*)");
@@ -163,40 +165,16 @@ pub const Sandbox = struct {
     fn initLandlock(self: *Sandbox, allowed_paths: []const []const u8) !void {
         if (builtin.os.tag != .linux) return;
 
-        const RC = std.posix.prctl(.SET_NO_NEW_PRIVS, 1, 0, 0, 0);
-        if (RC != 0) {
-            std.debug.print("[sandbox] prctl SET_NO_NEW_PRIVS failed, continuing without landlock\n", .{});
-            self.policy = .none;
-            return;
-        }
-
-        std.posix.prctl(.SET_DUMPABLE, 0, 0, 0, 0);
-
-        var ruleset_attr: extern struct {
-            handled_access_fs: u64,
-            handled_access_net: u64,
-            flags: u32,
-        } = .{
-            .handled_access_fs = 0x1 | 0x2 | 0x4 | 0x8,
-            .handled_access_net = 0,
-            .flags = 0,
-        };
-
-        const syscall_num = @intFromEnum(std.posix.SYS.linux_landlock_create_ruleset);
-        const attr_ptr = @intFromPtr(&ruleset_attr);
-        const fd = std.posix.syscall3(syscall_num, attr_ptr, @sizeOf(@TypeOf(ruleset_attr)), 0);
-
-        if (fd < 0) {
-            std.debug.print("[sandbox] landlock_create_ruleset unavailable (kernel < 5.13), using fallback restrictions\n", .{});
-            self.policy = .none;
-            return;
-        }
-
-        std.posix.close(@as(i32, fd));
-
-        if (builtin.mode == .Debug) {
-            std.debug.print("[sandbox] Landlock initialized with {d} allowed paths\n", .{allowed_paths.len});
-        }
+        // Landlock is a positive-authorization model: every handled access
+        // type is DENIED except on explicitly allowed paths. Tool calls can
+        // read/write arbitrary user-approved paths (cwd, $HOME, project dirs,
+        // /tmp, …) that a static allow-list cannot enumerate, so actually
+        // calling landlock_restrict_self here would break approved tools.
+        // The user-approval gate in app.zig is the effective protection;
+        // keep the platform layer as a no-op rather than a broken half-apply.
+        _ = allowed_paths;
+        std.debug.print("[sandbox] Landlock skipped: positive-authorization model conflicts with dynamic tool approval; using command-level restrictions only\n", .{});
+        self.policy = .none;
     }
 
     fn initJobObject(_: *Sandbox) !void {

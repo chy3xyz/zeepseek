@@ -17,12 +17,15 @@ pub fn executeSearch(alloc: std.mem.Allocator, sandbox: ?*Sandbox, call: ToolCal
     };
     const limit_str = map.get("limit") orelse "5";
 
-    const output = try std.fmt.allocPrint(alloc,
-        "Web search for: {s}\nResults limit: {s}\n\n[Note: Web search requires an external search API key. Configure DDG_API_KEY or SEARCH_API_KEY in your environment.]",
-        .{ query, limit_str }
-    );
-
-    return ToolResult{ .success = true, .output = output };
+    // Honest stub: no external search API is wired up. Report failure so the
+    // model falls back to the shell tool (curl) instead of treating the note
+    // as a real search result.
+    _ = limit_str;
+    return ToolResult{
+        .success = false,
+        .output = try std.fmt.allocPrint(alloc, "Web search is not implemented. Use the shell tool (curl/wget) instead. Query was: {s}", .{query}),
+        .err_msg = "Web search not implemented",
+    };
 }
 
 pub fn executeScrape(alloc: std.mem.Allocator, sandbox: ?*Sandbox, call: ToolCall) !ToolResult {
@@ -36,10 +39,10 @@ pub fn executeScrape(alloc: std.mem.Allocator, sandbox: ?*Sandbox, call: ToolCal
         return ToolResult{ .success = false, .output = "", .err_msg = "Missing url argument" };
     };
 
-    const output = try std.fmt.allocPrint(alloc,
-        "URL: {s}\n\n[Note: Web scraping requires network access. Use the shell tool with curl/wget as a workaround.]",
-        .{url}
-    );
-
-    return ToolResult{ .success = true, .output = output };
+    _ = url;
+    return ToolResult{
+        .success = false,
+        .output = try std.fmt.allocPrint(alloc, "Web scraping is not implemented. Use the shell tool (curl/wget) instead.", .{}),
+        .err_msg = "Web scraping not implemented",
+    };
 }

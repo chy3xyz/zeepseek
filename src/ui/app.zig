@@ -1544,7 +1544,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         .{ .id = "save", .label = "/save", .desc = "Save session (/save name)", .kind = .insert },
         .{ .id = "load", .label = "/load", .desc = "Load session (/load name)", .kind = .insert },
         .{ .id = "sessions", .label = "/sessions", .desc = "List saved sessions" },
-        .{ .id = "workspace", .label = "/workspace", .desc = "Show/set workspace path", .kind = .insert },
+        .{ .id = "workspace", .label = "/workspace", .desc = "Show current workspace path" },
         .{ .id = "context", .label = "/context", .desc = "Show context usage statistics" },
         .{ .id = "status", .label = "/status", .desc = "Show system status" },
         .{ .id = "compact", .label = "/compact", .desc = "Compact conversation context" },

@@ -52,6 +52,14 @@ pub fn build(b: *std.Build) void {
     tools_mod.addImport("c", c_mod);
     zz_mod.addImport("tools", tools_mod);
 
+    // Session format (shared by app.zig save/load)
+    const session_format_mod = b.createModule(.{
+        .root_source_file = b.path("src/storage/session_format.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    zz_mod.addImport("session_format", session_format_mod);
+
     // Expose net modules for streaming integration
     const http_client_file = b.createModule(.{
         .root_source_file = b.path("src/net/http_client.zig"),

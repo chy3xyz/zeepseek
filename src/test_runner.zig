@@ -38,6 +38,7 @@ const _context_manager = @import("dispatch/context_manager.zig");
 const _cache_first_loop = @import("dispatch/cache_first_loop.zig");
 const _store = @import("storage/store.zig");
 const _session_manager = @import("storage/session_manager.zig");
+const _session_format = @import("storage/session_format.zig");
 const _mmap_store = @import("storage/mmap_store.zig");
 const _subagent = @import("agent/subagent.zig");
 const _subworker = @import("agent/sub_worker.zig");

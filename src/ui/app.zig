@@ -16,6 +16,7 @@ const cc = @import("c");
 const stream_client_mod = @import("stream_client");
 const dangerous_patterns = @import("dangerous_patterns");
 const tools_mod = @import("tools");
+const session_format = @import("session_format");
 
 const CacheDecision = enum { none, hit, miss };
 
@@ -255,6 +256,9 @@ const StreamState = struct {
         self.done.store(true, .release);
     }
 
+    /// Store an error message; ownership passes to the stream state and the
+    /// UI frees it after displaying (pollStream). Empty string = alloc failure
+    /// fallback, never freed.
     fn setError(self: *StreamState, msg: []const u8) void {
         self.lock();
         defer self.unlock();
@@ -955,15 +959,15 @@ pub const App = struct {
                 var client = stream_client_mod.DeepSeekStreamClient.init(a, sio, null, null);
                 defer client.deinit();
 
-                var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch {
-                    state.setError("Failed to connect to API");
+                var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
+                    state.setError(std.fmt.allocPrint(a, "API request failed ({s})", .{@errorName(err)}) catch "");
                     return;
                 };
                 defer stream.deinit();
 
                 while (true) {
-                    const chunk = stream.nextChunk() catch {
-                        state.setError("Stream read error");
+                    const chunk = stream.nextChunk() catch |err| {
+                        state.setError(std.fmt.allocPrint(a, "Stream read error ({s})", .{@errorName(err)}) catch "");
                         return;
                     };
                     if (chunk == null) break;
@@ -985,7 +989,7 @@ pub const App = struct {
             alloc.free(prompt_owned);
             alloc.free(api_key_owned);
             alloc.free(model_owned);
-            ss.setError("Failed to spawn thread");
+            ss.setError(std.fmt.allocPrint(self.alloc, "Failed to spawn thread", .{}) catch "");
             return;
         };
         self.stream_thread = thread;
@@ -1014,6 +1018,8 @@ pub const App = struct {
 
             if (ss.error_msg) |msg| {
                 self.onStreamError(msg);
+                if (msg.len > 0) self.alloc.free(msg);
+                ss.error_msg = null;
             } else if (tc_json != null) {
                 // Handle tool calls — don't mark stream done yet
                 self.handleToolCalls(tc_json.?);
@@ -1734,9 +1740,21 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         // Build file path
         var path_buf: [512:0]u8 = undefined;
         _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, name }, 0) catch return;
-        // Write messages using C API. Format per message:
-        //   "ROLE <len>\n<content>\n" — the length prefix survives any
-        //   newlines / colons inside content.
+        // Serialize via the shared length-prefixed format
+        var msgs = std.ArrayList(session_format.SerializedMessage).empty;
+        defer msgs.deinit(self.alloc);
+        for (self.messages.items) |m| {
+            const role: session_format.Role = switch (m.role) {
+                .user => .user, .assistant => .assistant, .system => .system, .tool => .tool,
+            };
+            msgs.append(self.alloc, .{ .role = role, .content = m.content }) catch {};
+        }
+        const blob = session_format.serialize(self.alloc, msgs.items) catch {
+            self.setNotification("Save failed: serialization error");
+            return;
+        };
+        defer self.alloc.free(blob);
+
         const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
         const fd = std.c.open(&path_buf, flags, @as(std.c.mode_t, 0o644));
         if (fd < 0) {
@@ -1744,16 +1762,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             return;
         }
         defer _ = std.c.close(fd);
-        for (self.messages.items) |m| {
-            const role_str: []const u8 = switch (m.role) {
-                .user => "USER", .assistant => "ASSISTANT", .system => "SYSTEM", .tool => "TOOL",
-            };
-            var hdr: [64]u8 = undefined;
-            const header = std.fmt.bufPrint(&hdr, "{s} {d}\n", .{ role_str, m.content.len }) catch continue;
-            _ = std.c.write(fd, header.ptr, header.len);
-            _ = std.c.write(fd, m.content.ptr, m.content.len);
-            _ = std.c.write(fd, "\n", 1);
-        }
+        _ = std.c.write(fd, blob.ptr, blob.len);
         const note = std.fmt.allocPrint(self.alloc, "Session saved: {s}", .{name}) catch return;
         defer self.alloc.free(note);
         self.setNotification(note);
@@ -1801,29 +1810,20 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             if (n <= 0) break;
             data.appendSlice(self.alloc, read_buf[0..@intCast(n)]) catch break;
         }
+        // Parse via the shared module; parsed content ownership moves into
+        // the message list (owns = true).
+        const parsed = session_format.parse(self.alloc, data.items) catch return;
+        defer self.alloc.free(parsed);
         self.clearMessages();
-        // Parse "ROLE <len>\n<content>\n" records with a cursor.
-        var i: usize = 0;
-        while (i < data.items.len) {
-            if (std.mem.indexOfScalarPos(u8, data.items, i, '\n')) |nl| {
-                const hdr = data.items[i..nl];
-                const space = std.mem.indexOfScalar(u8, hdr, ' ') orelse break;
-                const role_str = hdr[0..space];
-                const content_len = std.fmt.parseInt(usize, hdr[space + 1 ..], 10) catch break;
-                const content_start = nl + 1;
-                if (content_start + content_len > data.items.len) break;
-                const content = data.items[content_start .. content_start + content_len];
-                const role: Role = if (std.mem.eql(u8, role_str, "USER")) .user
-                    else if (std.mem.eql(u8, role_str, "ASSISTANT")) .assistant
-                    else if (std.mem.eql(u8, role_str, "SYSTEM")) .system
-                    else .tool;
-                self.messages.append(self.alloc, .{
-                    .role = role,
-                    .content = self.alloc.dupe(u8, content) catch break,
-                    .owns = true,
-                }) catch {};
-                i = content_start + content_len + 1; // skip content + trailing '\n'
-            } else break;
+        for (parsed) |pm| {
+            const role: Role = switch (pm.role) {
+                .user => .user, .assistant => .assistant, .system => .system, .tool => .tool,
+            };
+            self.messages.append(self.alloc, .{
+                .role = role,
+                .content = pm.content,
+                .owns = true,
+            }) catch {};
         }
         self.setSessionName(name);
         self.auto_scroll = true;

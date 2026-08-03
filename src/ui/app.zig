@@ -74,87 +74,6 @@ fn appendFmt(buf: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []cons
 // Markdown → ANSI renderer (lightweight, inline)
 // ═══════════════════════════════════════════════════════════════════════
 
-fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, width: u16) void {
-    var in_code_block = false;
-    var code_lang: []const u8 = "";
-    var line_iter = std.mem.splitScalar(u8, text, '\n');
-    while (line_iter.next()) |line| {
-        // Code block fence
-        if (std.mem.startsWith(u8, line, "```")) {
-            if (in_code_block) {
-                appendFmt(buf, a, "{s}+---{s}\n", .{ D, R });
-                in_code_block = false;
-            } else {
-                in_code_block = true;
-                code_lang = if (line.len > 3) std.mem.trim(u8, line[3..], " ") else "";
-                if (code_lang.len > 0) {
-                    appendFmt(buf, a, "{s}+--- {s} ---{s}\n", .{ D, code_lang, R });
-                } else {
-                    appendFmt(buf, a, "{s}+---{s}\n", .{ D, R });
-                }
-            }
-            continue;
-        }
-
-        if (in_code_block) {
-            appendFmt(buf, a, "{s}| {s}{s}{s}\n", .{ D, Pal.fg, line, R });
-            continue;
-        }
-
-        // Headings
-        if (std.mem.startsWith(u8, line, "# ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.blue, line[2..], R });
-            continue;
-        }
-        if (std.mem.startsWith(u8, line, "## ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.green, line[3..], R });
-            continue;
-        }
-        if (std.mem.startsWith(u8, line, "### ")) {
-            appendFmt(buf, a, "{s}{s}{s}{s}\n", .{ B, Pal.gold, line[4..], R });
-            continue;
-        }
-
-        // Horizontal rule
-        if (line.len >= 3 and std.mem.allEqual(u8, line, '-')) {
-            appendFmt(buf, a, "{s}", .{D});
-            var col: u16 = 0;
-            while (col < width) : (col += 1) { buf.appendSlice(a, "x") catch {}; }
-            appendFmt(buf, a, "{s}\n", .{R});
-            continue;
-        }
-
-        // List items
-        if (std.mem.startsWith(u8, line, "- ") or std.mem.startsWith(u8, line, "* ")) {
-            appendFmt(buf, a, "  {s}•{s} ", .{ Pal.green, R });
-            renderInlineAnsi(buf, a, line[2..]);
-            buf.appendSlice(a, "\n") catch {};
-            continue;
-        }
-        if (line.len >= 3 and line[0] >= '1' and line[0] <= '9' and (line[1] == '.' or (line[1] >= '0' and line[1] <= '9' and line[2] == '.'))) {
-            const dot = std.mem.indexOfScalar(u8, line, '.') orelse 0;
-            appendFmt(buf, a, "  {s}{s}{s} ", .{ Pal.green, line[0 .. dot + 1], R });
-            renderInlineAnsi(buf, a, std.mem.trim(u8, line[dot + 1 ..], " "));
-            buf.appendSlice(a, "\n") catch {};
-            continue;
-        }
-
-        // Blockquote
-        if (std.mem.startsWith(u8, line, "> ")) {
-            appendFmt(buf, a, "  {s}|{s} {s}{s}{s}\n", .{ D, R, D, line[2..], R });
-            continue;
-        }
-
-        // Regular paragraph
-        renderInlineAnsi(buf, a, line);
-        buf.appendSlice(a, "\n") catch {};
-    }
-    // Unclosed code block
-    if (in_code_block) {
-        appendFmt(buf, a, "{s}+---{s}\n", .{ D, R });
-    }
-}
-
 fn renderInlineAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) void {
     var i: usize = 0;
     while (i < text.len) {
@@ -215,27 +134,6 @@ fn renderInlineAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const
     }
 }
 
-fn appendHighlighted(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, query: []const u8) void {
-    if (query.len == 0 or text.len == 0) {
-        buf.appendSlice(a, text) catch {};
-        return;
-    }
-    var pos: usize = 0;
-    while (pos < text.len) {
-        if (std.mem.indexOfPos(u8, text, pos, query)) |match| {
-            // Text before match
-            if (match > pos) buf.appendSlice(a, text[pos..match]) catch {};
-            // Highlighted match
-            appendFmt(buf, a, "{s}{s}{s}", .{ SearchHighlight, text[match .. match + query.len], R });
-            pos = match + query.len;
-        } else {
-            buf.appendSlice(a, text[pos..]) catch {};
-            break;
-        }
-    }
-}
-
-// ═══════════════════════════════════════════════════════════════════════
 // Data Types
 // ═══════════════════════════════════════════════════════════════════════
 
@@ -297,28 +195,6 @@ pub const SubAgent = struct {
     summary: []const u8 = "",
 };
 
-/// Semantic color theme (single dark palette matching Rust Whale defaults)
-pub const Theme = struct {
-    bg: []const u8 = "\x1b[48;2;13;21;37m",
-    surface: []const u8 = "\x1b[48;2;19;29;48m",
-    elevated: []const u8 = "\x1b[48;2;26;40;64m",
-    fg: []const u8 = "\x1b[38;2;246;242;232m",
-    fg_soft: []const u8 = "\x1b[38;2;217;224;234m",
-    fg_muted: []const u8 = "\x1b[38;2;169;180;199m",
-    accent_gold: []const u8 = "\x1b[38;2;246;196;83m",
-    accent_seafoam: []const u8 = "\x1b[38;2;79;209;197m",
-    accent_coral: []const u8 = "\x1b[38;2;255;122;89m",
-    error_color: []const u8 = "\x1b[38;2;255;92;122m",
-    success: []const u8 = "\x1b[38;2;79;209;197m",
-    warning: []const u8 = "\x1b[38;2;240;160;48m",
-    info: []const u8 = "\x1b[38;2;106;174;242m",
-    border: []const u8 = "\x1b[38;2;42;74;127m",
-    reasoning: []const u8 = "\x1b[38;2;224;153;72m",
-    tool_live: []const u8 = "\x1b[38;2;133;184;234m",
-    tool_output: []const u8 = "\x1b[38;2;194;208;224m",
-    diff_add: []const u8 = "\x1b[38;2;87;199;133m",
-    diff_del: []const u8 = "\x1b[38;2;255;92;122m",
-};
 
 // ═══════════════════════════════════════════════════════════════════════
 // Streaming state (thread-safe bridge between background thread and UI)
@@ -2841,9 +2717,6 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
     // --- Helpers 
 
-    fn fmtLine(a: std.mem.Allocator, comptime f: []const u8, args: anytype) []const u8 {
-        return std.fmt.allocPrint(a, f, args) catch "";
-    }
 
     fn appendInt(buf: *std.ArrayList(u8), a: std.mem.Allocator, val: anytype) void {
         if (std.fmt.allocPrint(a, "{d}", .{val})) |s| {

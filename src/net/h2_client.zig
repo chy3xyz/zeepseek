@@ -55,6 +55,12 @@ pub const H2Response = struct {
     }
 };
 
+/// Streaming sink: called with each DATA frame payload as it arrives.
+pub const StreamSink = struct {
+    ctx: *anyopaque,
+    on_data: *const fn (ctx: *anyopaque, data: []const u8) void,
+};
+
 pub const H2Client = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -139,6 +145,7 @@ pub const H2Client = struct {
         path: []const u8,
         headers: []const struct { []const u8, []const u8 },
         body: []const u8,
+        stream: ?*const StreamSink,
     ) H2Error!H2Response {
         // Writes to a peer that closed the connection must not kill the process.
         const ign = posix.Sigaction{
@@ -290,6 +297,9 @@ pub const H2Client = struct {
                     if ((frame.header.flags & h2.FrameFlags.end_stream) != 0) end_stream = true;
                 },
                 .data => {
+                    if (stream) |sink| {
+                        sink.on_data(sink.ctx, frame.payload);
+                    }
                     try response.body.appendSlice(alloc, frame.payload);
                     if ((frame.header.flags & h2.FrameFlags.end_stream) != 0) end_stream = true;
                 },

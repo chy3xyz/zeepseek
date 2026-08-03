@@ -1566,11 +1566,12 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         if (filtered.len == 0 or self.palette_sel >= filtered.len) { self.palette_buf.clearRetainingCapacity(); return; }
         const cmd = filtered[self.palette_sel];
         if (cmd.kind == .insert) {
-            // Insert command text into input so user can add arguments
+            // Insert command text into input so user can add arguments.
+            // Keep the leading "/" so the inserted text is a real command
+            // when submitted (e.g. "/save <name>").
             self.input.clearRetainingCapacity();
             self.cursor = 0;
-            // Copy the label without leading "/"
-            for (cmd.label[1..]) |ch| {
+            for (cmd.label) |ch| {
                 self.input.append(self.alloc, ch) catch {};
                 self.cursor += 1;
             }

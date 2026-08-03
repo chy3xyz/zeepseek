@@ -930,7 +930,7 @@ test "detect tool_calls in delta" {
 
 // ── h2-over-TLS streaming (H2Client + SSE line parsing) ───────────────
 
-pub const ChunkKind = enum { content, reasoning };
+pub const ChunkKind = enum { content, reasoning, tool };
 
 pub const ChunkSink = struct {
     ctx: *anyopaque,
@@ -960,9 +960,15 @@ fn findMatchingBracePlain(json_data: []const u8, start: usize) !?usize {
 
 /// Module-level delta extraction (content/reasoning only; tool_calls handled
 /// separately by the buffered StreamIterator path).
-pub fn extractContentAndReasoningPlain(allocator: std.mem.Allocator, json_data: []const u8) !struct { content: []const u8, reasoning: []const u8 } {
+pub fn extractContentAndReasoningPlain(allocator: std.mem.Allocator, json_data: []const u8) !struct { content: []const u8, reasoning: []const u8, tool: []const u8 } {
     var content_result: []const u8 = "";
     var reasoning_result: []const u8 = "";
+    var tool_result: []const u8 = "";
+    if (std.mem.indexOf(u8, json_data, "\"tool_calls\"") != null or
+        std.mem.indexOf(u8, json_data, "\"tool_call\"") != null)
+    {
+        tool_result = try allocator.dupe(u8, json_data);
+    }
     var i: usize = 0;
     while (i < json_data.len) : (i += 1) {
         if (i + 7 <= json_data.len and std.mem.eql(u8, json_data[i..i+7], "\"delta\"")) {
@@ -1003,7 +1009,7 @@ pub fn extractContentAndReasoningPlain(allocator: std.mem.Allocator, json_data: 
             }
         }
     }
-    return .{ .content = content_result, .reasoning = reasoning_result };
+    return .{ .content = content_result, .reasoning = reasoning_result, .tool = tool_result };
 }
 
 const H2SseCtx = struct {
@@ -1050,7 +1056,9 @@ const H2SseCtx = struct {
             defer {
                 if (extracted.content.len > 0) c.alloc.free(extracted.content);
                 if (extracted.reasoning.len > 0) c.alloc.free(extracted.reasoning);
+                if (extracted.tool.len > 0) c.alloc.free(extracted.tool);
             }
+            if (extracted.tool.len > 0) c.sink.on_chunk(c.sink.ctx, .tool, extracted.tool);
             if (extracted.reasoning.len > 0) c.sink.on_chunk(c.sink.ctx, .reasoning, extracted.reasoning);
             if (extracted.content.len > 0) c.sink.on_chunk(c.sink.ctx, .content, extracted.content);
         }

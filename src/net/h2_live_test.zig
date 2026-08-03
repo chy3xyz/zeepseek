@@ -127,3 +127,18 @@ test "streamMessageH2 live" {
         std.mem.indexOf(u8, ctx.content.items, "Hello") != null,
     });
 }
+
+test "extract tool_calls from h2 delta" {
+    const alloc = std.testing.allocator;
+    const delta = "{\"id\":\"x\",\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}}]}";
+    const ex = try stream_client.extractContentAndReasoningPlain(alloc, delta);
+    defer {
+        if (ex.content.len > 0) alloc.free(ex.content);
+        if (ex.reasoning.len > 0) alloc.free(ex.reasoning);
+        if (ex.tool.len > 0) alloc.free(ex.tool);
+    }
+    try std.testing.expectEqual(@as(usize, 0), ex.content.len);
+    try std.testing.expect(ex.tool.len > 0);
+    try std.testing.expect(std.mem.indexOf(u8, ex.tool, "\"tool_calls\"") != null);
+    std.debug.print("TOOL: extracted {d} bytes\n", .{ex.tool.len});
+}

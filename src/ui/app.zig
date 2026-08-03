@@ -990,6 +990,7 @@ pub const App = struct {
                         switch (kind) {
                             .content => c.state.pushContent(data),
                             .reasoning => c.state.pushReasoning(data),
+                            .tool => c.state.pushToolCallJson(data),
                         }
                     }
                 };

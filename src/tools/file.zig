@@ -2,7 +2,7 @@ const std = @import("std");
 const tools_mod = @import("mod.zig");
 const ToolCall = tools_mod.ToolCall;
 const ToolResult = tools_mod.ToolResult;
-const sandbox_mod = @import("sandbox");
+const sandbox_mod = @import("../utils/sandbox.zig");
 const Sandbox = sandbox_mod.Sandbox;
 
 const process_mod = @import("process.zig");

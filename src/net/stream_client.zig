@@ -57,6 +57,10 @@ pub const DeepSeekStreamClient = struct {
     rate_limiter: ?*RateLimiter = null,
     circuit_breaker: ?*CircuitBreaker = null,
     endpoint: []const u8 = "https://api.deepseek.com/chat/completions",
+    last_http_status: u16 = 0,
+    last_http_body: ?[]u8 = null,
+    request: ?http.Client.Request = null,
+    response: ?http.Client.Response = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -123,15 +127,19 @@ pub const DeepSeekStreamClient = struct {
         h2.config = .{ .read_timeout_ms = 60_000 };
         var resp = h2.open(scheme, host, port, "POST", uri.path.percent_encoded, &headers, body) catch return error.HttpError;
         errdefer resp.deinit();
+        self.last_http_status = @intCast(resp.status);
         if (resp.status < 200 or resp.status >= 300) {
             if (self.circuit_breaker) |cb| {
                 cb.recordFailure();
             }
-            return error.HttpError;
-        }
 
-        if (self.circuit_breaker) |cb| {
-            cb.recordSuccess();
+            // Capture the response body so the UI can show *why* the request failed.
+            var err_buf: [4096]u8 = undefined;
+            const n = resp.readBody(&err_buf) catch 0;
+            if (self.last_http_body) |old| self.allocator.free(old);
+            self.last_http_body = self.allocator.dupe(u8, err_buf[0..n]) catch null;
+
+            return error.HttpError;
         }
 
         return StreamIterator{
@@ -379,6 +387,40 @@ pub const StreamIterator = struct {
                 return null;
             }
             try self.line_accumulator.appendSlice(self.allocator, read_buf[0..n]);
+
+            if (std.mem.indexOfScalar(u8, self.line_accumulator.items, '\n')) |newline_idx| {
+                const line = self.line_accumulator.items[0 .. newline_idx + 1];
+                const remainder = self.line_accumulator.items[newline_idx + 1 ..];
+                const remainder_copy = try self.allocator.dupe(u8, remainder);
+                defer self.allocator.free(remainder_copy);
+                self.line_accumulator.clearRetainingCapacity();
+                if (remainder_copy.len > 0) {
+                    try self.line_accumulator.appendSlice(self.allocator, remainder_copy);
+                }
+                const trimmed = std.mem.trim(u8, line, "\r\n");
+                if (trimmed.len == 0) continue;
+                if (trimmed[0] == ':') continue;
+                if (!std.mem.startsWith(u8, trimmed, "data:")) continue;
+
+                const data_value = std.mem.trim(u8, trimmed[5..], " ");
+                if (data_value.len == 0) continue;
+                if (std.mem.eql(u8, data_value, "[DONE]")) {
+                    self.done = true;
+                    return null;
+                }
+
+                const extracted = try self.extractContentAndReasoning(data_value);
+                if (extracted.reasoning.len > 0) {
+                    self.reasoning_buffer = extracted.reasoning;
+                }
+                if (extracted.content.len > 0) {
+                    self.content_buffer = extracted.content;
+                }
+                if (self.reasoning_buffer.len > 0 or self.content_buffer.len > 0) {
+                    return self.nextChunk();
+                }
+                continue;
+            }
         }
     }
 

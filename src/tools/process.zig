@@ -1,5 +1,5 @@
 const std = @import("std");
-const sandbox_mod = @import("sandbox");
+const sandbox_mod = @import("../utils/sandbox.zig");
 const Sandbox = sandbox_mod.Sandbox;
 
 pub const RunResult = struct {

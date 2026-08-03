@@ -44,6 +44,8 @@ pub const CommandPalette = struct {
 
     cursor: usize,
     max_visible: u16,
+    /// Whether the palette is currently shown (open/close/isOpen).
+    is_open: bool = false,
     width: u16,
     prompt: []const u8,
     /// Placeholder shown in the input when the query is empty.
@@ -122,6 +124,18 @@ pub const CommandPalette = struct {
         };
         _ = &palette;
         return palette;
+    }
+
+    pub fn open(self: *CommandPalette) void {
+        self.is_open = true;
+    }
+
+    pub fn close(self: *CommandPalette) void {
+        self.is_open = false;
+    }
+
+    pub fn isOpen(self: *const CommandPalette) bool {
+        return self.is_open;
     }
 
     pub fn deinit(self: *CommandPalette) void {

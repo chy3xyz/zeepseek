@@ -1,5 +1,5 @@
 const std = @import("std");
-const sandbox_mod = @import("sandbox");
+const sandbox_mod = @import("../utils/sandbox.zig");
 
 pub const shell = @import("shell.zig");
 pub const file = @import("file.zig");

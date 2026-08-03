@@ -22,7 +22,8 @@ Utils ────────────────────────�
 ### `src/ui/app.zig` — Main Application
 - ZigZag Model-Update-View pattern
 - Handles keyboard input, streaming, command dispatch
-- ~2200 lines (includes rendering + state management)
+- Uses ZigZag components: `TextInput`, `CommandPalette`, `Modal`, `Toast`
+- ~3150 lines (includes rendering + state management; legacy dead code removed)
 
 ### `src/cache/reasonix.zig` — Semantic Cache
 - Token-based caching with 3-tier TTL (hot/cold/archive)

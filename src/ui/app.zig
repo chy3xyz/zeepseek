@@ -980,32 +980,52 @@ pub const App = struct {
                 var client = stream_client_mod.DeepSeekStreamClient.init(a, sio_own, null, null);
                 defer client.deinit();
 
-                var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
-                    state.setError(std.fmt.allocPrint(a, "API request failed ({s})", .{@errorName(err)}) catch "");
-                    return;
+                // Fast path: h2-over-TLS streaming (own TLS stack, read
+                // timeouts, no std.http chunked-EOF quirk). Falls back to the
+                // buffered std.http path when the stream errors early.
+                const H2Ctx = struct {
+                    state: *StreamState,
+                    fn onChunk(uc: *anyopaque, kind: stream_client_mod.ChunkKind, data: []const u8) void {
+                        const c: *@This() = @ptrCast(@alignCast(uc));
+                        switch (kind) {
+                            .content => c.state.pushContent(data),
+                            .reasoning => c.state.pushReasoning(data),
+                        }
+                    }
                 };
-                defer stream.deinit();
-
-                while (true) {
-                    const chunk = stream.nextChunk() catch |err| {
-                        state.setError(std.fmt.allocPrint(a, "Stream read error ({s})", .{@errorName(err)}) catch "");
+                var h2ctx = H2Ctx{ .state = state };
+                const h2sink = stream_client_mod.ChunkSink{ .ctx = &h2ctx, .on_chunk = H2Ctx.onChunk };
+                const h2_ok = blk: {
+                    stream_client_mod.streamMessageH2(&client, api_k, prompt, ctx, mdl, CacheDecision.none, "", null, h2sink) catch break :blk false;
+                    break :blk true;
+                };
+                if (!h2_ok) {
+                    // Fallback: buffered (non-streaming) response via std.http.
+                    var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
+                        state.setError(std.fmt.allocPrint(a, "API request failed ({s})", .{@errorName(err)}) catch "");
                         return;
                     };
-                    if (chunk == null) break;
-                    switch (chunk.?) {
-                        .content => |c| {
-                                    state.pushContent(c);
-                            a.free(c);
-                        },
-                        .reasoning => |r| {
-                            state.pushReasoning(r);
-                            a.free(r);
-                        },
+                    defer stream.deinit();
+                    while (true) {
+                        const chunk = stream.nextChunk() catch |err| {
+                            state.setError(std.fmt.allocPrint(a, "Stream read error ({s})", .{@errorName(err)}) catch "");
+                            return;
+                        };
+                        if (chunk == null) break;
+                        switch (chunk.?) {
+                            .content => |c| {
+                                state.pushContent(c);
+                                a.free(c);
+                            },
+                            .reasoning => |r| {
+                                state.pushReasoning(r);
+                                a.free(r);
+                            },
+                        }
                     }
-                }
-                // Capture tool call JSON if present
-                if (stream.has_tool_calls and stream.tool_call_json.items.len > 0) {
-                    state.pushToolCallJson(stream.tool_call_json.items);
+                    if (stream.has_tool_calls and stream.tool_call_json.items.len > 0) {
+                        state.pushToolCallJson(stream.tool_call_json.items);
+                    }
                 }
                 state.setDone();
             }

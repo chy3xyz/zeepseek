@@ -23,6 +23,15 @@ fn resolvePath(alloc: std.mem.Allocator, cwd: []const u8, path: []const u8) ![]c
     return std.fs.path.resolve(alloc, &.{ cwd, path });
 }
 
+/// Workspace model: structured file tools may only touch paths inside cwd.
+/// System files / project-external reads require the shell tool (with
+/// approval). resolved must already be absolute + normalized (resolvePath).
+fn isInsideWorkspace(resolved: []const u8, cwd: []const u8) bool {
+    if (std.mem.eql(u8, resolved, cwd)) return true;
+    if (resolved.len > cwd.len and std.mem.startsWith(u8, resolved, cwd) and resolved[cwd.len] == '/') return true;
+    return false;
+}
+
 fn readFileC(alloc: std.mem.Allocator, path: []const u8) ![]const u8 {
     const path_z = try alloc.dupeSentinel(u8, path, 0);
     defer alloc.free(path_z);
@@ -86,6 +95,9 @@ pub fn executeRead(alloc: std.mem.Allocator, sandbox: ?*Sandbox, cwd: []const u8
     };
     defer alloc.free(resolved);
 
+    if (!isInsideWorkspace(resolved, cwd)) {
+        return ToolResult{ .success = false, .output = "", .err_msg = "Path is outside the workspace (use shell for system files)", .sandbox_violation = true };
+    }
     if (sandbox) |sb| {
         if (!sb.allowFileRead(resolved)) {
             return ToolResult{ .success = false, .output = "", .err_msg = "File read blocked by sandbox", .sandbox_violation = true };
@@ -130,6 +142,12 @@ pub fn executeWrite(alloc: std.mem.Allocator, sandbox: ?*Sandbox, cwd: []const u
     };
     defer alloc.free(resolved);
 
+    if (!isInsideWorkspace(resolved, cwd)) {
+        return ToolResult{ .success = false, .output = "", .err_msg = "Path is outside the workspace (use shell for system files)", .sandbox_violation = true };
+    }
+    if (!isInsideWorkspace(resolved, cwd)) {
+        return ToolResult{ .success = false, .output = "", .err_msg = "Path is outside the workspace (use shell for system files)", .sandbox_violation = true };
+    }
     if (sandbox) |sb| {
         if (!sb.allowFileWrite(resolved)) {
             return ToolResult{ .success = false, .output = "", .err_msg = "File write blocked by sandbox", .sandbox_violation = true };
@@ -232,6 +250,9 @@ pub fn executeGlob(alloc: std.mem.Allocator, sandbox: ?*Sandbox, cwd: []const u8
 
     const resolved_root = resolvePath(alloc, cwd, root) catch cwd;
     defer if (resolved_root.ptr != cwd.ptr) alloc.free(resolved_root);
+    if (!isInsideWorkspace(resolved_root, cwd)) {
+        return ToolResult{ .success = false, .output = "", .err_msg = "Glob root is outside the workspace", .sandbox_violation = true };
+    }
 
     const result = process_mod.runArgv(alloc, resolved_root, &.{
         "find", ".", "-type", "f", "-name", pattern,
@@ -261,6 +282,9 @@ pub fn executeGrep(alloc: std.mem.Allocator, sandbox: ?*Sandbox, cwd: []const u8
 
     const resolved = resolvePath(alloc, cwd, path) catch cwd;
     defer if (resolved.ptr != cwd.ptr) alloc.free(resolved);
+    if (!isInsideWorkspace(resolved, cwd)) {
+        return ToolResult{ .success = false, .output = "", .err_msg = "Search path is outside the workspace", .sandbox_violation = true };
+    }
 
     const result = process_mod.runArgv(alloc, cwd, &.{
         "grep", "-rn", "--", pattern, resolved,
@@ -333,4 +357,19 @@ test "resolvePath keeps normal relative paths" {
     const resolved = try resolvePath(alloc, "/home/user/proj", "src/main.zig");
     defer alloc.free(resolved);
     try std.testing.expectEqualSlices(u8, "/home/user/proj/src/main.zig", resolved);
+}
+
+test "workspace restriction blocks outside paths" {
+    const alloc = std.testing.allocator;
+    const outside = try resolvePath(alloc, "/home/u/proj", "../etc/passwd");
+    defer alloc.free(outside);
+    try std.testing.expect(!isInsideWorkspace(outside, "/home/u/proj"));
+
+    const inside = try resolvePath(alloc, "/home/u/proj", "src/main.zig");
+    defer alloc.free(inside);
+    try std.testing.expect(isInsideWorkspace(inside, "/home/u/proj"));
+
+    const cwd_itself = try resolvePath(alloc, "/home/u/proj", ".");
+    defer alloc.free(cwd_itself);
+    try std.testing.expect(isInsideWorkspace(cwd_itself, "/home/u/proj"));
 }

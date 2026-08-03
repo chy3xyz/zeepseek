@@ -560,7 +560,11 @@ pub const App = struct {
         // Initialize sandbox for tool approval. Platform-level sandboxing
         // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
         // requiresApproval/allowShell still gate every tool call.
-        self.sandbox = tools_mod.Sandbox.init(tools_mod.Policy.host(), &.{}) catch null;
+        // Workspace model: allow the current working directory in the
+        // platform sandbox; file tools additionally reject anything outside it.
+        const ws_ptr = std.c.getenv("PWD") orelse ".";
+        const workspace = std.mem.sliceTo(ws_ptr, 0);
+        self.sandbox = tools_mod.Sandbox.init(tools_mod.Policy.host(), &.{workspace}) catch null;
 
         // Enter the alternate screen AND schedule a repeating tick (~60fps):
         // pollStream/pollSubAgents/pollCompact all run from the .tick message,

@@ -32,6 +32,7 @@ const ContextManager = @import("../dispatch/context_manager.zig").ContextManager
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
 const reasonix_mod = @import("../cache/reasonix.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
+const git_worker_mod = @import("../utils/git_worker.zig");
 
 const join = zz.join;
 
@@ -830,6 +831,8 @@ pub const App = struct {
             self.reasonix = r;
             self.reasonix_alloc = std.heap.page_allocator;
         }
+
+
 
         // Initialize sandbox for tool approval. Platform-level sandboxing
         // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
@@ -3568,7 +3571,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
 };
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init, _: ?git_worker_mod.Client) !void {
     var program = zz.Program(App).initWithOptions(init.gpa, init.io, init.environ_map, .{
         .mouse = true,
     });

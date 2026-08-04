@@ -1456,7 +1456,16 @@ pub const App = struct {
                                     const nm = if (obj.get("name")) |v| (if (v == .string) v.string else "?") else "?";
                                     const cmd = if (obj.get("command")) |v| (if (v == .string) v.string else "") else "";
                                     if (cmd.len > 0) {
-                                        self.mcp_servers.append(self.alloc, .{ .cfg_name = nm, .command = cmd, .args = &.{} }) catch {};
+                                        var arg_list = std.ArrayList([]const u8).empty;
+                                        if (obj.get("args")) |av| {
+                                            if (av == .array) {
+                                                for (av.array.items) |a| {
+                                                    if (a == .string) arg_list.append(self.alloc, a.string) catch {};
+                                                }
+                                            }
+                                        }
+                                        const args_owned = arg_list.toOwnedSlice(self.alloc) catch &.{};
+                                        self.mcp_servers.append(self.alloc, .{ .cfg_name = nm, .command = cmd, .args = args_owned }) catch {};
                                     }
                                 }
                             }

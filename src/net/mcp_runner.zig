@@ -103,6 +103,27 @@ pub const McpSession = struct {
     }
 };
 
+test "roundTrip handshake against a local demo server" {
+    // Requires /tmp/zz_mcp_demo.py (a tiny stdio MCP server) to exist.
+    if (std.fs.cwd().access("/tmp/zz_mcp_demo.py", .{})) |_| {
+        // fallthrough
+    } else |_| return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const srv = McpServer{ .cfg_name = "demo", .command = "/usr/bin/python3", .args = &.{"/tmp/zz_mcp_demo.py"} };
+    var sess = try McpSession.spawn(std.Io{ .userdata = undefined, .vtable = &std.Io.default_vtable }, alloc, srv);
+    defer sess.deinit();
+    const init = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{}}}}", .{});
+    defer alloc.free(init);
+    const resp = try sess.roundTrip(init, 4000);
+    defer alloc.free(resp);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "serverInfo") != null);
+    const tl = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\",\"params\":{{}}}}", .{});
+    defer alloc.free(tl);
+    const tl_resp = try sess.roundTrip(tl, 4000);
+    defer alloc.free(tl_resp);
+    try std.testing.expect(std.mem.indexOf(u8, tl_resp, "demo_tool") != null);
+}
+
 test "spawn fails cleanly for missing command" {
     const alloc = std.testing.allocator;
     const srv = McpServer{ .cfg_name = "missing", .command = "/nonexistent/mcp-server-xyz", .args = &.{} };

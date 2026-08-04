@@ -736,6 +736,7 @@ pub const App = struct {
     pending_inputs: std.ArrayList([]const u8) = .empty,
     history_edit_idx: ?usize = null,
     run_mode: RunMode = .auto,
+    tool_fail_streak: u32 = 0,
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -1963,10 +1964,18 @@ pub const App = struct {
             }
         }
 
+        // Recovery guardrail (Reasonix borrow): consecutive tool failures
+        // stop the tool to avoid a retry loop.
         const res = tools_mod.executeTool(self.alloc, self.sandbox, cwd, call) catch {
+            self.tool_fail_streak += 1;
+            if (self.tool_fail_streak >= 3) {
+                self.tool_fail_streak = 0;
+                self.setNotification("Tool failed 3x in a row — stopped (use /clear to reset)");
+            }
             return self.toolErr("Error: tool execution failed", .{});
         };
         // ToolResult.output is allocator-owned when non-empty, static "" on error.
+        self.tool_fail_streak = 0;
         if (res.output.len > 0) {
             const owned = self.alloc.dupe(u8, res.output) catch "";
             self.alloc.free(res.output);

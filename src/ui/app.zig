@@ -889,7 +889,7 @@ pub const App = struct {
             if (std.c.getenv("HOME")) |home_z| {
                 const home = std.mem.sliceTo(home_z, 0);
                 _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
-                m.load(&mem_path_buf);
+                m.load(mem_path_buf[0..]);
             }
             self.memory = m;
             self.memory_alloc = std.heap.page_allocator;
@@ -1451,7 +1451,7 @@ pub const App = struct {
                     if (std.c.getenv("HOME")) |home_z| {
                         const home = std.mem.sliceTo(home_z, 0);
                         _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
-                        mem.add(&mem_path_buf, arg);
+                        mem.add(mem_path_buf[0..], arg);
                         self.setNotification("Memory saved");
                     }
                 }

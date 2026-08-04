@@ -1102,8 +1102,8 @@ pub const App = struct {
 
         // --- Tool approval overlay (highest priority)
         if (self.pending_tool != null) {
-            if (k == .enter) { self.approvePendingTool(); return .none; }
-            if (k == .escape) { self.rejectPendingTool(); return .none; }
+            if (k == .enter or (k == .char and k.char == '1')) { self.approvePendingTool(); return .none; }
+            if (k == .escape or (k == .char and k.char == '2')) { self.rejectPendingTool(); return .none; }
             return .none;
         }
 
@@ -2875,6 +2875,42 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
                 const px = (w -| @as(u16, @intCast(pw))) / 2;
                 const py = (h -| @as(u16, @intCast(ph))) / 2;
                 result = ansiOverlay(a, result, palette_view, px, py) catch result;
+            }
+        }
+
+        // Tool approval modal (centered overlay with numbered options)
+        if (self.pending_tool) |pt| {
+            if (self.tool_run) |tr| {
+                if (pt.idx < tr.calls.items.len) {
+                    const call = tr.calls.items[pt.idx];
+                    var modal_lines = std.ArrayList(u8).empty;
+                    defer modal_lines.deinit(a);
+                    modal_lines.appendSlice(a, "┌─ Tool approval ─────────────────┐\n") catch {};
+                    modal_lines.appendSlice(a, "│  ") catch {};
+                    modal_lines.appendSlice(a, Pal.yellow) catch {};
+                    modal_lines.appendSlice(a, call.name) catch {};
+                    modal_lines.appendSlice(a, R) catch {};
+                    modal_lines.appendSlice(a, "\n") catch {};
+                    modal_lines.appendSlice(a, "│  ") catch {};
+                    modal_lines.appendSlice(a, Pal.fg_dim) catch {};
+                    const arg_view = if (call.arguments.len > 50) call.arguments[0..50] else call.arguments;
+                    modal_lines.appendSlice(a, arg_view) catch {};
+                    modal_lines.appendSlice(a, R) catch {};
+                    modal_lines.appendSlice(a, "\n") catch {};
+                    modal_lines.appendSlice(a, "│  [1] Allow   [2] Deny   [Enter/Esc]\n") catch {};
+                    modal_lines.appendSlice(a, "└───────────────────────────────┘\n") catch {};
+                    const modal_text = modal_lines.toOwnedSlice(a) catch "";
+                    defer a.free(modal_text);
+                    const mw = zz.layout.measure.maxLineWidth(modal_text);
+                    const mh = zz.layout.measure.height(modal_text);
+                    const mx = (w -| @as(u16, @intCast(mw))) / 2;
+                    const my = (h -| @as(u16, @intCast(mh))) / 2;
+                    const overlaid = ansiOverlay(a, result, modal_text, mx, my) catch result;
+                    if (overlaid.ptr != result.ptr) {
+                        a.free(result);
+                        result = overlaid;
+                    }
+                }
             }
         }
 

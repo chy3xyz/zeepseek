@@ -32,6 +32,7 @@ const ContextManager = @import("../dispatch/context_manager.zig").ContextManager
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
 const reasonix_mod = @import("../cache/reasonix.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
+const memory_mod = @import("../cache/memory.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
 
 const join = zz.join;
@@ -737,6 +738,8 @@ pub const App = struct {
     history_edit_idx: ?usize = null,
     run_mode: RunMode = .auto,
     tool_fail_streak: u32 = 0,
+    memory: ?*memory_mod.Memory = null,
+    memory_alloc: ?std.mem.Allocator = null,
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -854,6 +857,20 @@ pub const App = struct {
 
 
         self.git_worker = g_git_worker;
+
+        // Long-term BM25 memory (~/.zeepseek/memory.md).
+        const mem = ctx.allocator.create(memory_mod.Memory) catch null;
+        if (mem) |m| {
+            m.* = memory_mod.Memory.init(ctx.allocator);
+            var mem_path_buf: [512:0]u8 = undefined;
+            if (std.c.getenv("HOME")) |home_z| {
+                const home = std.mem.sliceTo(home_z, 0);
+                _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
+                m.load(&mem_path_buf);
+            }
+            self.memory = m;
+            self.memory_alloc = ctx.allocator;
+        }
 
         // Initialize sandbox for tool approval. Platform-level sandboxing
         // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
@@ -994,6 +1011,12 @@ pub const App = struct {
         if (self.git_worker) |gw| {
             _ = std.c.close(gw.stdin_fd);
             self.git_worker = null;
+        }
+
+        if (self.memory) |mem| {
+            mem.deinit();
+            if (self.memory_alloc) |ma| ma.destroy(mem);
+            self.memory = null;
         }
     }
 
@@ -1335,6 +1358,34 @@ pub const App = struct {
             return;
         }
 
+        // /memory <fact>: add a long-term fact; /memory recall <q>: show matches.
+        if (std.mem.startsWith(u8, text_slice, "/memory")) {
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            const arg = std.mem.trim(u8, text_slice["/memory".len..], " ");
+            if (std.mem.startsWith(u8, arg, "recall ")) {
+                const q = std.mem.trim(u8, arg["recall ".len..], " ");
+                if (self.memory) |mem| {
+                    const recalled = mem.recall(q, 4, 1200);
+                    defer self.alloc.free(recalled);
+                    self.setNotification(if (recalled.len > 0) recalled else "No memory matches");
+                }
+            } else if (arg.len > 0) {
+                if (self.memory) |mem| {
+                    var mem_path_buf: [512:0]u8 = undefined;
+                    if (std.c.getenv("HOME")) |home_z| {
+                        const home = std.mem.sliceTo(home_z, 0);
+                        _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
+                        mem.add(&mem_path_buf, arg);
+                        self.setNotification("Memory saved");
+                    }
+                }
+            } else {
+                self.setNotification("Usage: /memory <fact> | /memory recall <query>");
+            }
+            return;
+        }
+
         // /mode auto|plan|yolo: switch tool execution mode.
         if (std.mem.startsWith(u8, text_slice, "/mode")) {
             self.text_input.setValue("") catch {};
@@ -1504,6 +1555,18 @@ pub const App = struct {
 
         // Start streaming if API key is available
         if (self.api_key.len > 0) {
+            // Long-term memory footnote: BM25-recall facts relevant to the
+            // prompt, appended as low-authority context (bounded).
+            var mem_footnote: []const u8 = "";
+            if (self.memory) |mem| {
+                const recalled = mem.recall(text, 2, 800);
+                if (recalled.len > 0) {
+                    mem_footnote = std.fmt.allocPrint(self.alloc, "\n\nRelevant long-term facts (user-provided, verify before relying):\n{s}", .{recalled}) catch "";
+                }
+                self.alloc.free(recalled);
+            }
+            defer if (mem_footnote.len > 0) self.alloc.free(mem_footnote);
+
             var git_ctx_owned: []const u8 = "";
             if (self.git_worker) |*gw| {
                 if (std.c.getenv("PWD")) |pwd_z| {
@@ -1523,7 +1586,13 @@ pub const App = struct {
                     }
                 }
             }
-            self.startStreaming(text, git_ctx_owned);
+            var combined_ctx = git_ctx_owned;
+            defer if (combined_ctx.ptr != git_ctx_owned.ptr and combined_ctx.len > 0) self.alloc.free(combined_ctx);
+            if (mem_footnote.len > 0) {
+                const c2 = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ git_ctx_owned, mem_footnote }) catch git_ctx_owned;
+                combined_ctx = c2;
+            }
+            self.startStreaming(text, combined_ctx);
         } else {
             // No API key — placeholder
             self.messages.append(self.alloc, .{

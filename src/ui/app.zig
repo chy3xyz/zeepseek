@@ -714,6 +714,10 @@ pub const App = struct {
     // --- Context compaction (background LLM summarization)
     compact_run: ?*CompactRun = null,
 
+    // --- Semantic cache (reasonix): exact-prompt reuse for self-contained queries
+    reasonix: ?*reasonix_mod.Reasonix = null,
+    reasonix_alloc: ?std.mem.Allocator = null,
+
     // --- Session state
     session_id: []const u8,
     session_id_alloc: ?std.mem.Allocator = null,
@@ -815,6 +819,16 @@ pub const App = struct {
         };
         // Try loading saved API key from disk
         self.loadSavedApiKey();
+
+        // Semantic cache (exact-prompt reuse; conservative, see submit()).
+        // Use page_allocator: the app's persistent allocator may return
+        // under-aligned memory that trips 0.17's HashMap header alignment.
+        const rx = std.heap.page_allocator.create(reasonix_mod.Reasonix) catch null;
+        if (rx) |r| {
+            r.* = reasonix_mod.Reasonix.init(std.heap.page_allocator, .{});
+            self.reasonix = r;
+            self.reasonix_alloc = std.heap.page_allocator;
+        }
 
         // Initialize sandbox for tool approval. Platform-level sandboxing
         // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
@@ -945,6 +959,11 @@ pub const App = struct {
             self.sandbox = null;
         }
 
+        if (self.reasonix) |rx| {
+            rx.deinit();
+            if (self.reasonix_alloc) |a| a.destroy(rx);
+            self.reasonix = null;
+        }
     }
 
     fn textInputAppend(self: *App, bytes: []const u8) void {
@@ -1221,6 +1240,40 @@ pub const App = struct {
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;
             return;
+        }
+
+        // Semantic cache hit: self-contained query (>= 15 chars) in a simple
+        // conversation (<= 2 messages) with an exact-prompt cached reply is
+        // served instantly instead of calling the API.
+        if (text_slice.len >= 15 and self.messages.items.len <= 2) {
+            if (self.reasonix) |rx| {
+                if (rx.get(text_slice)) |cached| {
+                    const user_owned = self.alloc.dupe(u8, text_slice) catch null;
+                    const asst_owned = std.fmt.allocPrint(self.alloc, "{s} ⚡cached", .{cached}) catch null;
+                    if (user_owned != null and asst_owned != null) {
+                        self.messages.append(self.alloc, .{
+                            .role = .user, .content = user_owned.?, .timestamp = 0, .owns = true,
+                        }) catch {
+                            self.alloc.free(user_owned.?);
+                            self.alloc.free(asst_owned.?);
+                            return;
+                        };
+                        self.messages.append(self.alloc, .{
+                            .role = .assistant, .content = asst_owned.?, .timestamp = 0, .owns = true,
+                        }) catch {
+                            self.alloc.free(asst_owned.?);
+                            return;
+                        };
+                        self.text_input.setValue("") catch {};
+                        self.text_input.cursor = 0;
+                        self.auto_scroll = true;
+                        self.setNotification("⚡ served from semantic cache");
+                        return;
+                    }
+                    if (user_owned) |u| self.alloc.free(u);
+                    if (asst_owned) |a| self.alloc.free(a);
+                }
+            }
         }
 
         // Guard: sending a new message while the previous response is still
@@ -1755,6 +1808,18 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     }
 
     fn onStreamDone(self: *App) void {
+        // Cache successful (non-tool) replies for exact-prompt reuse.
+        if (self.reasonix) |rx| {
+            if (self.streaming_idx) |si| {
+                if (si > 0 and si < self.messages.items.len) {
+                    const user_msg = self.messages.items[si - 1];
+                    const asst_msg = self.messages.items[si];
+                    if (user_msg.role == .user and user_msg.content.len >= 15 and asst_msg.content.len > 0) {
+                        rx.put(user_msg.content, asst_msg.content) catch {};
+                    }
+                }
+            }
+        }
         if (self.streaming_idx) |idx| {
             if (idx < self.messages.items.len) {
                 self.messages.items[idx].status = .complete;

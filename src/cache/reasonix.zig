@@ -133,6 +133,28 @@ pub const Reasonix = struct {
     }
 
     pub fn initWithConfig(allocator: std.mem.Allocator, config: ReasonixConfig) Self {
+        // Pre-allocate the hot/cold HashMaps so empty-cache access doesn't
+        // trip 0.17's alignment assert on null metadata.
+        var self: Self = .{
+            .arena = std.heap.ArenaAllocator.init(allocator),
+            .hot = std.StringHashMap(*Entry).init(allocator),
+            .cold = std.StringHashMap(*Entry).init(allocator),
+            .lirs_stack = std.ArrayList([]const u8).empty,
+            .lirs_s = std.ArrayList([]const u8).empty,
+            .lirs_h = std.ArrayList([]const u8).empty,
+            .config = config,
+            .hot_stats = .{},
+            .cold_stats = .{},
+            .semantic_history = std.ArrayList(SemanticEntry).empty,
+            .clock = 0,
+            .time_fn = &defaultTimeFn,
+        };
+        self.hot.ensureTotalCapacity(4) catch {};
+        self.cold.ensureTotalCapacity(4) catch {};
+        return self;
+    }
+
+    pub fn initWithConfigOld(allocator: std.mem.Allocator, config: ReasonixConfig) Self {
         return .{
             .arena = std.heap.ArenaAllocator.init(allocator),
             .hot = std.StringHashMap(*Entry).init(allocator),
@@ -185,9 +207,6 @@ pub const Reasonix = struct {
     }
 
     pub fn get(self: *Self, key: []const u8) ?[]const u8 {
-        // Empty-cache guard: querying an unpopulated HashMap trips an
-        // alignment assert in 0.17's StringHashMap when metadata is null.
-        if (self.hot.metadata == null and self.cold.metadata == null) return null;
         if (self.hot.get(key)) |entry| {
             if (self.isExpired(entry)) {
                 self.evictEntry(entry, true);

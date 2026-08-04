@@ -94,8 +94,8 @@ pub const McpSession = struct {
     }
 
     pub fn deinit(self: *McpSession) void {
-        _ = posix.close(self.stdin_fd);
-        _ = posix.close(self.stdout_fd);
+        _ = std.c.close(self.stdin_fd);
+        _ = std.c.close(self.stdout_fd);
         _ = posix.kill(self.child_pid, posix.SIG.KILL) catch {};
     }
 };

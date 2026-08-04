@@ -31,6 +31,7 @@ const session_manager = @import("../storage/session_manager.zig");
 const ContextManager = @import("../dispatch/context_manager.zig").ContextManager;
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
 const reasonix_mod = @import("../cache/reasonix.zig");
+const tokenizer_mod = @import("../utils/tokenizer.zig");
 
 const join = zz.join;
 
@@ -943,6 +944,7 @@ pub const App = struct {
             sb.deinit();
             self.sandbox = null;
         }
+
     }
 
     fn textInputAppend(self: *App, bytes: []const u8) void {
@@ -1257,6 +1259,20 @@ pub const App = struct {
         }
     }
 
+    /// Keep the tail of the conversation that fits within `budget` tokens.
+    fn foldTailBudget(self: *const App, msg_count: usize, budget: usize) usize {
+        var start = msg_count;
+        var remaining = budget;
+        var i = msg_count;
+        while (i > 0) : (i -= 1) {
+            const t = tokenizer_mod.Tokenizer.count(self.messages.items[i - 1].content);
+            if (t > remaining) break;
+            remaining -= t;
+            start = i - 1;
+        }
+        return start;
+    }
+
     fn startStreaming(self: *App, user_input: []const u8) void {
         // Join the previous thread first: it may still be pushing into ss.
         if (self.stream_thread) |t| t.join();
@@ -1292,7 +1308,21 @@ pub const App = struct {
         var ctx_items = std.ArrayList(stream_client_mod.CtxItem).empty;
         defer ctx_items.deinit(self.alloc);
         const msg_count = self.messages.items.len - 1; // exclude the empty assistant msg
-        const start: usize = if (msg_count > 20) msg_count - 20 else 0;
+        // Token-budget aware context window via reasonix's fold decision,
+        // instead of a hardcoded last-20-messages slice.
+        var start: usize = 0;
+        if (msg_count > 0) {
+            var total_tokens: usize = 0;
+            for (self.messages.items[0..msg_count]) |m| total_tokens += tokenizer_mod.Tokenizer.count(m.content);
+            const decision = reasonix_mod.Reasonix.decideAfterUsage(total_tokens, @intCast(self.ctx_max), false);
+            switch (decision) {
+                .none => start = 0,
+                .fold_normal => |fd| start = self.foldTailBudget(msg_count, fd.tail_budget),
+                .fold_aggressive => |fd| start = self.foldTailBudget(msg_count, fd.tail_budget),
+                .exit_with_summary => start = if (msg_count > 6) msg_count - 6 else 0,
+                .emergency_truncate => |et| start = self.foldTailBudget(msg_count, et.target_tokens),
+            }
+        }
         for (self.messages.items[start..msg_count]) |m| {
             const role_str: []const u8 = switch (m.role) {
                 .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",

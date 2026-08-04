@@ -185,6 +185,9 @@ pub const Reasonix = struct {
     }
 
     pub fn get(self: *Self, key: []const u8) ?[]const u8 {
+        // Empty-cache guard: querying an unpopulated HashMap trips an
+        // alignment assert in 0.17's StringHashMap when metadata is null.
+        if (self.hot.metadata == null and self.cold.metadata == null) return null;
         if (self.hot.get(key)) |entry| {
             if (self.isExpired(entry)) {
                 self.evictEntry(entry, true);
@@ -239,7 +242,7 @@ pub const Reasonix = struct {
         errdefer alloc.destroy(entry);
 
         const tokens = tokenizer_mod.Tokenizer.count(value);
-        const now = self.time_fn.*;
+        const now = self.time_fn();
 
         entry.* = .{
             .key = key_copy,
@@ -253,7 +256,7 @@ pub const Reasonix = struct {
 
         try self.lirsStackPush(key_copy);
 
-        if (self.hot.getSize() >= self.config.max_hot_size) {
+        if (self.hot.count() >= self.config.max_hot_size) {
             try self.lirsEvict();
         }
 
@@ -510,21 +513,36 @@ pub const Reasonix = struct {
         _ = self;
         if (tokens_a == 0 or tokens_b == 0) return 0.0;
 
-        var shared: usize = 0;
-        var i_a: usize = 0;
-        while (i_a < a.len) : (i_a += 1) {
-            const byte_a = a[i_a];
-            for (b) |byte_b| {
-                if (byte_a == byte_b) {
-                    shared += 1;
-                    break;
-                }
+        // O(n) byte-set Jaccard similarity (replaces the previous O(n^2)
+        // per-byte scan that got slow on long code/text inputs).
+        var a_set = std.mem.zeroes([256]bool);
+        var b_set = std.mem.zeroes([256]bool);
+        var a_unique: usize = 0;
+        var b_unique: usize = 0;
+        for (a) |ba| {
+            if (!a_set[ba]) {
+                a_set[ba] = true;
+                a_unique += 1;
             }
         }
+        for (b) |bb| {
+            if (!b_set[bb]) {
+                b_set[bb] = true;
+                b_unique += 1;
+            }
+        }
+        var shared: usize = 0;
+        for (0..256) |i| {
+            if (a_set[i] and b_set[i]) shared += 1;
+        }
+        const union_size = a_unique + b_unique - shared;
+        const char_sim: f64 = if (union_size == 0)
+            0.0
+        else
+            @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(union_size));
 
         const max_tokens = @max(tokens_a, tokens_b);
         const token_sim = 1.0 - (@as(f64, @floatFromInt(@abs(tokens_a - tokens_b))) / @as(f64, @floatFromInt(max_tokens)));
-        const char_sim = @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(@max(a.len, b.len)));
 
         return (token_sim * 0.6 + char_sim * 0.4);
     }

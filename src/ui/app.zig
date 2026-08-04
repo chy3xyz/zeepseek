@@ -862,15 +862,29 @@ pub const App = struct {
 
         self.git_worker = g_git_worker;
 
-        // Skill registry: DISABLED — even ArrayList storage segfaults on
-        // list() at runtime (arena/allocator lifetime issue inside the app).
-        // Needs a dedicated storage-lifetime debug before re-enabling.
-        // self.skill_registry stays null; /skills reports not enabled.
+        // Skill registry with built-in skills. Uses page_allocator storage
+        // (stable in-app, same pattern as the semantic cache) — the app's
+        // persistent allocator invalidates the arena at runtime.
+        const sr = std.heap.page_allocator.create(skills_registry.SkillRegistry) catch null;
+        if (sr) |reg| {
+            if (skills_registry.SkillRegistry.init(std.heap.page_allocator)) |reg_init| {
+                reg.* = reg_init;
+                self.skill_registry = reg;
+                self.skill_registry_alloc = std.heap.page_allocator;
+                var builtin = skills_builtin.BuiltinSkills{};
+                const built = builtin.loadAll(std.heap.page_allocator) catch null;
+                if (built) |bskills| {
+                    for (bskills) |*bs| reg.registerSkill(bs) catch {};
+                }
+            } else |_| {
+                std.heap.page_allocator.destroy(reg);
+            }
+        }
 
         // Long-term BM25 memory (~/.zeepseek/memory.md).
-        const mem = ctx.allocator.create(memory_mod.Memory) catch null;
+        const mem = std.heap.page_allocator.create(memory_mod.Memory) catch null;
         if (mem) |m| {
-            m.* = memory_mod.Memory.init(ctx.allocator);
+            m.* = memory_mod.Memory.init(std.heap.page_allocator);
             var mem_path_buf: [512:0]u8 = undefined;
             if (std.c.getenv("HOME")) |home_z| {
                 const home = std.mem.sliceTo(home_z, 0);
@@ -878,7 +892,7 @@ pub const App = struct {
                 m.load(&mem_path_buf);
             }
             self.memory = m;
-            self.memory_alloc = ctx.allocator;
+            self.memory_alloc = std.heap.page_allocator;
         }
 
         // Initialize sandbox for tool approval. Platform-level sandboxing
@@ -1432,7 +1446,15 @@ pub const App = struct {
                     self.setNotification(if (recalled.len > 0) recalled else "No memory matches");
                 }
             } else if (arg.len > 0) {
-                self.setNotification("Memory add disabled (storage layer WIP)");
+                if (self.memory) |mem| {
+                    var mem_path_buf: [512:0]u8 = undefined;
+                    if (std.c.getenv("HOME")) |home_z| {
+                        const home = std.mem.sliceTo(home_z, 0);
+                        _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
+                        mem.add(&mem_path_buf, arg);
+                        self.setNotification("Memory saved");
+                    }
+                }
             } else {
                 self.setNotification("Usage: /memory <fact> | /memory recall <query>");
             }

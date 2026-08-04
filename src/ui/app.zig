@@ -1292,6 +1292,33 @@ pub const App = struct {
                     }
                     if (user_owned) |u| self.alloc.free(u);
                     if (asst_owned) |a| self.alloc.free(a);
+                } else if (rx.findSemanticMatch(text_slice, 0.85)) |sm| {
+                    // Conservative similar-query hit: mark it so the user can
+                    // judge whether the cached reply really matches.
+                    const user_owned = self.alloc.dupe(u8, text_slice) catch null;
+                    const asst_owned = std.fmt.allocPrint(self.alloc, "{s} ⚡similar ({d:.0}%)", .{ sm.value, sm.similarity * 100.0 }) catch null;
+                    if (user_owned != null and asst_owned != null) {
+                        self.messages.append(self.alloc, .{
+                            .role = .user, .content = user_owned.?, .timestamp = 0, .owns = true,
+                        }) catch {
+                            self.alloc.free(user_owned.?);
+                            self.alloc.free(asst_owned.?);
+                            return;
+                        };
+                        self.messages.append(self.alloc, .{
+                            .role = .assistant, .content = asst_owned.?, .timestamp = 0, .owns = true,
+                        }) catch {
+                            self.alloc.free(asst_owned.?);
+                            return;
+                        };
+                        self.text_input.setValue("") catch {};
+                        self.text_input.cursor = 0;
+                        self.auto_scroll = true;
+                        self.setNotification("⚡ similar cached reply");
+                        return;
+                    }
+                    if (user_owned) |u| self.alloc.free(u);
+                    if (asst_owned) |a| self.alloc.free(a);
                 }
             }
         }

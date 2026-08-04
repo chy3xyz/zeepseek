@@ -719,6 +719,7 @@ pub const App = struct {
     reasonix: ?*reasonix_mod.Reasonix = null,
     reasonix_alloc: ?std.mem.Allocator = null,
     compact_hinted: bool = false,
+    cleanup_tick: u32 = 0,
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -1041,6 +1042,12 @@ pub const App = struct {
             .load_session => |path| self.loadSession(path),
             .tick => |t| {
                 self.cursor_visible = (t.timestamp / 500_000_000) % 2 == 0; // blink every 500ms
+                // Periodic reasonix TTL cleanup (~every 5s at 60fps).
+                self.cleanup_tick += 1;
+                if (self.cleanup_tick >= 300) {
+                    self.cleanup_tick = 0;
+                    if (self.reasonix) |rx| rx.cleanupExpired();
+                }
                 self.pollStream();
                 self.pollSubAgents();
                 self.pollCompact();
@@ -1339,6 +1346,12 @@ pub const App = struct {
                 .status = .complete,
             }) catch {};
         }
+    }
+
+    /// Real semantic-cache hit rate from reasonix (falls back to 0).
+    fn cacheHitRate(self: *const App) f64 {
+        if (self.reasonix) |rx| return rx.hitRate();
+        return 0;
     }
 
     /// Keep the tail of the conversation that fits within `budget` tokens.
@@ -2970,7 +2983,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         right_buf.appendSlice(a, " cache ") catch {};
         right_buf.appendSlice(a, R) catch {};
         right_buf.appendSlice(a, Pal.cyan) catch {};
-        appendFmtFn(&right_buf, a, "{d:.0}%", .{self.cache_hit_rate * 100.0});
+        appendFmtFn(&right_buf, a, "{d:.0}%", .{self.cacheHitRate() * 100.0});
         right_buf.appendSlice(a, R) catch {};
         if (streaming) {
             right_buf.appendSlice(a, " ") catch {};
@@ -3296,7 +3309,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         defer lines.deinit(a);
 
         const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-        const cache_pct: f64 = self.cache_hit_rate * 100.0;
+        const cache_pct: f64 = self.cacheHitRate() * 100.0;
         const streaming = self.streaming_idx != null;
 
         const rows = [_]struct { label: []const u8, value: []const u8, color: []const u8 }{

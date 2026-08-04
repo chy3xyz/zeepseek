@@ -1586,9 +1586,16 @@ pub const App = struct {
                 .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
             };
             const content = self.alloc.dupe(u8, m.content) catch continue;
+            // Snip oversized tool outputs (Reasonix compact pipeline borrow):
+            // keep a bounded tail so stale command dumps don't burn tokens.
+            var final_content = content;
+            defer if (final_content.ptr != content.ptr) self.alloc.free(final_content);
+            if (m.role == .tool and content.len > 400) {
+                final_content = std.fmt.allocPrint(self.alloc, "{s}\n…[tool output truncated ({d} bytes)]", .{ content[0..400], content.len }) catch content;
+            }
             ctx_items.append(self.alloc, .{
                 .role = role_str,
-                .content = content,
+                .content = final_content,
                 .tool_call_id = if (m.role == .tool) m.tool_call_id else "",
             }) catch {
                 self.alloc.free(content);

@@ -1042,6 +1042,12 @@ pub const App = struct {
             self.git_worker = null;
         }
 
+        if (self.mcp_session) |*sess| {
+            sess.deinit();
+            self.mcp_session = null;
+        }
+        self.mcp_servers.deinit(self.alloc);
+
         if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
         if (self.skill_registry) |reg| {
             reg.deinit();

@@ -37,10 +37,19 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-/// Parses a command line into (cwd, git argv). Returns null on malformed
-/// input (empty cwd).
-fn splitCommand(cmd_line: []const u8) ?struct { cwd: []const u8, args: []const []const u8 } {
+const CommandType = enum { git, shell };
+
+/// Parses a command line "type\x1fcwd\x1farg1\x1f..." into (kind, cwd,
+/// args). Returns null on malformed input.
+fn splitCommand(cmd_line: []const u8) ?struct { kind: CommandType, cwd: []const u8, args: []const []const u8 } {
     var fields = std.mem.splitScalar(u8, cmd_line, 0x1f);
+    const kind_str = fields.next() orelse return null;
+    const kind: CommandType = if (std.mem.eql(u8, kind_str, "git"))
+        .git
+    else if (std.mem.eql(u8, kind_str, "shell"))
+        .shell
+    else
+        return null;
     const cwd = fields.next() orelse return null;
     if (cwd.len == 0) return null;
     var args = std.ArrayList([]const u8).empty;
@@ -48,7 +57,7 @@ fn splitCommand(cmd_line: []const u8) ?struct { cwd: []const u8, args: []const [
     while (fields.next()) |f| {
         if (f.len > 0) args.append(std.heap.page_allocator, f) catch return null;
     }
-    return .{ .cwd = cwd, .args = args.toOwnedSlice(std.heap.page_allocator) catch return null };
+    return .{ .kind = kind, .cwd = cwd, .args = args.toOwnedSlice(std.heap.page_allocator) catch return null };
 }
 
 fn handleCommand(io: std.Io, cmd_line: []const u8) void {
@@ -60,8 +69,19 @@ fn handleCommand(io: std.Io, cmd_line: []const u8) void {
     const cwd = parsed.cwd;
     var argv = std.ArrayList([]const u8).empty;
     defer argv.deinit(std.heap.page_allocator);
-    argv.append(std.heap.page_allocator, "git") catch return;
-    for (parsed.args) |f| argv.append(std.heap.page_allocator, f) catch return;
+    switch (parsed.kind) {
+        .git => {
+            argv.append(std.heap.page_allocator, "git") catch return;
+            for (parsed.args) |f| argv.append(std.heap.page_allocator, f) catch return;
+        },
+        .shell => {
+            // /bin/sh -c "<cmd>" (the command string is a single arg; the
+            // dangerous-command blacklist already ran on the app side).
+            argv.append(std.heap.page_allocator, "/bin/sh") catch return;
+            argv.append(std.heap.page_allocator, "-c") catch return;
+            if (parsed.args.len > 0) argv.append(std.heap.page_allocator, parsed.args[0]) catch return;
+        },
+    }
     // Exec git directly with argv (no shell interpolation), which removes
     // the injection surface (quotes/;/$ in args are passed verbatim).
     var child = std.process.spawn(io, .{
@@ -74,18 +94,34 @@ fn handleCommand(io: std.Io, cmd_line: []const u8) void {
         writeResponse("err", "failed to spawn git");
         return;
     };
-    defer _ = child.wait(io) catch {};
+    defer {
+        if (child.id != null) _ = child.wait(io) catch {};
+    }
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.heap.page_allocator);
+    var timed_out = false;
     if (child.stdout) |sout| {
         var buf: [4096]u8 = undefined;
         while (true) {
+            // Bound each read by a poll so a hung command is killed instead
+            // of blocking the pipe forever (worker is single-threaded).
+            var fds = [_]std.posix.pollfd{.{ .fd = sout.handle, .events = std.posix.POLL.IN, .revents = 0 }};
+            const pr = std.posix.poll(&fds, 30_000) catch break;
+            if (pr == 0) {
+                child.kill(io);
+                timed_out = true;
+                break;
+            }
             const n: usize = @intCast(std.c.read(sout.handle, &buf, buf.len));
             if (n == 0) break;
             out.appendSlice(std.heap.page_allocator, buf[0..n]) catch break;
         }
         // wait()'s childCleanupPosix closes the pipes; no manual close.
+    }
+    if (timed_out) {
+        writeResponse("err", "timed out after 30s");
+        return;
     }
     writeResponse("ok", out.items);
 }
@@ -132,6 +168,7 @@ pub const Client = struct {
     pub fn runGit(self: *Client, alloc: std.mem.Allocator, cwd: []const u8, args: []const []const u8) ?[]const u8 {
         var cmd = std.ArrayList(u8).empty;
         defer cmd.deinit(alloc);
+        cmd.appendSlice(alloc, "git\x1f") catch return null;
         cmd.appendSlice(alloc, cwd) catch return null;
         for (args) |a| {
             cmd.append(alloc, 0x1f) catch return null;
@@ -177,6 +214,57 @@ pub const Client = struct {
         return out;
     }
 
+    /// Runs a shell command in `cwd` through the worker (30s timeout, kill
+    /// on hang). Returns an owned output string or null on failure.
+    pub fn runShell(self: *Client, alloc: std.mem.Allocator, cwd: []const u8, cmd: []const u8) ?[]const u8 {
+        var cmd_buf = std.ArrayList(u8).empty;
+        defer cmd_buf.deinit(alloc);
+        cmd_buf.appendSlice(alloc, "shell\x1f") catch return null;
+        cmd_buf.appendSlice(alloc, cwd) catch return null;
+        cmd_buf.append(alloc, 0x1f) catch return null;
+        cmd_buf.appendSlice(alloc, cmd) catch return null;
+        cmd_buf.append(alloc, '\n') catch return null;
+
+        var off: usize = 0;
+        while (off < cmd_buf.items.len) {
+            const n = std.c.write(self.stdin_fd, cmd_buf.items.ptr + off, cmd_buf.items.len - off);
+            if (n <= 0) return null;
+            off += @intCast(n);
+        }
+        return self.readResponse(alloc);
+    }
+
+    fn readResponse(self: *Client, alloc: std.mem.Allocator) ?[]const u8 {
+        var header: [64]u8 = undefined;
+        var hlen: usize = 0;
+        while (hlen < header.len) : (hlen += 1) {
+            const n = readWithTimeout(self.stdout_fd, header[hlen..][0..1], 30_000) orelse return null;
+            if (n == 0) return null;
+            if (header[hlen] == '\n') break;
+        }
+        const header_line = header[0..hlen];
+        var fields = std.mem.splitScalar(u8, header_line, 0x1f);
+        _ = fields.next() orelse return null; // status
+        const len_str = fields.next() orelse return null;
+        const payload_len = std.fmt.parseInt(usize, len_str, 10) catch return null;
+        if (payload_len == 0) return alloc.dupe(u8, "") catch null;
+
+        const out = alloc.alloc(u8, payload_len) catch return null;
+        var got: usize = 0;
+        while (got < payload_len) {
+            const n = readWithTimeout(self.stdout_fd, out[got..payload_len], 30_000) orelse {
+                alloc.free(out);
+                return null;
+            };
+            if (n == 0) {
+                alloc.free(out);
+                return null;
+            }
+            got += n;
+        }
+        return out;
+    }
+
     /// Blocking read bounded by a poll timeout so a hung git never blocks
     /// the UI thread indefinitely.
     fn readWithTimeout(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) ?usize {
@@ -189,10 +277,11 @@ pub const Client = struct {
     }
 };
 
-test "splitCommand parses cwd and args" {
+test "splitCommand parses git command" {
     _ = std.testing.allocator;
-    const parsed = splitCommand("/repo\x1fstatus\x1f--short\x1f\x1f-diff") orelse return error.TestUnexpectedResult;
+    const parsed = splitCommand("git\x1f/repo\x1fstatus\x1f--short\x1f\x1f-diff") orelse return error.TestUnexpectedResult;
     defer std.heap.page_allocator.free(parsed.args);
+    try std.testing.expectEqual(CommandType.git, parsed.kind);
     try std.testing.expectEqualStrings("/repo", parsed.cwd);
     try std.testing.expectEqual(@as(usize, 3), parsed.args.len);
     try std.testing.expectEqualStrings("status", parsed.args[0]);
@@ -200,12 +289,23 @@ test "splitCommand parses cwd and args" {
     try std.testing.expectEqualStrings("-diff", parsed.args[2]);
 }
 
-test "splitCommand rejects empty cwd" {
-    try std.testing.expect(splitCommand("\x1fstatus") == null);
+test "splitCommand parses shell command" {
+    _ = std.testing.allocator;
+    const parsed = splitCommand("shell\x1f/tmp\x1fls -la") orelse return error.TestUnexpectedResult;
+    defer std.heap.page_allocator.free(parsed.args);
+    try std.testing.expectEqual(CommandType.shell, parsed.kind);
+    try std.testing.expectEqualStrings("/tmp", parsed.cwd);
+    try std.testing.expectEqual(@as(usize, 1), parsed.args.len);
+    try std.testing.expectEqualStrings("ls -la", parsed.args[0]);
+}
+
+test "splitCommand rejects unknown type or empty cwd" {
+    try std.testing.expect(splitCommand("foo\x1f/repo") == null);
+    try std.testing.expect(splitCommand("git\x1f") == null);
 }
 
 test "splitCommand accepts no args" {
-    const parsed = splitCommand("/repo") orelse return error.TestUnexpectedResult;
+    const parsed = splitCommand("git\x1f/repo") orelse return error.TestUnexpectedResult;
     defer std.heap.page_allocator.free(parsed.args);
     try std.testing.expectEqual(@as(usize, 0), parsed.args.len);
 }

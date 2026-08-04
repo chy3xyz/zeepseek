@@ -1738,6 +1738,15 @@ pub const App = struct {
                 if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
                     return self.toolErr("Error: blocked dangerous command ({s}). Prefer a direct command (e.g. 'ls' instead of 'sh -c \"ls\"')", .{p.description});
                 }
+                // Execute through the worker process (pipe I/O, 30s timeout,
+                // kill on hang) so a long-running command can never freeze
+                // the UI indefinitely.
+                if (self.git_worker) |*gw| {
+                    if (gw.runShell(self.alloc, cwd, cmd)) |out| {
+                        return out;
+                    }
+                    return self.toolErr("Error: shell execution failed or timed out", .{});
+                }
             }
         }
         if (std.mem.eql(u8, call.name, "file_read") or

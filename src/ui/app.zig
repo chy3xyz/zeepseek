@@ -2835,7 +2835,11 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         right_buf.appendSlice(a, D) catch {};
         right_buf.appendSlice(a, " ctx ") catch {};
         right_buf.appendSlice(a, R) catch {};
-        right_buf.appendSlice(a, if (ctx_pct > 70) Pal.red else Pal.green) catch {};
+        // Context water level, color-banded to reasonix fold thresholds
+        // (fold_warn 50 / aggressive 70 / exit 80): green <50, yellow 50-70,
+        // orange 70-80, red >80.
+        const ctx_color: []const u8 = if (ctx_pct > 80) Pal.red else if (ctx_pct > 70) Pal.orange else if (ctx_pct > 50) Pal.yellow else Pal.green;
+        right_buf.appendSlice(a, ctx_color) catch {};
         appendFmtFn(&right_buf, a, "{d:.0}%", .{ctx_pct});
         right_buf.appendSlice(a, R) catch {};
         right_buf.appendSlice(a, D) catch {};

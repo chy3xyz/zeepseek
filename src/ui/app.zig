@@ -1491,8 +1491,19 @@ pub const App = struct {
                 return;
             };
             defer self.alloc.free(resp);
-            info_buf.appendSlice(self.alloc, " init ok: ") catch {};
-            info_buf.appendSlice(self.alloc, resp[0..@min(resp.len, 120)]) catch {};
+            info_buf.appendSlice(self.alloc, " init ok\n") catch {};
+            defer self.alloc.free(resp);
+            const tl_req = mcp_client_mod.buildToolsList(self.alloc, 2) catch return;
+            defer self.alloc.free(tl_req);
+            const tl_resp = self.mcp_session.?.roundTrip(tl_req, 4000) catch |e| {
+                info_buf.appendSlice(self.alloc, " tools/list error: ") catch {};
+                info_buf.appendSlice(self.alloc, @errorName(e)) catch {};
+                self.setNotification(info_buf.items);
+                return;
+            };
+            defer self.alloc.free(tl_resp);
+            info_buf.appendSlice(self.alloc, "tools: ") catch {};
+            info_buf.appendSlice(self.alloc, tl_resp[0..@min(tl_resp.len, 400)]) catch {};
             self.setNotification(info_buf.items);
             return;
         }

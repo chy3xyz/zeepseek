@@ -3097,8 +3097,41 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         self.renderClaudeHeader(&header_buf, a, w);
         const header_text = header_buf.toOwnedSlice(a) catch return "";
 
-        // Build footer — separator line above input + input + status
+        // Build footer — command hint (when typing '/'), separator, input + status
         var footer_buf = std.ArrayList(u8).empty;
+        const input_val = self.text_input.getValue();
+        if (input_val.len >= 1 and input_val[0] == '/' and self.pending_tool == null) {
+            // Show matching slash commands above the input (bounded to 5).
+            const commands = [_]struct { []const u8, []const u8 }{
+                .{ "/save", "Save session" }, .{ "/load", "Load session" },
+                .{ "/sessions", "List sessions" }, .{ "/compact", "Summarize context" },
+                .{ "/clear", "Clear chat" }, .{ "/mode", "Tool mode auto|plan|yolo" },
+                .{ "/skill", "Activate a skill" }, .{ "/skills", "List skills" },
+                .{ "/memory", "Long-term memory" }, .{ "/copy", "Copy conversation" },
+                .{ "/rewind", "Go back one turn" }, .{ "/help", "Help" },
+                .{ "/model", "Set model" }, .{ "/apikey", "Set API key" },
+                .{ "/provider", "Switch provider" }, .{ "/subagent", "Spawn sub-agent" },
+                .{ "/quit", "Quit" },
+            };
+            var shown: usize = 0;
+            for (commands) |cmd| {
+                if (shown >= 5) break;
+                if (std.mem.startsWith(u8, cmd[0], input_val)) {
+                    footer_buf.appendSlice(a, D) catch {};
+                    footer_buf.appendSlice(a, "│ ") catch {};
+                    footer_buf.appendSlice(a, R) catch {};
+                    footer_buf.appendSlice(a, Pal.cyan) catch {};
+                    footer_buf.appendSlice(a, cmd[0]) catch {};
+                    footer_buf.appendSlice(a, R) catch {};
+                    footer_buf.appendSlice(a, Pal.fg_dim) catch {};
+                    footer_buf.appendSlice(a, "  ") catch {};
+                    footer_buf.appendSlice(a, cmd[1]) catch {};
+                    footer_buf.appendSlice(a, R) catch {};
+                    footer_buf.appendSlice(a, "\n") catch {};
+                    shown += 1;
+                }
+            }
+        }
         footer_buf.appendSlice(a, D) catch {};
         footer_buf.appendSlice(a, Pal.fg_dim) catch {};
         footer_buf.appendSlice(a, "├") catch {};
@@ -3526,8 +3559,15 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         defer if (input_view.ptr != "Error".ptr) a.free(input_view);
         const input_vis = zz.layout.measure.width(input_view);
         const max_input = if (w > 4) w - 4 else 0;
+        const input_with_cursor = blk: {
+            if (self.cursor_visible) {
+                break :blk std.fmt.allocPrint(a, "{s}|", .{input_view}) catch input_view;
+            }
+            break :blk input_view;
+        };
+        defer if (input_with_cursor.ptr != input_view.ptr and input_with_cursor.len > 0) a.free(input_with_cursor);
         const display_input = if (input_vis > max_input)
-            (ansiClip(a, input_view, max_input) catch input_view)
+            (ansiClip(a, input_with_cursor, max_input) catch input_with_cursor)
         else
             input_view;
         defer if (display_input.ptr != input_view.ptr) a.free(display_input);

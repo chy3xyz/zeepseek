@@ -20,13 +20,16 @@ Zeepseek is a TUI (terminal UI) application that lets you chat with DeepSeek's l
 - **Themes** — Ctrl+T cycles semantic color themes
 - **Streaming via own h2-over-TLS client** — no std.http chunked-EOF quirks;
   automatic fallback to the buffered path
+- **Auto git context** — workspace `git status` is attached to the system
+  prompt each turn via a dedicated worker process (no fork in the TUI loop)
 - **Single static binary** — No runtime dependencies
 
-> **Experimental (not wired into the runtime yet):** semantic cache
-> (`cache/reasonix`), the `agent/` scheduler, `skills/`, `acp/`, `rlm/`
-> (long-term memory), and the TurboDB `storage/session_manager`/`mmap_store`
-> layer. They compile and have unit tests, but are documented in
-> `docs/ARCHITECTURE.md` as isolated until integrated.
+> **Experimental (not wired into the runtime yet):** the `agent/` scheduler,
+> `skills/`, `acp/`, `rlm/` (long-term memory), and the TurboDB
+> `storage/session_manager`/`mmap_store` layer. They compile and have unit
+> tests, but are documented in `docs/ARCHITECTURE.md` as isolated until
+> integrated. `cache/reasonix` **is** wired in: token-budget context folding
+> and an exact-prompt semantic cache (⚡cached).
 
 ## Requirements
 

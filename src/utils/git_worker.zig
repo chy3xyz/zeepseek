@@ -16,7 +16,7 @@ const builtin = @import("builtin");
 const MAX_LINE: usize = 8192;
 
 pub fn main(init: std.process.Init) !void {
-    _ = init;
+    const io = init.io;
     var line_buf: [MAX_LINE]u8 = undefined;
     var line_len: usize = 0;
 
@@ -27,7 +27,7 @@ pub fn main(init: std.process.Init) !void {
         if (n <= 0) break;
         if (byte[0] == '\n') {
             if (line_len > 0) {
-                handleCommand(line_buf[0..line_len]);
+                handleCommand(io, line_buf[0..line_len]);
                 line_len = 0;
             }
         } else if (line_len < MAX_LINE) {
@@ -37,43 +37,55 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-fn handleCommand(cmd_line: []const u8) void {
-    // Split on \x1f: first field = cwd, rest = git argv.
+/// Parses a command line into (cwd, git argv). Returns null on malformed
+/// input (empty cwd).
+fn splitCommand(cmd_line: []const u8) ?struct { cwd: []const u8, args: []const []const u8 } {
     var fields = std.mem.splitScalar(u8, cmd_line, 0x1f);
-    const cwd = fields.next() orelse return;
+    const cwd = fields.next() orelse return null;
+    if (cwd.len == 0) return null;
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(std.heap.page_allocator);
     while (fields.next()) |f| {
-        if (f.len > 0) args.append(std.heap.page_allocator, f) catch return;
+        if (f.len > 0) args.append(std.heap.page_allocator, f) catch return null;
     }
-    // Build "cd <cwd> && git <args>" via popen (single-threaded here).
-    var cmd = std.ArrayList(u8).empty;
-    defer cmd.deinit(std.heap.page_allocator);
-    cmd.appendSlice(std.heap.page_allocator, "cd ") catch return;
-    cmd.appendSlice(std.heap.page_allocator, cwd) catch return;
-    cmd.appendSlice(std.heap.page_allocator, " && git") catch return;
-    for (args.items) |arg| {
-        cmd.append(std.heap.page_allocator, ' ') catch return;
-        cmd.append(std.heap.page_allocator, '\'') catch return;
-        cmd.appendSlice(std.heap.page_allocator, arg) catch return;
-        cmd.append(std.heap.page_allocator, '\'') catch return;
-    }
-    const cmd_z = std.heap.page_allocator.dupeSentinel(u8, cmd.items, 0) catch return;
-    defer std.heap.page_allocator.free(cmd_z);
+    return .{ .cwd = cwd, .args = args.toOwnedSlice(std.heap.page_allocator) catch return null };
+}
 
-    const fp = c.popen(cmd_z.ptr, "r") orelse {
+fn handleCommand(io: std.Io, cmd_line: []const u8) void {
+    const parsed = splitCommand(cmd_line) orelse {
+        writeResponse("err", "malformed command");
+        return;
+    };
+    defer std.heap.page_allocator.free(parsed.args);
+    const cwd = parsed.cwd;
+    var argv = std.ArrayList([]const u8).empty;
+    defer argv.deinit(std.heap.page_allocator);
+    argv.append(std.heap.page_allocator, "git") catch return;
+    for (parsed.args) |f| argv.append(std.heap.page_allocator, f) catch return;
+    // Exec git directly with argv (no shell interpolation), which removes
+    // the injection surface (quotes/;/$ in args are passed verbatim).
+    var child = std.process.spawn(io, .{
+        .argv = argv.items,
+        .cwd = .{ .path = cwd },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    }) catch {
         writeResponse("err", "failed to spawn git");
         return;
     };
-    defer _ = c.pclose(fp);
+    defer _ = child.wait(io) catch {};
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.heap.page_allocator);
-    var buf: [4096]u8 = undefined;
-    while (true) {
-        const r = c.fread(&buf, 1, buf.len, fp);
-        if (r == 0) break;
-        out.appendSlice(std.heap.page_allocator, buf[0..r]) catch break;
+    if (child.stdout) |sout| {
+        var buf: [4096]u8 = undefined;
+        while (true) {
+            const n: usize = @intCast(std.c.read(sout.handle, &buf, buf.len));
+            if (n == 0) break;
+            out.appendSlice(std.heap.page_allocator, buf[0..n]) catch break;
+        }
+        // wait()'s childCleanupPosix closes the pipes; no manual close.
     }
     writeResponse("ok", out.items);
 }
@@ -134,12 +146,12 @@ pub const Client = struct {
             off += @intCast(n);
         }
 
-        // Header: "status\x1f<len>\n" (byte at a time; short).
+        // Header: "status\x1f<len>\n" (byte at a time; short, poll-guarded).
         var header: [64]u8 = undefined;
         var hlen: usize = 0;
         while (hlen < header.len) : (hlen += 1) {
-            const n = std.c.read(self.stdout_fd, header[hlen..][0..1].ptr, 1);
-            if (n <= 0) return null;
+            const n = readWithTimeout(self.stdout_fd, header[hlen..][0..1], 5000) orelse return null;
+            if (n == 0) return null;
             if (header[hlen] == '\n') break;
         }
         const header_line = header[0..hlen];
@@ -152,13 +164,48 @@ pub const Client = struct {
         const out = alloc.alloc(u8, payload_len) catch return null;
         var got: usize = 0;
         while (got < payload_len) {
-            const n = std.c.read(self.stdout_fd, out.ptr + got, payload_len - got);
-            if (n <= 0) {
+            const n = readWithTimeout(self.stdout_fd, out[got..payload_len], 5000) orelse {
+                alloc.free(out);
+                return null;
+            };
+            if (n == 0) {
                 alloc.free(out);
                 return null;
             }
-            got += @intCast(n);
+            got += n;
         }
         return out;
     }
+
+    /// Blocking read bounded by a poll timeout so a hung git never blocks
+    /// the UI thread indefinitely.
+    fn readWithTimeout(fd: std.posix.fd_t, buf: []u8, timeout_ms: i32) ?usize {
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        const pr = std.posix.poll(&fds, timeout_ms) catch return null;
+        if (pr == 0) return null; // timeout
+        if ((fds[0].revents & (std.posix.POLL.IN | std.posix.POLL.HUP)) == 0) return null;
+        const n: usize = @intCast(std.c.read(fd, buf.ptr, buf.len));
+        return n;
+    }
 };
+
+test "splitCommand parses cwd and args" {
+    _ = std.testing.allocator;
+    const parsed = splitCommand("/repo\x1fstatus\x1f--short\x1f\x1f-diff") orelse return error.TestUnexpectedResult;
+    defer std.heap.page_allocator.free(parsed.args);
+    try std.testing.expectEqualStrings("/repo", parsed.cwd);
+    try std.testing.expectEqual(@as(usize, 3), parsed.args.len);
+    try std.testing.expectEqualStrings("status", parsed.args[0]);
+    try std.testing.expectEqualStrings("--short", parsed.args[1]);
+    try std.testing.expectEqualStrings("-diff", parsed.args[2]);
+}
+
+test "splitCommand rejects empty cwd" {
+    try std.testing.expect(splitCommand("\x1fstatus") == null);
+}
+
+test "splitCommand accepts no args" {
+    const parsed = splitCommand("/repo") orelse return error.TestUnexpectedResult;
+    defer std.heap.page_allocator.free(parsed.args);
+    try std.testing.expectEqual(@as(usize, 0), parsed.args.len);
+}

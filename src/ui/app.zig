@@ -1188,6 +1188,19 @@ pub const App = struct {
         }
 
         // --- Global Ctrl shortcuts
+        // Ctrl+Tab: cycle tool mode (auto -> plan -> yolo -> auto)
+        if (m.ctrl and k == .tab) {
+            self.run_mode = switch (self.run_mode) {
+                .auto => .plan,
+                .plan => .yolo,
+                .yolo => .auto,
+            };
+            const mode_msg = std.fmt.allocPrint(self.alloc, "Mode: {s}", .{@tagName(self.run_mode)}) catch "";
+            defer if (mode_msg.len > 0) self.alloc.free(mode_msg);
+            self.setNotification(mode_msg);
+            return .none;
+        }
+
         if (m.ctrl and k == .char) {
             switch (k.char) {
                 'y', 0x19 => {

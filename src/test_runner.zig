@@ -47,6 +47,7 @@ const _deepseek_client = @import("net/deepseek_client.zig");
 const _app = @import("ui/app.zig");
 const _slash_command_dispatcher = @import("ui/slash_command_dispatcher.zig");
 const mcp_client = @import("net/mcp_client.zig");
+const mcp_runner = @import("net/mcp_runner.zig");
 
 
 

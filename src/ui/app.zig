@@ -172,6 +172,14 @@ fn renderCodeBlockWithLineNums(
     if (count == 0) {
         buf.appendSlice(a, D) catch {};
         buf.appendSlice(a, "+---") catch {};
+        if (lang.len > 0) {
+            buf.appendSlice(a, " ") catch {};
+            buf.appendSlice(a, Pal.cyan) catch {};
+            buf.appendSlice(a, lang) catch {};
+            buf.appendSlice(a, R) catch {};
+            buf.appendSlice(a, D) catch {};
+        }
+        buf.appendSlice(a, " ---") catch {};
         buf.appendSlice(a, R) catch {};
         buf.appendSlice(a, "\n") catch {};
         return;
@@ -720,6 +728,7 @@ pub const App = struct {
     reasonix_alloc: ?std.mem.Allocator = null,
     compact_hinted: bool = false,
     cleanup_tick: u32 = 0,
+    git_changes: usize = 0,
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -1357,6 +1366,9 @@ pub const App = struct {
                     if (std.c.access(&dir_buf, 0) == 0) {
                         if (gw.runGit(self.alloc, pwd, &.{ "status", "--short" })) |out| {
                             defer self.alloc.free(out);
+                            // Count changed files for the sidebar indicator.
+                            const changes = std.mem.count(u8, out, "\n");
+                            if (out.len > 0) self.git_changes = changes;
                             if (out.len > 0 and out.len < 2000) {
                                 git_ctx_owned = std.fmt.allocPrint(self.alloc, "Git workspace status (use this when answering code/change questions):\n{s}", .{out}) catch "";
                             }
@@ -3282,6 +3294,12 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             }
 
             if (i + 1 < total) {
+                // Faint separator line between messages.
+                lines.appendSlice(a, "\n") catch {};
+                lines.appendSlice(a, D) catch {};
+                lines.appendSlice(a, Pal.fg_dim) catch {};
+                lines.appendSlice(a, "  ············································") catch {};
+                lines.appendSlice(a, R) catch {};
                 lines.appendSlice(a, "\n") catch {};
             }
         }
@@ -3313,6 +3331,18 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         lines.appendSlice(a, "  ") catch {};
         lines.appendSlice(a, D) catch {};
         lines.appendSlice(a, "Type a message to chat, or / for commands") catch {};
+        lines.appendSlice(a, R) catch {};
+        lines.appendSlice(a, "\n") catch {};
+        lines.appendSlice(a, D) catch {};
+        lines.appendSlice(a, "│") catch {};
+        lines.appendSlice(a, R) catch {};
+        lines.appendSlice(a, "\n") catch {};
+        lines.appendSlice(a, D) catch {};
+        lines.appendSlice(a, "│") catch {};
+        lines.appendSlice(a, R) catch {};
+        lines.appendSlice(a, "  ") catch {};
+        lines.appendSlice(a, Pal.fg_dim) catch {};
+        lines.appendSlice(a, "Ctrl+P palette   Ctrl+F search   Ctrl+S sub-agents   Ctrl+N thinking   / commands") catch {};
         lines.appendSlice(a, R) catch {};
         lines.appendSlice(a, "\n") catch {};
         lines.appendSlice(a, D) catch {};
@@ -3355,6 +3385,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             .{ .label = "turn", .value = "", .color = Pal.yellow },
             .{ .label = "context", .value = "", .color = if (ctx_pct > 70) Pal.red else Pal.green },
             .{ .label = "cache", .value = "", .color = Pal.cyan },
+            .{ .label = "git", .value = "", .color = if (self.git_changes > 0) Pal.yellow else Pal.fg_dim },
             .{ .label = "status", .value = if (streaming) "streaming" else "idle", .color = if (streaming) Pal.yellow else Pal.fg_dim },
         };
 
@@ -3382,6 +3413,11 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
                 const val: []const u8 = if (row.value.len > 0) row.value else val: {
                     if (std.mem.eql(u8, row.label, "turn")) {
                         break :val std.fmt.allocPrint(a, "{d}", .{self.turn}) catch "";
+                    } else if (std.mem.eql(u8, row.label, "git")) {
+                        break :val if (self.git_changes > 0)
+                            std.fmt.allocPrint(a, "{d} changed", .{self.git_changes}) catch ""
+                        else
+                            "clean";
                     } else if (std.mem.eql(u8, row.label, "context")) {
                         break :val std.fmt.allocPrint(a, "{d:.0}%", .{ctx_pct}) catch "";
                     } else if (std.mem.eql(u8, row.label, "cache")) {

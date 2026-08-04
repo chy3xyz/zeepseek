@@ -1185,6 +1185,23 @@ pub const App = struct {
         // --- Global Ctrl shortcuts
         if (m.ctrl and k == .char) {
             switch (k.char) {
+                'y' => {
+                    // Copy the last assistant message to the clipboard.
+                    var i = self.messages.items.len;
+                    while (i > 0) : (i -= 1) {
+                        if (self.messages.items[i - 1].role == .assistant and self.messages.items[i - 1].content.len > 0) {
+                            if (self.git_worker) |*gw| {
+                                if (gw.copy(self.messages.items[i - 1].content)) {
+                                    self.setNotification("Copied last reply to clipboard");
+                                } else {
+                                    self.setNotification("Copy failed");
+                                }
+                            }
+                            return .none;
+                        }
+                    }
+                    return .none;
+                },
                 'c' => { self.should_quit = true; return .none; },
                 'f' => { self.search_active = true; self.search_query.clearRetainingCapacity(); },
                 's' => { self.show_subagents = !self.show_subagents; },

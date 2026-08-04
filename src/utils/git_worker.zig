@@ -37,7 +37,7 @@ pub fn main(init: std.process.Init) !void {
     }
 }
 
-const CommandType = enum { git, shell };
+const CommandType = enum { git, shell, copy };
 
 /// Parses a command line "type\x1fcwd\x1farg1\x1f..." into (kind, cwd,
 /// args). Returns null on malformed input.
@@ -48,10 +48,12 @@ fn splitCommand(cmd_line: []const u8) ?struct { kind: CommandType, cwd: []const 
         .git
     else if (std.mem.eql(u8, kind_str, "shell"))
         .shell
+    else if (std.mem.eql(u8, kind_str, "copy"))
+        .copy
     else
         return null;
     const cwd = fields.next() orelse return null;
-    if (cwd.len == 0) return null;
+    if (cwd.len == 0 and kind != .copy) return null;
     var args = std.ArrayList([]const u8).empty;
     defer args.deinit(std.heap.page_allocator);
     while (fields.next()) |f| {
@@ -80,6 +82,31 @@ fn handleCommand(io: std.Io, cmd_line: []const u8) void {
             argv.append(std.heap.page_allocator, "/bin/sh") catch return;
             argv.append(std.heap.page_allocator, "-c") catch return;
             if (parsed.args.len > 0) argv.append(std.heap.page_allocator, parsed.args[0]) catch return;
+        },
+        .copy => {
+            // "copy\x1f<len>": the length is the second field (cwd slot).
+            const len_str = parsed.cwd;
+            const content_len = std.fmt.parseInt(usize, len_str, 10) catch {
+                writeResponse("err", "bad copy length");
+                return;
+            };
+            const content = std.heap.page_allocator.alloc(u8, content_len) catch {
+                writeResponse("err", "copy alloc failed");
+                return;
+            };
+            defer std.heap.page_allocator.free(content);
+            var got: usize = 0;
+            while (got < content_len) {
+                const n = std.c.read(0, content.ptr + got, content_len - got);
+                if (n <= 0) {
+                    writeResponse("err", "copy read failed");
+                    return;
+                }
+                got += @intCast(n);
+            }
+            writeResponse("ok", "");
+            _ = copyToClipboard(content);
+            return;
         },
     }
     // Exec git directly with argv (no shell interpolation), which removes
@@ -234,6 +261,38 @@ pub const Client = struct {
         return self.readResponse(alloc);
     }
 
+    /// Copies text to the system clipboard through the worker (pbcopy).
+    pub fn copy(self: *Client, content: []const u8) bool {
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(std.heap.page_allocator);
+        buf.appendSlice(std.heap.page_allocator, "copy\x1f") catch return false;
+        var len_buf: [24]u8 = undefined;
+        const len_str = std.fmt.bufPrint(&len_buf, "{d}", .{content.len}) catch return false;
+        buf.appendSlice(std.heap.page_allocator, len_str) catch return false;
+        buf.append(std.heap.page_allocator, '\n') catch return false;
+        var off: usize = 0;
+        while (off < buf.items.len) {
+            const n = std.c.write(self.stdin_fd, buf.items.ptr + off, buf.items.len - off);
+            if (n <= 0) return false;
+            off += @intCast(n);
+        }
+        off = 0;
+        while (off < content.len) {
+            const n = std.c.write(self.stdin_fd, content.ptr + off, content.len - off);
+            if (n <= 0) return false;
+            off += @intCast(n);
+        }
+        // Read the response header (ok/err) to confirm.
+        var header: [16]u8 = undefined;
+        var hlen: usize = 0;
+        while (hlen < header.len) : (hlen += 1) {
+            const n = readWithTimeout(self.stdout_fd, header[hlen..][0..1], 5000) orelse return false;
+            if (n == 0) return false;
+            if (header[hlen] == '\n') break;
+        }
+        return std.mem.startsWith(u8, header[0..hlen], "ok");
+    }
+
     fn readResponse(self: *Client, alloc: std.mem.Allocator) ?[]const u8 {
         var header: [64]u8 = undefined;
         var hlen: usize = 0;
@@ -308,4 +367,18 @@ test "splitCommand accepts no args" {
     const parsed = splitCommand("git\x1f/repo") orelse return error.TestUnexpectedResult;
     defer std.heap.page_allocator.free(parsed.args);
     try std.testing.expectEqual(@as(usize, 0), parsed.args.len);
+}
+
+/// Pipes content into `pbcopy` (macOS clipboard). Returns true on success.
+fn copyToClipboard(content: []const u8) bool {
+    // popen write-mode: single-threaded worker, so this is safe.
+    const fp = c.popen("/usr/bin/pbcopy", "w") orelse return false;
+    defer _ = c.pclose(fp);
+    var off: usize = 0;
+    while (off < content.len) {
+        const n = c.fwrite(content.ptr + off, 1, content.len - off, fp);
+        if (n == 0) return false;
+        off += n;
+    }
+    return true;
 }

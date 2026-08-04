@@ -32,7 +32,7 @@ pub const Response = struct {
         defer parsed.deinit();
         const root = parsed.value.object;
         const id = if (root.get("id")) |v| switch (v) {
-            .integer => |n| @intCast(n),
+            .integer => |n| @as(u64, @intCast(n)),
             else => 0,
         } else 0;
         var result: ?[]const u8 = null;

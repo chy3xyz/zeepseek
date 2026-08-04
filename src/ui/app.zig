@@ -1186,7 +1186,7 @@ pub const App = struct {
         // --- Global Ctrl shortcuts
         if (m.ctrl and k == .char) {
             switch (k.char) {
-                'y' => {
+                'y', 0x19 => {
                     // Copy the last assistant message to the clipboard.
                     var i = self.messages.items.len;
                     while (i > 0) : (i -= 1) {
@@ -1294,6 +1294,35 @@ pub const App = struct {
     fn submit(self: *App) void {
         const text_slice = self.text_input.getValue();
         if (text_slice.len == 0) return;
+
+        // /copy: copy the whole conversation (plain text) to the clipboard.
+        if (std.mem.eql(u8, text_slice, "/copy") or std.mem.startsWith(u8, text_slice, "/copy ")) {
+            std.debug.print("[dbg] /copy triggered, gw={any}\n", .{self.git_worker != null});
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            var buf = std.ArrayList(u8).empty;
+            defer buf.deinit(self.alloc);
+            for (self.messages.items) |m| {
+                const role_str: []const u8 = switch (m.role) {
+                    .user => "You", .assistant => "Zeep", .system => "System", .tool => "Tool",
+                };
+                buf.appendSlice(self.alloc, role_str) catch break;
+                buf.appendSlice(self.alloc, ": ") catch break;
+                buf.appendSlice(self.alloc, m.content) catch break;
+                buf.appendSlice(self.alloc, "\n\n") catch break;
+            }
+            if (self.git_worker) |*gw| {
+                std.debug.print("[dbg] copy {d} bytes\n", .{buf.items.len});
+                if (gw.copy(buf.items)) {
+                    self.setNotification("Conversation copied to clipboard");
+                } else {
+                    self.setNotification("Copy failed");
+                }
+            } else {
+                std.debug.print("[dbg] no worker\n", .{});
+            }
+            return;
+        }
 
         // Handle pending interactive actions
         if (self.pending_action == .await_api_key) {

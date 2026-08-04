@@ -16,7 +16,10 @@ pub fn main(init: std.process.Init) !void {
             return git_worker.main(init);
         }
     }
-    try app.main(init, null);
+    // Spawn the worker while the process is still single-threaded
+    // (forking later, after zigzag starts its Io threads, stalls).
+    const worker = git_worker.Client.spawn(init.io) catch null;
+    try app.main(init, worker);
 }
 
 const std = @import("std");

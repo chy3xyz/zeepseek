@@ -287,6 +287,7 @@ pub const H2Client = struct {
                     }
                     if ((frame.header.flags & h2.FrameFlags.end_headers) != 0) {
                         const decoded = hpack_dec.decode(header_block.items) catch return error.H2Protocol;
+                        defer hpack.freeHeaders(alloc, decoded);
                         for (decoded) |hdr| {
                             if (std.mem.eql(u8, hdr.name, ":status")) {
                                 response.status = std.fmt.parseInt(u16, hdr.value, 10) catch 0;

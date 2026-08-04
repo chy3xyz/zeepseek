@@ -1410,6 +1410,7 @@ pub const App = struct {
             self.alloc.free(model_owned);
             return;
         };
+
         const alloc = self.alloc;
 
         // Spawn streaming thread

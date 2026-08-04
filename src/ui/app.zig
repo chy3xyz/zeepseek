@@ -862,23 +862,11 @@ pub const App = struct {
 
         self.git_worker = g_git_worker;
 
-        // Skill registry with built-in skills (design-review, health, ...).
-        const sr = ctx.allocator.create(skills_registry.SkillRegistry) catch null;
-        if (sr) |reg| {
-            reg.* = skills_registry.SkillRegistry.init(ctx.allocator) catch {
-                ctx.allocator.destroy(reg);
-                null_reg_skip: {
-                    break :null_reg_skip;
-                }
-            };
-            var builtin = skills_builtin.BuiltinSkills{};
-            const built = builtin.loadAll(ctx.allocator) catch null;
-            if (built) |bskills| {
-                for (bskills) |*bs| reg.registerSkill(bs) catch {};
-            }
-            self.skill_registry = reg;
-            self.skill_registry_alloc = ctx.allocator;
-        }
+        // Skill registry: DISABLED — 0.17 StringHashMap valueIterator crashes
+        // at runtime (same class of issue as the git_worker empty-HashMap
+        // alignment assert). Skills activation reverted until the registry's
+        // storage is rewritten (ArrayList, like the semantic cache).
+        // self.skill_registry stays null; /skills reports not enabled.
 
         // Long-term BM25 memory (~/.zeepseek/memory.md).
         const mem = ctx.allocator.create(memory_mod.Memory) catch null;
@@ -1395,9 +1383,9 @@ pub const App = struct {
             if (self.skill_registry) |reg| {
                 var it = reg.list();
                 while (it.next()) |sk| {
-                    list_buf.appendSlice(self.alloc, sk.*.name) catch {};
+                    list_buf.appendSlice(self.alloc, sk.*.*.name) catch {};
                     list_buf.appendSlice(self.alloc, "  ") catch {};
-                    list_buf.appendSlice(self.alloc, sk.*.description) catch {};
+                    list_buf.appendSlice(self.alloc, sk.*.*.description) catch {};
                     list_buf.appendSlice(self.alloc, "\n") catch {};
                 }
             }

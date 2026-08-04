@@ -2823,8 +2823,16 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         self.renderClaudeHeader(&header_buf, a, w);
         const header_text = header_buf.toOwnedSlice(a) catch return "";
 
-        // Build footer — input + separator + status (each renderer adds its own newline)
+        // Build footer — separator line above input + input + status
         var footer_buf = std.ArrayList(u8).empty;
+        footer_buf.appendSlice(a, D) catch {};
+        footer_buf.appendSlice(a, Pal.fg_dim) catch {};
+        footer_buf.appendSlice(a, "├") catch {};
+        var sep_i: u16 = 1;
+        while (sep_i < w - 1) : (sep_i += 1) { footer_buf.appendSlice(a, "─") catch {}; }
+        footer_buf.appendSlice(a, "┤") catch {};
+        footer_buf.appendSlice(a, R) catch {};
+        footer_buf.appendSlice(a, "\n") catch {};
         @constCast(self).renderClaudeInput(&footer_buf, a, w);
         self.renderClaudeSeparator(&footer_buf, a, w);
         self.renderClaudeStatus(&footer_buf, a, w);
@@ -3254,8 +3262,13 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     // ── Claude-style status bar ──
 
     fn renderClaudeStatus(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        _ = self;
-        const hint_full = "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit";
+        const streaming = self.streaming_idx != null;
+        const spin = if (self.cursor_visible) "◐" else "◑";
+        const hint_full = if (streaming)
+            (std.fmt.allocPrint(a, "{s} generating… (queued inputs send when done)", .{spin}) catch "generating…")
+        else
+            "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit";
+        defer if (streaming) a.free(@constCast(hint_full));
         const cell_w = if (w >= 2) w - 2 else 0;
         const content_w = if (cell_w > 1) cell_w - 1 else 0; // leading space
 

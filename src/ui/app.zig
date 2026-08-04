@@ -690,6 +690,7 @@ pub const App = struct {
     streaming_idx: ?usize,
     mcp_servers: std.ArrayList(mcp_runner_mod.McpServer),
     mcp_session: ?mcp_runner_mod.McpSession,
+    app_io: std.Io = undefined,
 
     // --- Input state
     text_input: zz.components.TextInput,
@@ -802,6 +803,7 @@ pub const App = struct {
             .streaming_idx = null,
             .mcp_servers = .empty,
             .mcp_session = null,
+            .app_io = undefined,
             .text_input = zz.components.TextInput.init(ctx.persistent_allocator),
             .palette = zz.components.CommandPalette.init(ctx.persistent_allocator) catch unreachable,
             .show_thinking = true,
@@ -867,6 +869,7 @@ pub const App = struct {
 
 
         self.git_worker = g_git_worker;
+        self.app_io = ctx.io;
 
         // Skill registry with built-in skills. Uses page_allocator storage
         // (stable in-app, same pattern as the semantic cache) — the app's
@@ -1471,7 +1474,25 @@ pub const App = struct {
                 info_buf.appendSlice(self.alloc, srv.command) catch {};
                 info_buf.appendSlice(self.alloc, "\n") catch {};
             }
-            info_buf.appendSlice(self.alloc, "\n(spawn/init wiring lands next: needs ctx.io in this path)") catch {};
+            if (self.mcp_session == null) {
+                self.mcp_session = mcp_runner_mod.McpSession.spawn(self.app_io, self.alloc, self.mcp_servers.items[0]) catch |e| {
+                    info_buf.appendSlice(self.alloc, " spawn error: ") catch {};
+                    info_buf.appendSlice(self.alloc, @errorName(e)) catch {};
+                    self.setNotification(info_buf.items);
+                    return;
+                };
+            }
+            const req = mcp_client_mod.buildInitialize(self.alloc, 1) catch return;
+            defer self.alloc.free(req);
+            const resp = self.mcp_session.?.roundTrip(req, 4000) catch |e| {
+                info_buf.appendSlice(self.alloc, " init error: ") catch {};
+                info_buf.appendSlice(self.alloc, @errorName(e)) catch {};
+                self.setNotification(info_buf.items);
+                return;
+            };
+            defer self.alloc.free(resp);
+            info_buf.appendSlice(self.alloc, " init ok: ") catch {};
+            info_buf.appendSlice(self.alloc, resp[0..@min(resp.len, 120)]) catch {};
             self.setNotification(info_buf.items);
             return;
         }

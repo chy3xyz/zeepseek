@@ -38,7 +38,7 @@ pub const McpSession = struct {
         return .{
             .stdin_fd = child.stdin.?.handle,
             .stdout_fd = child.stdout.?.handle,
-            .child_pid = child.pid,
+            .child_pid = child.id orelse 0,
             .alloc = alloc,
         };
     }
@@ -47,28 +47,31 @@ pub const McpSession = struct {
     /// framed) with a poll timeout.
     pub fn roundTrip(self: *McpSession, body: []const u8, timeout_ms: u64) ![]const u8 {
         self.id += 1;
-        var framed = std.ArrayList(u8).init(self.alloc);
-        defer framed.deinit();
-        try framed.writer().print("Content-Length: {d}\r\n\r\n", .{body.len});
-        try framed.appendSlice(body);
+        var framed = std.ArrayList(u8).empty;
+        defer framed.deinit(self.alloc);
+        const hdr = try std.fmt.allocPrint(self.alloc, "Content-Length: {d}\r\n\r\n", .{body.len});
+        defer self.alloc.free(hdr);
+        try framed.appendSlice(self.alloc, hdr);
+        try framed.appendSlice(self.alloc, body);
 
         const n = framed.items.len;
         var off: usize = 0;
         while (off < n) {
-            const w = try posix.write(self.stdin_fd, framed.items[off..]);
-            if (w == 0) return error.TransportClosed;
-            off += w;
+            const w = std.c.write(self.stdin_fd, framed.items[off..].ptr, framed.items.len - off);
+            if (w <= 0) return error.TransportClosed;
+            off += @intCast(w);
         }
 
         // Read headers (until \r\n\r\n) then the payload.
         var buf: [65536]u8 = undefined;
         var total: usize = 0;
-        const deadline = std.time.milliTimestamp() + timeout_ms;
+        var polls_left: u32 = @intCast(@max(timeout_ms / 100, 1));
         var content_len: usize = 0;
         while (true) {
-            if (std.time.milliTimestamp() > deadline) return error.Timeout;
-            const pollfd = [1]posix.pollfd{.{ .fd = self.stdout_fd, .events = posix.POLL.IN, .revents = 0 }};
-            const pr = try posix.poll(&pollfd, timeout_ms);
+            if (polls_left == 0) return error.Timeout;
+            polls_left -= 1;
+            var pollfd = [1]posix.pollfd{.{ .fd = self.stdout_fd, .events = posix.POLL.IN, .revents = 0 }};
+            const pr = try posix.poll(pollfd[0..], 100);
             if (pr == 0) return error.Timeout;
             const r = try posix.read(self.stdout_fd, buf[total..]);
             if (r == 0) return error.TransportClosed;

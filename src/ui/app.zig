@@ -2985,11 +2985,16 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         out.appendSlice(a, R) catch {};
         out.appendSlice(a, "\n") catch {};
 
-        // Title row: left="zeepseek", center=model, right=status
+        // Title row: left, center=model, right=status (+ ● generating)
         // Pre-compute the right segment so we know its visual width.
         const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
         var right_buf = std.ArrayList(u8).empty;
         right_buf.appendSlice(a, " ") catch {};
+        if (streaming) {
+            right_buf.appendSlice(a, Pal.red) catch {};
+            right_buf.appendSlice(a, "● ") catch {};
+            right_buf.appendSlice(a, R) catch {};
+        }
         right_buf.appendSlice(a, Pal.fg_dim) catch {};
         right_buf.appendSlice(a, "turn ") catch {};
         right_buf.appendSlice(a, R) catch {};
@@ -3086,6 +3091,10 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             self.text_input.setEchoMode(.password);
             self.text_input.setPrompt("🔑 ");
             self.text_input.setPlaceholder("Enter API key...");
+        } else if (self.streaming_idx != null) {
+            self.text_input.setEchoMode(.normal);
+            self.text_input.setPrompt("▸ ");
+            self.text_input.setPlaceholder("Generating... (submit resumes when done)");
         } else {
             self.text_input.setEchoMode(.normal);
             self.text_input.setPrompt("▸ ");
@@ -3194,7 +3203,8 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             const role_label: []const u8 = switch (m.role) {
                 .user => "You", .assistant => "Zeep", .system => "System", .tool => "Tool",
             };
-            const status_icon: []const u8 = if (is_streaming) " ◐" else "";
+            const spin = if (self.cursor_visible) " ◐" else " ◑";
+            const status_icon: []const u8 = if (is_streaming) spin else "";
 
             lines.appendSlice(a, D) catch {};
             lines.appendSlice(a, "│") catch {};

@@ -12,24 +12,20 @@ const ManifestParser = manifest_mod.ManifestParser;
 
 pub const SkillRegistry = struct {
     arena: std.heap.ArenaAllocator,
-    skills: std.StringHashMap(*Skill),
-    commands: std.StringHashMap([]const u8),
+    skills: std.ArrayList(*Skill),
 
     pub fn init(allocator: std.mem.Allocator) !SkillRegistry {
         return .{
             .arena = std.heap.ArenaAllocator.init(allocator),
-            .skills = std.StringHashMap(*Skill).init(allocator),
-            .commands = std.StringHashMap([]const u8).init(allocator),
+            .skills = std.ArrayList(*Skill).empty,
         };
     }
 
     pub fn deinit(self: *SkillRegistry) void {
-        var skill_it = self.skills.valueIterator();
-        while (skill_it.next()) |skill| {
-            self.freeSkill(skill.*);
+        for (self.skills.items) |skill| {
+            self.freeSkill(skill);
         }
-        self.skills.deinit();
-        self.commands.deinit();
+        self.skills.deinit(self.arena.allocator());
         self.arena.deinit();
     }
 
@@ -154,35 +150,39 @@ pub const SkillRegistry = struct {
         }
         owned.prompts = prompts;
 
-        try self.skills.put(owned.name, owned);
-
-        for (owned.commands) |cmd| {
-            try self.commands.put(cmd.name, owned.name);
-        }
+        try self.skills.append(self.arena.allocator(), owned);
     }
 
     pub fn uninstall(self: *SkillRegistry, name: []const u8) !void {
-        const skill = self.skills.get(name) orelse return SkillError.SkillNotFound;
-
-        for (skill.commands) |cmd| {
-            _ = self.commands.remove(cmd.name);
+        var idx: usize = 0;
+        while (idx < self.skills.items.len) : (idx += 1) {
+            if (std.mem.eql(u8, self.skills.items[idx].name, name)) {
+                self.freeSkill(self.skills.items[idx]);
+                _ = self.skills.orderedRemove(self.arena.allocator(), idx);
+                return;
+            }
         }
-
-        self.freeSkill(skill);
-        _ = self.skills.remove(name);
+        return SkillError.SkillNotFound;
     }
 
-    pub fn list(self: *SkillRegistry) @TypeOf(self.skills).ValueIterator {
-        return self.skills.valueIterator();
+    pub fn list(self: *SkillRegistry) []const *Skill {
+        return self.skills.items;
     }
 
     pub fn findByCommand(self: *const SkillRegistry, cmd: []const u8) ?*Skill {
-        const skill_name = self.commands.get(cmd) orelse return null;
-        return self.skills.get(skill_name);
+        for (self.skills.items) |skill| {
+            for (skill.commands) |cmd2| {
+                if (std.mem.eql(u8, cmd2.name, cmd)) return skill;
+            }
+        }
+        return null;
     }
 
     pub fn findByName(self: *const SkillRegistry, name: []const u8) ?*Skill {
-        return self.skills.get(name);
+        for (self.skills.items) |skill| {
+            if (std.mem.eql(u8, skill.name, name)) return skill;
+        }
+        return null;
     }
 
     pub fn reload(self: *SkillRegistry, name: []const u8) !void {

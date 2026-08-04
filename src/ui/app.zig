@@ -862,10 +862,9 @@ pub const App = struct {
 
         self.git_worker = g_git_worker;
 
-        // Skill registry: DISABLED — 0.17 StringHashMap valueIterator crashes
-        // at runtime (same class of issue as the git_worker empty-HashMap
-        // alignment assert). Skills activation reverted until the registry's
-        // storage is rewritten (ArrayList, like the semantic cache).
+        // Skill registry: DISABLED — even ArrayList storage segfaults on
+        // list() at runtime (arena/allocator lifetime issue inside the app).
+        // Needs a dedicated storage-lifetime debug before re-enabling.
         // self.skill_registry stays null; /skills reports not enabled.
 
         // Long-term BM25 memory (~/.zeepseek/memory.md).
@@ -1386,11 +1385,10 @@ pub const App = struct {
             var list_buf = std.ArrayList(u8).empty;
             defer list_buf.deinit(self.alloc);
             if (self.skill_registry) |reg| {
-                var it = reg.list();
-                while (it.next()) |sk| {
-                    list_buf.appendSlice(self.alloc, sk.*.*.name) catch {};
+                for (reg.list()) |sk| {
+                    list_buf.appendSlice(self.alloc, sk.name) catch {};
                     list_buf.appendSlice(self.alloc, "  ") catch {};
-                    list_buf.appendSlice(self.alloc, sk.*.*.description) catch {};
+                    list_buf.appendSlice(self.alloc, sk.description) catch {};
                     list_buf.appendSlice(self.alloc, "\n") catch {};
                 }
             }

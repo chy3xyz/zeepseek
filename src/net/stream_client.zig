@@ -176,14 +176,20 @@ pub const DeepSeekStreamClient = struct {
         try body.appendSlice(self.allocator, if (stream) "true" else "false");
         try body.appendSlice(self.allocator, ",\"messages\":[");
 
-        if (system_prompt.len > 0) {
+        const tool_rules = "Tool usage: the shell tool expects a direct command string (e.g. \"ls -la\"). Never wrap it in sh -c or bash -c (those are blocked).";
+        const full_system = if (system_prompt.len > 0)
+            try std.fmt.allocPrint(self.allocator, "{s}\n\n{s}", .{ system_prompt, tool_rules })
+        else
+            tool_rules;
+        defer if (system_prompt.len > 0) self.allocator.free(full_system);
+        {
             const cache_tag = switch (cache_decision) {
                 .hit => "(cache)",
                 .miss => "",
                 .none => "",
             };
             try body.appendSlice(self.allocator, "{\"role\":\"system\",\"content\":\"");
-            try escapeJsonString(self.allocator, system_prompt, &body);
+            try escapeJsonString(self.allocator, full_system, &body);
             if (cache_tag.len > 0) {
                 try body.appendSlice(self.allocator, " ");
                 try body.appendSlice(self.allocator, cache_tag);

@@ -1736,7 +1736,7 @@ pub const App = struct {
         if (std.mem.eql(u8, call.name, "shell")) {
             if (self.extractJsonString(call.arguments, "command")) |cmd| {
                 if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
-                    return self.toolErr("Error: blocked dangerous command ({s})", .{p.description});
+                    return self.toolErr("Error: blocked dangerous command ({s}). Prefer a direct command (e.g. 'ls' instead of 'sh -c \"ls\"')", .{p.description});
                 }
             }
         }

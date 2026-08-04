@@ -10,6 +10,7 @@ const net = std.Io.net;
 const tls_mod = @import("vendor/tls_client.zig");
 const raw_io = @import("vendor/raw_io.zig");
 const h2 = @import("vendor/h2_frames.zig");
+extern "c" fn usleep(usec: u32) c_int;
 const hpack = @import("vendor/hpack.zig");
 
 pub const H2Error = error{
@@ -96,13 +97,19 @@ pub const H2Client = struct {
             } else return error.ConnectionFailed;
         }
 
-        const fd = libc.socket(@intCast(posix.AF.INET), @intCast(posix.SOCK.STREAM), 0);
-        if (fd < 0) return error.ConnectionFailed;
-        if (libc.connect(fd, &sa, @sizeOf(posix.sockaddr.in)) != 0) {
+        // Retry the connect a couple of times with backoff: transient network
+        // blips are common, and retrying only at the connect stage is safe
+        // (once the stream starts we never retry mid-response).
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            const fd = libc.socket(@intCast(posix.AF.INET), @intCast(posix.SOCK.STREAM), 0);
+            if (fd < 0) return error.ConnectionFailed;
+            if (libc.connect(fd, &sa, @sizeOf(posix.sockaddr.in)) == 0) return fd;
             _ = libc.close(fd);
-            return error.ConnectionFailed;
+            if (attempt >= 2) return error.ConnectionFailed;
+            // ~200ms * 2^attempt backoff (usleep).
+            _ = usleep(200_000 * (@as(u32, 1) << @intCast(attempt)));
         }
-        return fd;
     }
 
     fn setReadTimeout(fd: posix.fd_t, timeout_ms: u64) void {

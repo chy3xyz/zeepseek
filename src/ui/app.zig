@@ -1034,6 +1034,11 @@ pub const App = struct {
             if (self.memory_alloc) |ma| ma.destroy(mem);
             self.memory = null;
         }
+        if (self.memory) |mem| {
+            mem.deinit();
+            if (self.memory_alloc) |ma| ma.destroy(mem);
+            self.memory = null;
+        }
     }
 
     fn textInputAppend(self: *App, bytes: []const u8) void {
@@ -1423,33 +1428,13 @@ pub const App = struct {
             const arg = std.mem.trim(u8, text_slice["/memory".len..], " ");
             if (std.mem.startsWith(u8, arg, "recall ")) {
                 const q = std.mem.trim(u8, arg["recall ".len..], " ");
-                if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
-        if (self.skill_registry) |reg| {
-            reg.deinit();
-            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
-            self.skill_registry = null;
-        }
-        if (self.memory) |mem| {
+                if (self.memory) |mem| {
                     const recalled = mem.recall(q, 4, 1200);
                     defer self.alloc.free(recalled);
                     self.setNotification(if (recalled.len > 0) recalled else "No memory matches");
                 }
             } else if (arg.len > 0) {
-                if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
-        if (self.skill_registry) |reg| {
-            reg.deinit();
-            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
-            self.skill_registry = null;
-        }
-        if (self.memory) |mem| {
-                    var mem_path_buf: [512:0]u8 = undefined;
-                    if (std.c.getenv("HOME")) |home_z| {
-                        const home = std.mem.sliceTo(home_z, 0);
-                        _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
-                        mem.add(&mem_path_buf, arg);
-                        self.setNotification("Memory saved");
-                    }
-                }
+                self.setNotification("Memory add disabled (storage layer WIP)");
             } else {
                 self.setNotification("Usage: /memory <fact> | /memory recall <query>");
             }
@@ -1633,6 +1618,11 @@ pub const App = struct {
             reg.deinit();
             if (self.skill_registry_alloc) |sa| sa.destroy(reg);
             self.skill_registry = null;
+        }
+        if (self.memory) |mem| {
+            mem.deinit();
+            if (self.memory_alloc) |ma| ma.destroy(mem);
+            self.memory = null;
         }
         if (self.memory) |mem| {
                 const recalled = mem.recall(text, 2, 800);

@@ -1313,6 +1313,28 @@ pub const App = struct {
         const text_slice = self.text_input.getValue();
         if (text_slice.len == 0) return;
 
+        // /rewind: go back one turn (drop the trailing user + assistant/tool
+        // messages) — a lightweight checkpoint/rewind without a snapshot store.
+        if (std.mem.eql(u8, text_slice, "/rewind")) {
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            var removed: usize = 0;
+            while (self.messages.items.len > 0) {
+                const last = self.messages.items[self.messages.items.len - 1];
+                if (last.role == .user and removed > 0) break;
+                // Free owned content and pop.
+                if (last.owns) {
+                    self.alloc.free(last.content);
+                    if (last.tool_call_id.len > 0) self.alloc.free(last.tool_call_id);
+                }
+                _ = self.messages.pop();
+                removed += 1;
+                if (last.role == .user) break;
+            }
+            self.setNotification(if (removed > 0) "Rewound one turn" else "Nothing to rewind");
+            return;
+        }
+
         // /mode auto|plan|yolo: switch tool execution mode.
         if (std.mem.startsWith(u8, text_slice, "/mode")) {
             self.text_input.setValue("") catch {};

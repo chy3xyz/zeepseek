@@ -27,6 +27,7 @@ const I18nManager = @import("../i18n/manager.zig").I18nManager;
 const Sandbox = @import("../utils/sandbox.zig").Sandbox;
 const subagent_mod = @import("../agent/subagent.zig");
 const skills_registry = @import("../skills/registry.zig");
+const skills_builtin = @import("../skills/builtin.zig");
 const session_manager = @import("../storage/session_manager.zig");
 const ContextManager = @import("../dispatch/context_manager.zig").ContextManager;
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
@@ -740,6 +741,9 @@ pub const App = struct {
     tool_fail_streak: u32 = 0,
     memory: ?*memory_mod.Memory = null,
     memory_alloc: ?std.mem.Allocator = null,
+    skill_registry: ?*skills_registry.SkillRegistry = null,
+    skill_registry_alloc: ?std.mem.Allocator = null,
+    active_skill: []const u8 = "",
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -857,6 +861,24 @@ pub const App = struct {
 
 
         self.git_worker = g_git_worker;
+
+        // Skill registry with built-in skills (design-review, health, ...).
+        const sr = ctx.allocator.create(skills_registry.SkillRegistry) catch null;
+        if (sr) |reg| {
+            reg.* = skills_registry.SkillRegistry.init(ctx.allocator) catch {
+                ctx.allocator.destroy(reg);
+                null_reg_skip: {
+                    break :null_reg_skip;
+                }
+            };
+            var builtin = skills_builtin.BuiltinSkills{};
+            const built = builtin.loadAll(ctx.allocator) catch null;
+            if (built) |bskills| {
+                for (bskills) |*bs| reg.registerSkill(bs) catch {};
+            }
+            self.skill_registry = reg;
+            self.skill_registry_alloc = ctx.allocator;
+        }
 
         // Long-term BM25 memory (~/.zeepseek/memory.md).
         const mem = ctx.allocator.create(memory_mod.Memory) catch null;
@@ -1013,6 +1035,12 @@ pub const App = struct {
             self.git_worker = null;
         }
 
+        if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
+        if (self.skill_registry) |reg| {
+            reg.deinit();
+            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
+            self.skill_registry = null;
+        }
         if (self.memory) |mem| {
             mem.deinit();
             if (self.memory_alloc) |ma| ma.destroy(mem);
@@ -1358,6 +1386,48 @@ pub const App = struct {
             return;
         }
 
+        // /skills: list registered skills; /skill <name>: activate (prompt inject).
+        if (std.mem.eql(u8, text_slice, "/skills")) {
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            var list_buf = std.ArrayList(u8).empty;
+            defer list_buf.deinit(self.alloc);
+            if (self.skill_registry) |reg| {
+                var it = reg.list();
+                while (it.next()) |sk| {
+                    list_buf.appendSlice(self.alloc, sk.*.name) catch {};
+                    list_buf.appendSlice(self.alloc, "  ") catch {};
+                    list_buf.appendSlice(self.alloc, sk.*.description) catch {};
+                    list_buf.appendSlice(self.alloc, "\n") catch {};
+                }
+            }
+            self.setNotification(if (list_buf.items.len > 0) list_buf.items else "No skills registered");
+            return;
+        }
+        if (std.mem.startsWith(u8, text_slice, "/skill ")) {
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            const name = std.mem.trim(u8, text_slice["/skill ".len..], " ");
+            var found = false;
+            if (self.skill_registry) |reg| {
+                if (reg.findByName(name) != null or reg.findByCommand(name) != null) {
+                    const owned = self.alloc.dupe(u8, name) catch null;
+                    if (owned) |o| {
+                        if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
+                        self.active_skill = o;
+                    }
+                    found = true;
+                }
+            }
+            const skill_msg = if (found)
+                std.fmt.allocPrint(self.alloc, "Skill activated: {s}", .{name}) catch ""
+            else
+                std.fmt.allocPrint(self.alloc, "Unknown skill: {s}", .{name}) catch "";
+            defer if (skill_msg.len > 0) self.alloc.free(skill_msg);
+            self.setNotification(skill_msg);
+            return;
+        }
+
         // /memory <fact>: add a long-term fact; /memory recall <q>: show matches.
         if (std.mem.startsWith(u8, text_slice, "/memory")) {
             self.text_input.setValue("") catch {};
@@ -1365,13 +1435,25 @@ pub const App = struct {
             const arg = std.mem.trim(u8, text_slice["/memory".len..], " ");
             if (std.mem.startsWith(u8, arg, "recall ")) {
                 const q = std.mem.trim(u8, arg["recall ".len..], " ");
-                if (self.memory) |mem| {
+                if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
+        if (self.skill_registry) |reg| {
+            reg.deinit();
+            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
+            self.skill_registry = null;
+        }
+        if (self.memory) |mem| {
                     const recalled = mem.recall(q, 4, 1200);
                     defer self.alloc.free(recalled);
                     self.setNotification(if (recalled.len > 0) recalled else "No memory matches");
                 }
             } else if (arg.len > 0) {
-                if (self.memory) |mem| {
+                if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
+        if (self.skill_registry) |reg| {
+            reg.deinit();
+            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
+            self.skill_registry = null;
+        }
+        if (self.memory) |mem| {
                     var mem_path_buf: [512:0]u8 = undefined;
                     if (std.c.getenv("HOME")) |home_z| {
                         const home = std.mem.sliceTo(home_z, 0);
@@ -1558,7 +1640,13 @@ pub const App = struct {
             // Long-term memory footnote: BM25-recall facts relevant to the
             // prompt, appended as low-authority context (bounded).
             var mem_footnote: []const u8 = "";
-            if (self.memory) |mem| {
+            if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
+        if (self.skill_registry) |reg| {
+            reg.deinit();
+            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
+            self.skill_registry = null;
+        }
+        if (self.memory) |mem| {
                 const recalled = mem.recall(text, 2, 800);
                 if (recalled.len > 0) {
                     mem_footnote = std.fmt.allocPrint(self.alloc, "\n\nRelevant long-term facts (user-provided, verify before relying):\n{s}", .{recalled}) catch "";
@@ -1591,6 +1679,19 @@ pub const App = struct {
             if (mem_footnote.len > 0) {
                 const c2 = std.fmt.allocPrint(self.alloc, "{s}{s}", .{ git_ctx_owned, mem_footnote }) catch git_ctx_owned;
                 combined_ctx = c2;
+            }
+            if (self.active_skill.len > 0) {
+                if (self.skill_registry) |reg| {
+                    if (reg.findByName(self.active_skill)) |sk| {
+                        const skill_prompt = std.fmt.allocPrint(self.alloc, "You are running the '{s}' skill: {s}\n{s}", .{ sk.name, sk.description, if (sk.prompts.len > 0) sk.prompts[0].template else "" }) catch "";
+                        defer if (skill_prompt.len > 0) self.alloc.free(skill_prompt);
+                        const c3 = std.fmt.allocPrint(self.alloc, "{s}\n\n{s}", .{ combined_ctx, skill_prompt }) catch combined_ctx;
+                        if (c3.ptr != combined_ctx.ptr) {
+                            if (combined_ctx.ptr != git_ctx_owned.ptr) self.alloc.free(combined_ctx);
+                            combined_ctx = c3;
+                        }
+                    }
+                }
             }
             self.startStreaming(text, combined_ctx);
         } else {

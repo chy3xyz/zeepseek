@@ -392,6 +392,7 @@ pub const ToolCall = struct {
 pub const ChatMsg = struct {
     role: Role,
     content: []const u8,
+    tool_call_id: []const u8 = "",
     thinking: ?[]const u8 = null,
     tool_calls: std.ArrayList(ToolCall) = .empty,
     status: MsgStatus = .complete,
@@ -1515,7 +1516,11 @@ pub const App = struct {
                 .user => "user", .assistant => "assistant", .system => "system", .tool => "tool",
             };
             const content = self.alloc.dupe(u8, m.content) catch continue;
-            ctx_items.append(self.alloc, .{ .role = role_str, .content = content }) catch {
+            ctx_items.append(self.alloc, .{
+                .role = role_str,
+                .content = content,
+                .tool_call_id = if (m.role == .tool) m.tool_call_id else "",
+            }) catch {
                 self.alloc.free(content);
             };
         }
@@ -1719,12 +1724,18 @@ pub const App = struct {
             .results = std.ArrayList(u8).empty,
         };
         for (parse_result.calls) |call| {
-            const name = self.alloc.dupe(u8, call.name) catch continue;
+            const id = self.alloc.dupe(u8, call.id) catch continue;
+            const name = self.alloc.dupe(u8, call.name) catch {
+                self.alloc.free(id);
+                continue;
+            };
             const arguments = self.alloc.dupe(u8, call.arguments) catch {
+                self.alloc.free(id);
                 self.alloc.free(name);
                 continue;
             };
-            tr.calls.append(self.alloc, .{ .index = call.index, .name = name, .arguments = arguments }) catch {
+            tr.calls.append(self.alloc, .{ .index = call.index, .id = id, .name = name, .arguments = arguments }) catch {
+                self.alloc.free(id);
                 self.alloc.free(name);
                 self.alloc.free(arguments);
             };
@@ -1816,6 +1827,7 @@ pub const App = struct {
             self.messages.append(self.alloc, .{
                 .role = .tool,
                 .content = result_text,
+                .tool_call_id = if (tr.calls.items.len > 0) tr.calls.items[0].id else "",
                 .owns = true,
             }) catch {};
 
@@ -1824,6 +1836,7 @@ pub const App = struct {
         }
         // Cleanup run state
         for (tr.calls.items) |c| {
+            if (c.id.len > 0) self.alloc.free(c.id);
             self.alloc.free(c.name);
             self.alloc.free(c.arguments);
         }

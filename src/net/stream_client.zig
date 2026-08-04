@@ -20,7 +20,7 @@ fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8, output: *st
     }
 }
 
-pub const CtxItem = struct { role: []const u8, content: []const u8 };
+pub const CtxItem = struct { role: []const u8, content: []const u8, tool_call_id: []const u8 = "" };
 
 pub const ThinkingConfig = struct {
     enabled: bool = true,
@@ -203,7 +203,13 @@ pub const DeepSeekStreamClient = struct {
             }
             try body.appendSlice(self.allocator, "{\"role\":\"");
             try body.appendSlice(self.allocator, ctx.role);
-            try body.appendSlice(self.allocator, "\",\"content\":\"");
+            if (std.mem.eql(u8, ctx.role, "tool") and ctx.tool_call_id.len > 0) {
+                try body.appendSlice(self.allocator, "\",\"tool_call_id\":\"");
+                try escapeJsonString(self.allocator, ctx.tool_call_id, &body);
+                try body.appendSlice(self.allocator, "\",\"content\":\"");
+            } else {
+                try body.appendSlice(self.allocator, "\",\"content\":\"");
+            }
             try escapeJsonString(self.allocator, ctx.content, &body);
             try body.appendSlice(self.allocator, "\"}");
         }
@@ -569,6 +575,7 @@ pub const ToolCallRepairPipeline = struct {
 
     pub const ToolCallExtracted = struct {
         index: usize,
+        id: []const u8,
         name: []const u8,
         arguments: []const u8,
         signature: []const u8,
@@ -706,6 +713,7 @@ pub const ToolCallRepairPipeline = struct {
     }
 
     const ToolCallJson = struct {
+    id: ?[]const u8 = null,
         index: usize = 0,
         function: struct {
             name: []const u8 = "",
@@ -719,6 +727,10 @@ pub const ToolCallRepairPipeline = struct {
         if (parsed.value.function.name.len == 0) return null;
         return ToolCallExtracted{
             .index = parsed.value.index,
+            .id = if (parsed.value.id) |cid|
+                try self.allocator.dupe(u8, cid)
+            else
+                try self.allocator.dupe(u8, ""),
             .name = try self.allocator.dupe(u8, parsed.value.function.name),
             .arguments = try self.allocator.dupe(u8, parsed.value.function.arguments),
             .signature = try self.allocator.dupe(u8, ""),

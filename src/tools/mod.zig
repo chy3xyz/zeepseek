@@ -13,6 +13,7 @@ pub const Policy = sandbox_mod.Policy;
 
 pub const ToolCall = struct {
     index: usize,
+    id: []const u8 = "",
     name: []const u8,
     arguments: []const u8,
 };

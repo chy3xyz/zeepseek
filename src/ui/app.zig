@@ -1767,6 +1767,7 @@ pub const App = struct {
                 .idx = tr.idx,
                 .cwd = self.alloc.dupe(u8, cwd) catch return,
             };
+            self.setNotification("Tool approval required — Enter to allow, Esc to deny");
             return;
         }
 
@@ -3193,7 +3194,11 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         out.appendSlice(a, "│ ") catch {};
         out.appendSlice(a, R) catch {};
 
-        if (self.pending_action == .await_api_key) {
+        if (self.pending_tool != null) {
+            self.text_input.setEchoMode(.normal);
+            self.text_input.setPrompt("⚠ ");
+            self.text_input.setPlaceholder("Tool awaiting approval — Enter allow / Esc deny");
+        } else if (self.pending_action == .await_api_key) {
             self.text_input.setEchoMode(.password);
             self.text_input.setPrompt("🔑 ");
             self.text_input.setPlaceholder("Enter API key...");

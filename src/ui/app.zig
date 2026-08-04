@@ -717,6 +717,7 @@ pub const App = struct {
     // --- Semantic cache (reasonix): exact-prompt reuse for self-contained queries
     reasonix: ?*reasonix_mod.Reasonix = null,
     reasonix_alloc: ?std.mem.Allocator = null,
+    compact_hinted: bool = false,
 
     // --- Session state
     session_id: []const u8,
@@ -1828,6 +1829,24 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         }
         self.streaming_idx = null;
         self.turn += 1;
+
+        // One-shot context water-level hint (aligned with reasonix fold
+        // thresholds): suggest /compact once the conversation passes 70%.
+        if (!self.compact_hinted) {
+            var total: usize = 0;
+            for (self.messages.items) |m| total += tokenizer_mod.Tokenizer.count(m.content);
+            if (self.ctx_max > 0) {
+                const pct = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0;
+                if (pct > 70) {
+                    const hint = std.fmt.allocPrint(self.alloc, "Context at {d:.0}% — run /compact to summarize", .{pct}) catch null;
+                    if (hint) |h| {
+                        self.setNotification(h);
+                        self.alloc.free(h);
+                    }
+                    self.compact_hinted = true;
+                }
+            }
+        }
     }
 
     fn onStreamError(self: *App, err_msg: []const u8) void {

@@ -719,6 +719,7 @@ pub const App = struct {
     reasonix: ?*reasonix_mod.Reasonix = null,
     reasonix_alloc: ?std.mem.Allocator = null,
     compact_hinted: bool = false,
+    git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
     session_id: []const u8,
@@ -833,6 +834,8 @@ pub const App = struct {
         }
 
 
+
+        self.git_worker = g_git_worker;
 
         // Initialize sandbox for tool approval. Platform-level sandboxing
         // (Seatbelt/Landlock) may fail open, but the approval-mode checks in
@@ -967,6 +970,12 @@ pub const App = struct {
             rx.deinit();
             if (self.reasonix_alloc) |a| a.destroy(rx);
             self.reasonix = null;
+        }
+
+        // Shut down the git worker: closing stdin makes it read EOF and exit.
+        if (self.git_worker) |gw| {
+            _ = std.c.close(gw.stdin_fd);
+            self.git_worker = null;
         }
     }
 
@@ -1305,7 +1314,23 @@ pub const App = struct {
 
         // Start streaming if API key is available
         if (self.api_key.len > 0) {
-            self.startStreaming(text);
+            var git_ctx_owned: []const u8 = "";
+            if (self.git_worker) |*gw| {
+                if (std.c.getenv("PWD")) |pwd_z| {
+                    const pwd = std.mem.sliceTo(pwd_z, 0);
+                    var dir_buf: [512:0]u8 = undefined;
+                    _ = std.fmt.bufPrintSentinel(&dir_buf, "{s}/.git", .{pwd}, 0) catch null;
+                    if (std.c.access(&dir_buf, 0) == 0) {
+                        if (gw.runGit(self.alloc, pwd, &.{ "status", "--short" })) |out| {
+                            defer self.alloc.free(out);
+                            if (out.len > 0 and out.len < 2000) {
+                                git_ctx_owned = std.fmt.allocPrint(self.alloc, "Git workspace status (use this when answering code/change questions):\n{s}", .{out}) catch "";
+                            }
+                        }
+                    }
+                }
+            }
+            self.startStreaming(text, git_ctx_owned);
         } else {
             // No API key — placeholder
             self.messages.append(self.alloc, .{
@@ -1330,7 +1355,7 @@ pub const App = struct {
         return start;
     }
 
-    fn startStreaming(self: *App, user_input: []const u8) void {
+    fn startStreaming(self: *App, user_input: []const u8, git_ctx_owned: []const u8) void {
         // Join the previous thread first: it may still be pushing into ss.
         if (self.stream_thread) |t| t.join();
         if (self.stream_state) |ss| {
@@ -1419,13 +1444,14 @@ pub const App = struct {
 
         // Spawn streaming thread
         const thread = std.Thread.spawn(.{}, struct {
-            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, ep: []const u8, a: std.mem.Allocator, state: *StreamState) void {
+            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, ep: []const u8, git_ctx: []const u8, a: std.mem.Allocator, state: *StreamState) void {
                 defer {
                     for (ctx) |ci| a.free(ci.content);
                     a.free(ctx);
                     a.free(prompt);
                     a.free(api_k);
                     a.free(mdl);
+                    if (git_ctx.len > 0) a.free(git_ctx);
                 }
                 // Dedicated Io so blocking network reads never stall the UI
                 // thread's shared std.Io (threaded-io socket hang on macOS).
@@ -1453,7 +1479,7 @@ pub const App = struct {
                 var h2ctx = H2Ctx{ .state = state };
                 const h2sink = stream_client_mod.ChunkSink{ .ctx = &h2ctx, .on_chunk = H2Ctx.onChunk };
                 const h2_ok = blk: {
-                    stream_client_mod.streamMessageH2(&client, api_k, prompt, ctx, mdl, CacheDecision.none, "", null, h2sink) catch break :blk false;
+                    stream_client_mod.streamMessageH2(&client, api_k, prompt, ctx, mdl, CacheDecision.none, git_ctx, null, h2sink) catch break :blk false;
                     break :blk true;
                 };
                 if (!h2_ok) {
@@ -1498,13 +1524,14 @@ pub const App = struct {
                 }
                 state.setDone();
             }
-        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, endpoint, alloc, ss }) catch {
+        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, endpoint, git_ctx_owned, alloc, ss }) catch {
             // Thread failed to spawn: reclaim the data we duplicated for it
             for (ctx_slice) |ci| alloc.free(ci.content);
             alloc.free(ctx_slice);
             alloc.free(prompt_owned);
             alloc.free(api_key_owned);
             alloc.free(model_owned);
+            if (git_ctx_owned.len > 0) alloc.free(git_ctx_owned);
             ss.setError(std.fmt.allocPrint(self.alloc, "Failed to spawn thread", .{}) catch "");
             return;
         };
@@ -1688,7 +1715,7 @@ pub const App = struct {
             }) catch {};
 
             // Start a new stream with the tool results in context
-            self.startStreaming("(tool results)");
+            self.startStreaming("(tool results)", "");
         }
         // Cleanup run state
         for (tr.calls.items) |c| {
@@ -3571,7 +3598,10 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
 };
 
-pub fn main(init: std.process.Init, _: ?git_worker_mod.Client) !void {
+var g_git_worker: ?git_worker_mod.Client = null;
+
+pub fn main(init: std.process.Init, git_worker: ?git_worker_mod.Client) !void {
+    g_git_worker = git_worker;
     var program = zz.Program(App).initWithOptions(init.gpa, init.io, init.environ_map, .{
         .mouse = true,
     });

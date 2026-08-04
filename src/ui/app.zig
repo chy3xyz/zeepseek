@@ -729,6 +729,8 @@ pub const App = struct {
     compact_hinted: bool = false,
     cleanup_tick: u32 = 0,
     git_changes: usize = 0,
+    pending_inputs: std.ArrayList([]const u8) = .empty,
+    history_edit_idx: ?usize = null,
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -1217,7 +1219,34 @@ pub const App = struct {
 
         // --- Scroll keys (when input empty)
         if (self.text_input.getValue().len == 0) {
-            if (k == .up) { if (self.scroll_offset > 0) self.scroll_offset -= 1; self.auto_scroll = false; return .none; }
+            // Up recalls/edits the previous user message (auto_scroll stays;
+            // PgUp/PgDn and the mouse wheel still scroll).
+            if (k == .up) {
+                var idx: ?usize = self.history_edit_idx;
+                if (idx == null) {
+                    var i = self.messages.items.len;
+                    while (i > 0) : (i -= 1) {
+                        if (self.messages.items[i - 1].role == .user) {
+                            idx = i - 1;
+                            break;
+                        }
+                    }
+                } else {
+                    var i = idx.?;
+                    while (i > 0) : (i -= 1) {
+                        if (self.messages.items[i - 1].role == .user) {
+                            idx = i - 1;
+                            break;
+                        }
+                    }
+                }
+                if (idx) |found| {
+                    self.text_input.setValue(self.messages.items[found].content) catch {};
+                    self.text_input.cursor = 0;
+                    self.history_edit_idx = found;
+                }
+                return .none;
+            }
             if (k == .down) { self.scroll_offset += 1; return .none; }
             if (k == .page_up) { self.scroll_offset -|= 10; self.auto_scroll = false; return .none; }
             if (k == .page_down) { self.scroll_offset +|= 10; return .none; }
@@ -1332,12 +1361,18 @@ pub const App = struct {
             }
         }
 
-        // Guard: sending a new message while the previous response is still
-        // streaming would startStreaming -> join a possibly blocked network
-        // thread, freezing the UI (no request timeout). Keep the input so the
-        // user can retry after the current response finishes.
+        // While a response is streaming, accept the input and queue it: it is
+        // sent automatically when the current turn (incl. tool calls) finishes.
         if (self.streaming_idx != null) {
-            self.setNotification("Wait for the current response to finish");
+            const queued = self.alloc.dupe(u8, text_slice) catch return;
+            self.pending_inputs.append(self.alloc, queued) catch {
+                self.alloc.free(queued);
+                return;
+            };
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            self.history_edit_idx = null;
+            self.setNotification("Queued (will send when the current reply finishes)");
             return;
         }
 
@@ -1351,6 +1386,7 @@ pub const App = struct {
 
         self.text_input.setValue("") catch {};
         self.text_input.cursor = 0;
+        self.history_edit_idx = null;
         self.auto_scroll = true;
         self.scroll_offset = 0;
         self.turn += 1;
@@ -1920,6 +1956,26 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         }
         self.streaming_idx = null;
         self.turn += 1;
+
+        // Auto-send the next queued input, if any (streaming/tool loop done).
+        if (self.pending_inputs.items.len > 0) {
+            const queued = self.pending_inputs.orderedRemove(0);
+            self.messages.append(self.alloc, .{
+                .role = .user,
+                .content = queued,
+                .timestamp = 0,
+                .owns = true,
+            }) catch {
+                self.alloc.free(queued);
+                return;
+            };
+            self.history_edit_idx = null;
+            self.auto_scroll = true;
+            self.turn += 1;
+            if (self.api_key.len > 0) {
+                self.startStreaming(queued, "");
+            }
+        }
 
         // One-shot context water-level hint (aligned with reasonix fold
         // thresholds): suggest /compact once the conversation passes 70%.

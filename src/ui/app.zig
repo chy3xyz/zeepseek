@@ -3513,10 +3513,11 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
                     if (std.mem.eql(u8, row.label, "turn")) {
                         break :val std.fmt.allocPrint(a, "{d}", .{self.turn}) catch "";
                     } else if (std.mem.eql(u8, row.label, "git")) {
+                        // Always allocate so the free on static strings never fires.
                         break :val if (self.git_changes > 0)
-                            std.fmt.allocPrint(a, "{d} changed", .{self.git_changes}) catch ""
+                            std.fmt.allocPrint(a, "{d} changed", .{self.git_changes}) catch a.dupe(u8, "clean") catch ""
                         else
-                            "clean";
+                            a.dupe(u8, "clean") catch "";
                     } else if (std.mem.eql(u8, row.label, "context")) {
                         break :val std.fmt.allocPrint(a, "{d:.0}%", .{ctx_pct}) catch "";
                     } else if (std.mem.eql(u8, row.label, "cache")) {

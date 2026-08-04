@@ -14,6 +14,8 @@ const std = @import("std");
 const zz = @import("zigzag");
 const cc = @import("c");
 const stream_client_mod = @import("../net/stream_client.zig");
+const mcp_runner_mod = @import("../net/mcp_runner.zig");
+const mcp_client_mod = @import("../net/mcp_client.zig");
 const dangerous_patterns = @import("dangerous_patterns");
 const tools_mod = @import("../tools/mod.zig");
 const session_format = @import("session_format");
@@ -686,6 +688,8 @@ pub const App = struct {
     scroll_offset: u16,
     auto_scroll: bool,
     streaming_idx: ?usize,
+    mcp_servers: std.ArrayList(mcp_runner_mod.McpServer),
+    mcp_session: ?mcp_runner_mod.McpSession,
 
     // --- Input state
     text_input: zz.components.TextInput,
@@ -796,6 +800,8 @@ pub const App = struct {
             .scroll_offset = 0,
             .auto_scroll = true,
             .streaming_idx = null,
+            .mcp_servers = .empty,
+            .mcp_session = null,
             .text_input = zz.components.TextInput.init(ctx.persistent_allocator),
             .palette = zz.components.CommandPalette.init(ctx.persistent_allocator) catch unreachable,
             .show_thinking = true,
@@ -1409,6 +1415,61 @@ pub const App = struct {
             self.setNotification(if (list_buf.items.len > 0) list_buf.items else "No skills registered");
             return;
         }
+        if (std.mem.eql(u8, text_slice, "/mcp")) {
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            var info_buf = std.ArrayList(u8).empty;
+            defer info_buf.deinit(self.alloc);
+            // Lazy-load ~/.zeepseek/mcp.json ({"servers":[{"name","command"}]}).
+            if (self.mcp_servers.items.len == 0) {
+                var cfg_buf: [4096]u8 = undefined;
+                var cfg_len: usize = 0;
+                if (std.c.getenv("HOME")) |home_z| {
+                    const home = std.mem.sliceTo(home_z, 0);
+                    var path_buf: [512:0]u8 = undefined;
+                    if (std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/mcp.json", .{home}, 0)) |pb| {
+                        const fd = std.c.open(pb, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+                        if (fd >= 0) {
+                            defer _ = std.c.close(fd);
+                            const rlen = std.c.read(fd, &cfg_buf, @as(usize, cfg_buf.len));
+                            cfg_len = if (rlen > 0) @intCast(rlen) else 0;
+                        }
+                    } else |_| {}
+                }
+                if (cfg_len > 0) {
+                    var parsed = std.json.parseFromSlice(std.json.Value, self.alloc, cfg_buf[0..cfg_len], .{}) catch null;
+                    if (parsed) |pdoc| {
+                        defer parsed.?.deinit();
+                        if (pdoc.value.object.get("servers")) |arr| {
+                            if (arr == .array) {
+                                for (arr.array.items) |srv| {
+                                    const obj = srv.object;
+                                    const nm = if (obj.get("name")) |v| (if (v == .string) v.string else "?") else "?";
+                                    const cmd = if (obj.get("command")) |v| (if (v == .string) v.string else "") else "";
+                                    if (cmd.len > 0) {
+                                        self.mcp_servers.append(self.alloc, .{ .cfg_name = nm, .command = cmd, .args = &.{} }) catch {};
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if (self.mcp_servers.items.len == 0) {
+                self.setNotification("No MCP servers in ~/.zeepseek/mcp.json");
+                return;
+            }
+            for (self.mcp_servers.items) |srv| {
+                info_buf.appendSlice(self.alloc, srv.cfg_name) catch {};
+                info_buf.appendSlice(self.alloc, ": ") catch {};
+                info_buf.appendSlice(self.alloc, srv.command) catch {};
+                info_buf.appendSlice(self.alloc, "\n") catch {};
+            }
+            info_buf.appendSlice(self.alloc, "\n(spawn/init wiring lands next: needs ctx.io in this path)") catch {};
+            self.setNotification(info_buf.items);
+            return;
+        }
+
         if (std.mem.startsWith(u8, text_slice, "/skill ")) {
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;

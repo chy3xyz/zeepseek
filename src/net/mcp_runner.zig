@@ -23,13 +23,13 @@ pub const McpSession = struct {
     id: u64 = 0,
     initialized: bool = false,
 
-    pub fn spawn(alloc: std.mem.Allocator, server: McpServer) !McpSession {
-        var argv = std.ArrayList([]const u8).init(alloc);
-        defer argv.deinit();
-        try argv.append(server.command);
-        for (server.args) |a| try argv.append(a);
+    pub fn spawn(io: std.Io, alloc: std.mem.Allocator, server: McpServer) !McpSession {
+        var argv = std.ArrayList([]const u8).empty;
+        defer argv.deinit(alloc);
+        try argv.append(alloc, server.command);
+        for (server.args) |a| try argv.append(alloc, a);
 
-        const child = try std.process.spawn(.{}, .{
+        const child = try std.process.spawn(io, .{
             .argv = argv.items,
             .stdin = .pipe,
             .stdout = .pipe,
@@ -103,7 +103,7 @@ pub const McpSession = struct {
 test "spawn fails cleanly for missing command" {
     const alloc = std.testing.allocator;
     const srv = McpServer{ .cfg_name = "missing", .command = "/nonexistent/mcp-server-xyz", .args = &.{} };
-    _ = McpSession.spawn(alloc, srv) catch |e| {
+    _ = McpSession.spawn(std.Io{ .userdata = undefined, .vtable = &std.Io.default_vtable }, alloc, srv) catch |e| {
         try std.testing.expect(e == error.FileNotFound);
         return;
     };

@@ -3270,8 +3270,10 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     fn renderClaudeStatus(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
         const streaming = self.streaming_idx != null;
         const spin = if (self.cursor_visible) "◐" else "◑";
+        // The spinner is prepended to the regular shortcut/status hint instead
+        // of replacing it, so the hint (and the sidebar stats) stay visible.
         const hint_full = if (streaming)
-            (std.fmt.allocPrint(a, "{s} generating… type below to queue", .{spin}) catch "generating…")
+            (std.fmt.allocPrint(a, "{s} generating  {s}", .{ spin, "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit" }) catch "generating…")
         else
             "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit";
         defer if (streaming) a.free(@constCast(hint_full));

@@ -353,6 +353,9 @@ fn appendHighlighted(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []cons
 // Data Types
 // ═══════════════════════════════════════════════════════════════════════
 
+/// Tool execution modes (like codex/claude-code).
+pub const RunMode = enum { auto, plan, yolo };
+
 pub const Role = enum {
     user,
     assistant,
@@ -732,6 +735,7 @@ pub const App = struct {
     git_changes: usize = 0,
     pending_inputs: std.ArrayList([]const u8) = .empty,
     history_edit_idx: ?usize = null,
+    run_mode: RunMode = .auto,
     git_worker: ?git_worker_mod.Client = null,
 
     // --- Session state
@@ -1295,6 +1299,30 @@ pub const App = struct {
         const text_slice = self.text_input.getValue();
         if (text_slice.len == 0) return;
 
+        // /mode auto|plan|yolo: switch tool execution mode.
+        if (std.mem.startsWith(u8, text_slice, "/mode")) {
+            self.text_input.setValue("") catch {};
+            self.text_input.cursor = 0;
+            const arg = std.mem.trim(u8, text_slice["/mode".len..], " ");
+            const new_mode: ?RunMode = if (std.mem.eql(u8, arg, "plan"))
+                .plan
+            else if (std.mem.eql(u8, arg, "yolo"))
+                .yolo
+            else if (std.mem.eql(u8, arg, "auto") or arg.len == 0)
+                .auto
+            else
+                null;
+            if (new_mode) |m| {
+                self.run_mode = m;
+                const mode_msg = std.fmt.allocPrint(self.alloc, "Mode: {s}", .{@tagName(m)}) catch "";
+                defer if (mode_msg.len > 0) self.alloc.free(mode_msg);
+                self.setNotification(mode_msg);
+            } else {
+                self.setNotification("Usage: /mode auto|plan|yolo");
+            }
+            return;
+        }
+
         // /copy: copy the whole conversation (plain text) to the clipboard.
         if (std.mem.eql(u8, text_slice, "/copy") or std.mem.startsWith(u8, text_slice, "/copy ")) {
             std.debug.print("[dbg] /copy triggered, gw={any}\n", .{self.git_worker != null});
@@ -1789,7 +1817,12 @@ pub const App = struct {
         const call = tr.calls.items[tr.idx];
         self.onToolStart(call.name, call.arguments);
 
-        if (tools_mod.requiresApproval(self.sandbox, call)) {
+        const approval_needed = switch (self.run_mode) {
+            .auto => tools_mod.requiresApproval(self.sandbox, call),
+            .plan => true,
+            .yolo => false,
+        };
+        if (approval_needed) {
             const cwd_ptr = std.c.getenv("PWD") orelse ".";
             const cwd = std.mem.sliceTo(cwd_ptr, 0);
             self.pending_tool = .{
@@ -1883,6 +1916,7 @@ pub const App = struct {
         // sensitive paths are refused before anything executes.
         if (std.mem.eql(u8, call.name, "shell")) {
             if (self.extractJsonString(call.arguments, "command")) |cmd| {
+                if (self.run_mode != .yolo) {
                 if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
                     return self.toolErr("Error: blocked dangerous command ({s}). Prefer a direct command (e.g. 'ls' instead of 'sh -c \"ls\"')", .{p.description});
                 }
@@ -1896,6 +1930,7 @@ pub const App = struct {
                     return self.toolErr("Error: shell execution failed or timed out", .{});
                 }
             }
+        }
         }
         if (std.mem.eql(u8, call.name, "file_read") or
             std.mem.eql(u8, call.name, "file_write") or
@@ -3558,6 +3593,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             .{ .label = "context", .value = "", .color = if (ctx_pct > 70) Pal.red else Pal.green },
             .{ .label = "cache", .value = "", .color = Pal.cyan },
             .{ .label = "git", .value = "", .color = if (self.git_changes > 0) Pal.yellow else Pal.fg_dim },
+            .{ .label = "mode", .value = @tagName(self.run_mode), .color = switch (self.run_mode) { .auto => Pal.green, .plan => Pal.yellow, .yolo => Pal.red } },
             .{ .label = "status", .value = if (streaming) "streaming" else "idle", .color = if (streaming) Pal.yellow else Pal.fg_dim },
         };
 

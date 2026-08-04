@@ -1,5 +1,6 @@
 const std = @import("std");
 const sandbox_mod = @import("../utils/sandbox.zig");
+const c = @import("c");
 const Sandbox = sandbox_mod.Sandbox;
 
 pub const RunResult = struct {
@@ -13,70 +14,36 @@ pub fn runArgv(
     cwd: []const u8,
     argv: []const []const u8,
 ) !RunResult {
-    var threaded = std.Io.Threaded.init(alloc, .{
-        .argv0 = .empty,
-        .environ = .empty,
-    });
-    const io = threaded.io();
-
-    var child = try std.process.spawn(io, .{
-        .argv = argv,
-        .cwd = .{ .path = cwd },
-        .stdin = .ignore,
-        .stdout = .pipe,
-        .stderr = .pipe,
-    });
-
-    var stdout = std.ArrayList(u8).empty;
-    defer stdout.deinit(alloc);
-    var stderr = std.ArrayList(u8).empty;
-    defer stderr.deinit(alloc);
-
-    if (child.stdout) |out| {
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n_read = std.c.read(out.handle, &buf, buf.len);
-            if (n_read <= 0) break;
-            try stdout.appendSlice(alloc, buf[0..@intCast(n_read)]);
-        }
-        out.close(io);
+    // Synchronous popen pipeline (same path as runShell, verified in-app).
+    // std.process.spawn(io) + blocking std.c.read on io-managed pipes
+    // stalls inside the zigzag runtime.
+    var cmd = std.ArrayList(u8).empty;
+    defer cmd.deinit(alloc);
+    try cmd.appendSlice(alloc, "cd ");
+    try cmd.appendSlice(alloc, cwd);
+    try cmd.appendSlice(alloc, " && ");
+    for (argv, 0..) |arg, i| {
+        if (i > 0) try cmd.append(alloc, ' ');
+        try cmd.append(alloc, '\'');
+        try cmd.appendSlice(alloc, arg);
+        try cmd.append(alloc, '\'');
     }
-    if (child.stderr) |err_pipe| {
-        var buf: [4096]u8 = undefined;
-        while (true) {
-            const n_read = std.c.read(err_pipe.handle, &buf, buf.len);
-            if (n_read <= 0) break;
-            try stderr.appendSlice(alloc, buf[0..@intCast(n_read)]);
-        }
-        err_pipe.close(io);
+    const cmd_z = try alloc.dupeSentinel(u8, cmd.items, 0);
+    defer alloc.free(cmd_z);
+    const fp = c.popen(cmd_z.ptr, "r") orelse return error.SpawnFailed;
+    defer _ = c.pclose(fp);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = c.fread(&buf, 1, buf.len, fp);
+        if (n == 0) break;
+        try out.appendSlice(alloc, buf[0..n]);
     }
-
-    const term = child.wait(io) catch {
-        return RunResult{ .output = try alloc.dupe(u8, "process wait failed"), .success = false };
-    };
-    const exit_ok = term == .exited and term.exited == 0;
-
-    var combined = std.ArrayList(u8).empty;
-    defer combined.deinit(alloc);
-    try combined.appendSlice(alloc, stdout.items);
-    if (stderr.items.len > 0) {
-        if (stdout.items.len > 0) try combined.appendSlice(alloc, "\n");
-        try combined.appendSlice(alloc, stderr.items);
-    }
-
-    const max_output_len = 32 * 1024;
-    const final_output = if (combined.items.len > max_output_len)
-        try std.fmt.allocPrint(alloc, "{s}\n\n... ({d} chars truncated)", .{
-            combined.items[0..max_output_len],
-            combined.items.len - max_output_len,
-        })
-    else
-        try alloc.dupe(u8, combined.items);
-
-    return RunResult{ .output = final_output, .success = exit_ok };
+    return .{ .output = try out.toOwnedSlice(alloc), .success = true };
 }
 
-/// Run a shell command in cwd via /bin/sh -c. cwd is not interpolated into the command string.
 pub fn runShell(
     alloc: std.mem.Allocator,
     sandbox: ?*Sandbox,

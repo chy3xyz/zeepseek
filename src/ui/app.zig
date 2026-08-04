@@ -3200,7 +3200,8 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         } else if (self.streaming_idx != null) {
             self.text_input.setEchoMode(.normal);
             self.text_input.setPrompt("▸ ");
-            self.text_input.setPlaceholder("Generating... (submit resumes when done)");
+            // Input stays active during streaming; submissions are queued.
+            self.text_input.setPlaceholder("Type to queue… (auto-sends when done)");
         } else {
             self.text_input.setEchoMode(.normal);
             self.text_input.setPrompt("▸ ");
@@ -3265,7 +3266,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         const streaming = self.streaming_idx != null;
         const spin = if (self.cursor_visible) "◐" else "◑";
         const hint_full = if (streaming)
-            (std.fmt.allocPrint(a, "{s} generating… (queued inputs send when done)", .{spin}) catch "generating…")
+            (std.fmt.allocPrint(a, "{s} generating… type below to queue", .{spin}) catch "generating…")
         else
             "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit";
         defer if (streaming) a.free(@constCast(hint_full));

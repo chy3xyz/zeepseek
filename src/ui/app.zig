@@ -248,7 +248,7 @@ const StreamState = struct {
 
 
 /// Pending tool-call run state: survives user-approval pauses between calls.
-const ToolRunState = struct {
+pub const ToolRunState = struct {
     /// All duplicated tool calls awaiting execution
     calls: std.ArrayList(tools_mod.ToolCall),
     idx: usize,
@@ -1543,7 +1543,7 @@ pub const App = struct {
                 ss.error_msg = null;
             } else if (tc_json != null) {
                 // Handle tool calls — don't mark stream done yet
-                self.handleToolCalls(tc_json.?);
+                tools_run.handleToolCalls(self, tc_json.?);
                 self.alloc.free(tc_json.?);
                 // Cleanup stream state but keep streaming_idx alive
                 if (self.stream_thread) |t| {
@@ -1568,54 +1568,6 @@ pub const App = struct {
         }
     }
 
-    fn handleToolCalls(self: *App, tc_json: []const u8) void {
-        var pipeline = stream_client_mod.ToolCallRepairPipeline.init(self.alloc);
-        defer pipeline.deinit();
-
-        const parse_result = pipeline.processChunk(tc_json) catch return;
-        defer {
-            for (parse_result.calls) |call| {
-                self.alloc.free(call.name);
-                self.alloc.free(call.arguments);
-                self.alloc.free(call.signature);
-            }
-            self.alloc.free(parse_result.calls);
-        }
-
-        if (parse_result.calls.len == 0) return;
-
-        // Duplicate calls into a run state that survives approval pauses.
-        const tr = self.alloc.create(ToolRunState) catch return;
-        tr.* = .{
-            .calls = std.ArrayList(tools_mod.ToolCall).empty,
-            .idx = 0,
-            .results = std.ArrayList(u8).empty,
-        };
-        for (parse_result.calls) |call| {
-            const id = self.alloc.dupe(u8, call.id) catch continue;
-            const name = self.alloc.dupe(u8, call.name) catch {
-                self.alloc.free(id);
-                continue;
-            };
-            const arguments = self.alloc.dupe(u8, call.arguments) catch {
-                self.alloc.free(id);
-                self.alloc.free(name);
-                continue;
-            };
-            tr.calls.append(self.alloc, .{ .index = call.index, .id = id, .name = name, .arguments = arguments }) catch {
-                self.alloc.free(id);
-                self.alloc.free(name);
-                self.alloc.free(arguments);
-            };
-        }
-        if (tr.calls.items.len == 0) {
-            self.alloc.destroy(tr);
-            return;
-        }
-        self.tool_run = tr;
-
-        tools_run.processNextTool(self);
-    }
 
     /// Process the next queued tool call. Pauses at the first call that
     /// requires user approval (pending_tool) and resumes on Enter/Esc.

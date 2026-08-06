@@ -3,11 +3,13 @@
 const std = @import("std");
 const App = @import("app.zig").App;
 const tools_mod = @import("../tools/mod.zig");
+const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_client_mod = @import("../net/mcp_client.zig");
 const dangerous_patterns = @import("dangerous_patterns");
 const git_worker_mod = @import("../utils/git_worker.zig");
 const extractJsonString = @import("app.zig").extractJsonString;
 const isSensitivePath = App.isSensitivePath;
+const ToolRunState = @import("app.zig").ToolRunState;
 
 fn isBuiltinToolName(name: []const u8) bool {
     const builtin = [_][]const u8{ "shell", "file_read", "file_write", "file_edit", "git_status", "git_commit", "web_search", "web_scrape" };
@@ -192,3 +194,51 @@ pub fn finishToolRun(app: *App) void {
     app.tool_run = null;
 }
 
+pub fn handleToolCalls(app: *App, tc_json: []const u8) void {
+    var pipeline = stream_client_mod.ToolCallRepairPipeline.init(app.alloc);
+    defer pipeline.deinit();
+
+    const parse_result = pipeline.processChunk(tc_json) catch return;
+    defer {
+        for (parse_result.calls) |call| {
+            app.alloc.free(call.name);
+            app.alloc.free(call.arguments);
+            app.alloc.free(call.signature);
+        }
+        app.alloc.free(parse_result.calls);
+    }
+
+    if (parse_result.calls.len == 0) return;
+
+    // Duplicate calls into a run state that survives approval pauses.
+    const tr = app.alloc.create(ToolRunState) catch return;
+    tr.* = .{
+        .calls = std.ArrayList(tools_mod.ToolCall).empty,
+        .idx = 0,
+        .results = std.ArrayList(u8).empty,
+    };
+    for (parse_result.calls) |call| {
+        const id = app.alloc.dupe(u8, call.id) catch continue;
+        const name = app.alloc.dupe(u8, call.name) catch {
+            app.alloc.free(id);
+            continue;
+        };
+        const arguments = app.alloc.dupe(u8, call.arguments) catch {
+            app.alloc.free(id);
+            app.alloc.free(name);
+            continue;
+        };
+        tr.calls.append(app.alloc, .{ .index = call.index, .id = id, .name = name, .arguments = arguments }) catch {
+            app.alloc.free(id);
+            app.alloc.free(name);
+            app.alloc.free(arguments);
+        };
+    }
+    if (tr.calls.items.len == 0) {
+        app.alloc.destroy(tr);
+        return;
+    }
+    app.tool_run = tr;
+
+    processNextTool(app);
+}

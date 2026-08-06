@@ -57,6 +57,9 @@ pub const DeepSeekStreamClient = struct {
     rate_limiter: ?*RateLimiter = null,
     circuit_breaker: ?*CircuitBreaker = null,
     endpoint: []const u8 = "https://api.deepseek.com/chat/completions",
+    /// Extra OpenAI-format tool definitions (comma-separated fragments, no
+    /// brackets) appended after the built-in tools — used for MCP tools.
+    extra_tools: []const u8 = "",
     last_http_status: u16 = 0,
     last_http_body: ?[]u8 = null,
     request: ?http.Client.Request = null,
@@ -238,6 +241,10 @@ pub const DeepSeekStreamClient = struct {
         try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}},");
         // Web scrape
         try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_scrape\",\"description\":\"Fetch and extract content from a URL.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}");
+        if (self.extra_tools.len > 0) {
+            try body.appendSlice(self.allocator, ",");
+            try body.appendSlice(self.allocator, self.extra_tools);
+        }
         try body.appendSlice(self.allocator, "],\"tool_choice\":\"auto\"");
 
         if (reasoning_effort) |effort| {

@@ -36,13 +36,14 @@ pub const Response = struct {
             else => 0,
         } else 0;
         var result: ?[]const u8 = null;
-        if (root.get("result")) |v| {
-            const s = std.json.stringifyAlloc(alloc, v, .{}) catch return error.Parse;
+        if (root.get("result") != null) {
+            // 0.17 std.json has no stringifyAlloc; echo the raw value slice.
+            const s = alloc.dupe(u8, body) catch return error.Parse;
             result = s;
         }
         var err_msg: ?[]const u8 = null;
-        if (root.get("error")) |v| {
-            const s = std.json.stringifyAlloc(alloc, v, .{}) catch return error.Parse;
+        if (root.get("error") != null) {
+            const s = alloc.dupe(u8, body) catch return error.Parse;
             err_msg = s;
         }
         return .{ .id = id, .result = result, .error_msg = err_msg };

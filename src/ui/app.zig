@@ -690,6 +690,7 @@ pub const App = struct {
     streaming_idx: ?usize,
     mcp_servers: std.ArrayList(mcp_runner_mod.McpServer),
     mcp_session: ?mcp_runner_mod.McpSession,
+    mcp_tools_json: []const u8 = "",
     app_io: std.Io = undefined,
 
     // --- Input state
@@ -803,6 +804,7 @@ pub const App = struct {
             .streaming_idx = null,
             .mcp_servers = .empty,
             .mcp_session = null,
+            .mcp_tools_json = "",
             .app_io = undefined,
             .text_input = zz.components.TextInput.init(ctx.persistent_allocator),
             .palette = zz.components.CommandPalette.init(ctx.persistent_allocator) catch unreachable,
@@ -1511,6 +1513,40 @@ pub const App = struct {
                 return;
             };
             defer self.alloc.free(tl_resp);
+            // Parse MCP tools into OpenAI-format definitions for the model.
+            var mcp_tools = std.ArrayList(u8).empty;
+            defer mcp_tools.deinit(self.alloc);
+            var parsed_tl = std.json.parseFromSlice(std.json.Value, self.alloc, tl_resp, .{}) catch null;
+            if (parsed_tl) |pdoc| {
+                defer parsed_tl.?.deinit();
+                if (pdoc.value.object.get("result")) |res| {
+                    if (res.object.get("tools")) |tarr| {
+                        if (tarr == .array) {
+                            var first = true;
+                            for (tarr.array.items) |t| {
+                                const obj = t.object;
+                                const nm = if (obj.get("name")) |v| (if (v == .string) v.string else "") else "";
+                                const desc = if (obj.get("description")) |v| (if (v == .string) v.string else "") else "";
+                                // NOTE: 0.17 std.json has no stringifyAlloc; the
+                                // schema is passed as a generic object for now.
+                                const schema: ?[]const u8 = null;
+                                if (nm.len == 0) continue;
+                                if (!first) mcp_tools.appendSlice(self.alloc, ",") catch {};
+                                first = false;
+                                mcp_tools.appendSlice(self.alloc, "{\"type\":\"function\",\"function\":{\"name\":\"") catch {};
+                                mcp_tools.appendSlice(self.alloc, nm) catch {};
+                                mcp_tools.appendSlice(self.alloc, "\",\"description\":\"") catch {};
+                                mcp_tools.appendSlice(self.alloc, desc) catch {};
+                                mcp_tools.appendSlice(self.alloc, "\",\"parameters\":") catch {};
+                                mcp_tools.appendSlice(self.alloc, schema orelse "{\"type\":\"object\"}") catch {};
+                                mcp_tools.appendSlice(self.alloc, "}}") catch {};
+                            }
+                        }
+                    }
+                }
+            }
+            if (self.mcp_tools_json.len > 0) self.alloc.free(self.mcp_tools_json);
+            self.mcp_tools_json = mcp_tools.toOwnedSlice(self.alloc) catch "";
             info_buf.appendSlice(self.alloc, "tools: ") catch {};
             info_buf.appendSlice(self.alloc, tl_resp[0..@min(tl_resp.len, 400)]) catch {};
             self.setNotification(info_buf.items);

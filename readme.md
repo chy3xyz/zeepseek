@@ -2,7 +2,7 @@
 
 A terminal (TUI) DeepSeek client built with Zig and [zigzag](https://github.com/chy3xyz/zigzag). Streams chat completions, runs tools (shell/file/git/web) with an approval flow, manages sessions and long-term memory, and can talk to MCP servers.
 
-> ⚠️ **Compiler**: built and tested against Zig `0.17.0-dev.1422+e863bf3be` (the only version that builds this tree today). `zigzag` is vendored at `vendor/zigzag` with a small patch (`addPassthruArgs`) for that compiler.
+> ⚠️ **Compiler**: built and tested against Zig `0.17.0-dev.1422+e863bf3be` (the only version that builds this tree today). `zigzag` is vendored at `vendor/zigzag` with a small patch (`addPassthruArgs`) for that compiler. See **[BUILDING.md](BUILDING.md)** for the exact reproducible build steps.
 
 ## Build & run
 

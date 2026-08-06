@@ -3,7 +3,18 @@
 const std = @import("std");
 const zz = @import("zigzag");
 const theme = @import("theme.zig");
-const R = theme.Pal.R;
+const Pal = theme.Pal;
+const R = Pal.R;
+const B = Pal.B;
+const D = Pal.D;
+const U = Pal.U;
+const I = "\x1b[3m";
+const CodeBg = Pal.bg_code;
+const CodeInlineBg = Pal.bg_code_inline;
+const SearchHighlight = Pal.bg_highlight;
+const App = @import("app.zig").App;
+const render_text = @import("render_text.zig");
+const join = zz.join;
 
 pub fn padToCol(out: *std.ArrayList(u8), a: std.mem.Allocator, target: u16, used: usize) void {
     if (used < target) {
@@ -206,3 +217,567 @@ pub fn ansiVisibleLen(text: []const u8) usize {
         }
     }
 }
+
+pub fn renderSearchOverlay(app: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator, w: u16, h: u16) void {
+    _ = h; _ = w;
+    const bo = Pal.fg_dim;
+    lines.append(a, std.fmt.allocPrint(a, "{s}┌─ Search ─────────────────────────────────────────┐{s}", .{ bo, R }) catch "") catch {};
+    lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}▸{s} {s}{s}{s}", .{ bo, R, Pal.yellow, R, Pal.fg, app.search_query.items, R }) catch "") catch {};
+    lines.append(a, std.fmt.allocPrint(a, "{s}└────────────────────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
+}
+
+pub fn updateHelpModal(app: *App) void {
+    app.help_modal.title = "Keybindings";
+    app.help_modal.body =
+        \\Ctrl+C      Quit
+        \\Ctrl+P      Open command palette
+        \\Ctrl+F      Search messages
+        \\Ctrl+N      Toggle thinking display
+        \\Ctrl+S      Toggle sub-agent panel
+        \\Ctrl+T      Cycle color theme
+        \\Ctrl+O      Message detail
+        \\Enter       Send message
+        \\Shift+Enter Newline in input
+        \\↑/↓         Scroll / navigate
+        \\/           Open command palette
+        \\F1 / ?      Toggle this help
+        \\Esc         Close overlay
+    ;
+}
+
+pub fn updateDetailModal(app: *App) void {
+    if (app.detail_idx >= app.messages.items.len) {
+        app.detail_modal.title = "Message Detail";
+        app.detail_modal.body = "";
+        return;
+    }
+    const m = app.messages.items[app.detail_idx];
+    app.detail_modal.title = std.fmt.allocPrint(app.alloc, "Message Detail ({d}/{d})", .{ app.detail_idx + 1, app.messages.items.len }) catch "Message Detail";
+    app.detail_modal.body = m.content;
+}
+
+// ── Claude-style header: border box with title + model info ──
+
+pub fn renderClaudeHeader(app: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+    const streaming = app.streaming_idx != null;
+    const cell_w = if (w >= 2) w - 2 else 0;
+
+    // Top border
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, Pal.fg_dim) catch {};
+    out.appendSlice(a, "┌") catch {};
+    var c: u16 = 1;
+    while (c < w - 1) : (c += 1) { out.appendSlice(a, "─") catch {}; }
+    out.appendSlice(a, "┐") catch {};
+    out.appendSlice(a, R) catch {};
+    out.appendSlice(a, "\n") catch {};
+
+    // Title row: left, center=model, right=status (+ ● generating)
+    // Pre-compute the right segment so we know its visual width.
+    const ctx_pct: f64 = if (app.ctx_max > 0) @as(f64, @floatFromInt(app.tokens_used)) / @as(f64, @floatFromInt(app.ctx_max)) * 100.0 else 0.0;
+    var right_buf = std.ArrayList(u8).empty;
+    right_buf.appendSlice(a, " ") catch {};
+    if (streaming) {
+        right_buf.appendSlice(a, Pal.red) catch {};
+        right_buf.appendSlice(a, "● ") catch {};
+        right_buf.appendSlice(a, R) catch {};
+    }
+    right_buf.appendSlice(a, Pal.fg_dim) catch {};
+    right_buf.appendSlice(a, "turn ") catch {};
+    right_buf.appendSlice(a, R) catch {};
+    right_buf.appendSlice(a, Pal.yellow) catch {};
+    appendIntFn(&right_buf, a, app.turn);
+    right_buf.appendSlice(a, R) catch {};
+    right_buf.appendSlice(a, D) catch {};
+    right_buf.appendSlice(a, " ctx ") catch {};
+    right_buf.appendSlice(a, R) catch {};
+    // Context water level, color-banded to reasonix fold thresholds
+    // (fold_warn 50 / aggressive 70 / exit 80): green <50, yellow 50-70,
+    // orange 70-80, red >80.
+    const ctx_color: []const u8 = if (ctx_pct > 80) Pal.red else if (ctx_pct > 70) Pal.orange else if (ctx_pct > 50) Pal.yellow else Pal.green;
+    right_buf.appendSlice(a, ctx_color) catch {};
+    appendFmtFn(&right_buf, a, "{d:.0}%", .{ctx_pct});
+    right_buf.appendSlice(a, R) catch {};
+    right_buf.appendSlice(a, D) catch {};
+    right_buf.appendSlice(a, " cache ") catch {};
+    right_buf.appendSlice(a, R) catch {};
+    right_buf.appendSlice(a, Pal.cyan) catch {};
+    appendFmtFn(&right_buf, a, "{d:.0}%", .{app.cacheHitRate() * 100.0});
+    right_buf.appendSlice(a, R) catch {};
+    if (streaming) {
+        right_buf.appendSlice(a, " ") catch {};
+        right_buf.appendSlice(a, B) catch {};
+        right_buf.appendSlice(a, Pal.yellow) catch {};
+        right_buf.appendSlice(a, "◐") catch {};
+        right_buf.appendSlice(a, R) catch {};
+    }
+    const right_text = right_buf.toOwnedSlice(a) catch "";
+    const right_len = zz.layout.measure.width(right_text);
+
+    const left_text = " zeepseek ";
+    const left_len: u16 = 10;
+    const model_len: u16 = @min(@as(u16, @intCast(app.model.len)), if (cell_w > left_len + right_len) cell_w - left_len - right_len else 0);
+
+    // Distribute remaining space: center the model between left and right.
+    const total_fixed = left_len + model_len + @as(u16, @intCast(right_len));
+    const remaining = if (cell_w > total_fixed) cell_w - total_fixed else 0;
+    const left_pad = remaining / 2;
+    const right_pad = remaining - left_pad;
+
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, R) catch {};
+
+    // Left: zeepseek
+    out.appendSlice(a, B) catch {};
+    out.appendSlice(a, Pal.yellow) catch {};
+    out.appendSlice(a, left_text) catch {};
+    out.appendSlice(a, R) catch {};
+
+    // Center: model name
+    out.appendSlice(a, D) catch {};
+    var pad: u16 = 0;
+    while (pad < left_pad) : (pad += 1) { out.appendSlice(a, " ") catch {}; }
+    out.appendSlice(a, Pal.fg) catch {};
+    if (model_len < app.model.len) {
+        out.appendSlice(a, app.model[0..model_len]) catch {};
+        out.appendSlice(a, "…") catch {};
+    } else {
+        out.appendSlice(a, app.model) catch {};
+    }
+    out.appendSlice(a, R) catch {};
+    pad = 0;
+    while (pad < right_pad) : (pad += 1) { out.appendSlice(a, " ") catch {}; }
+
+    // Right: turn + ctx + cache
+    out.appendSlice(a, right_text) catch {};
+
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, R) catch {};
+    out.appendSlice(a, "\n") catch {};
+
+    // Bottom border
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, Pal.fg_dim) catch {};
+    out.appendSlice(a, "└") catch {};
+    c = 1;
+    while (c < w - 1) : (c += 1) { out.appendSlice(a, "─") catch {}; }
+    out.appendSlice(a, "┘") catch {};
+    out.appendSlice(a, R) catch {};
+}
+
+// ── Claude-style input line ──
+
+pub fn renderClaudeInput(app: *App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│ ") catch {};
+    out.appendSlice(a, R) catch {};
+
+    if (app.pending_tool != null) {
+        app.text_input.setEchoMode(.normal);
+        app.text_input.setPrompt("⚠ ");
+        app.text_input.setPlaceholder("Tool awaiting approval — Enter allow / Esc deny");
+    } else if (app.pending_action == .await_api_key) {
+        app.text_input.setEchoMode(.password);
+        app.text_input.setPrompt("🔑 ");
+        app.text_input.setPlaceholder("Enter API key...");
+    } else if (app.streaming_idx != null) {
+        app.text_input.setEchoMode(.normal);
+        app.text_input.setPrompt("▸ ");
+        // Input stays active during streaming; submissions are queued.
+        app.text_input.setPlaceholder("Type to queue… (auto-sends when done)");
+    } else {
+        app.text_input.setEchoMode(.normal);
+        app.text_input.setPrompt("▸ ");
+        app.text_input.setPlaceholder("Type a message, or / for commands");
+    }
+
+    const input_view = app.text_input.view(a) catch "Error";
+    defer if (input_view.ptr != "Error".ptr) a.free(input_view);
+    const input_vis = zz.layout.measure.width(input_view);
+    const max_input = if (w > 4) w - 4 else 0;
+    const input_with_cursor = blk: {
+        if (app.cursor_visible) {
+            break :blk std.fmt.allocPrint(a, "{s}|", .{input_view}) catch input_view;
+        }
+        break :blk input_view;
+    };
+    defer if (input_with_cursor.ptr != input_view.ptr and input_with_cursor.len > 0) a.free(input_with_cursor);
+    const display_input = if (input_vis > max_input)
+        (ansiClip(a, input_with_cursor, max_input) catch input_with_cursor)
+    else
+        input_view;
+    defer if (display_input.ptr != input_view.ptr) a.free(display_input);
+    out.appendSlice(a, display_input) catch {};
+
+    // Pad to fill the cell (inside width is w - 2, leading "│ " consumes 2)
+    const display_vis = zz.layout.measure.width(display_input);
+    const pad_target = if (w > 3) w - 3 else 0;
+    var p = display_vis;
+    while (p < pad_target) : (p += 1) { out.appendSlice(a, " ") catch {}; }
+
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, R) catch {};
+    out.appendSlice(a, "\n") catch {};
+}
+
+// ── Vertical separator between chat and sidebar ──
+
+pub fn buildVerticalSeparator(app: *const App, a: std.mem.Allocator, h: u16) []const u8 {
+    _ = app;
+    var buf = std.ArrayList(u8).empty;
+    var row: u16 = 0;
+    while (row < h) : (row += 1) {
+        buf.appendSlice(a, D) catch {};
+        buf.appendSlice(a, Pal.fg_dim) catch {};
+        buf.appendSlice(a, "│") catch {};
+        buf.appendSlice(a, R) catch {};
+        if (row + 1 < h) buf.appendSlice(a, "\n") catch {};
+    }
+    return buf.toOwnedSlice(a) catch "";
+}
+
+// ── Separator line ──
+
+pub fn renderClaudeSeparator(app: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+    _ = app;
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, R) catch {};
+    var c: u16 = 2;
+    while (c < w) : (c += 1) { out.appendSlice(a, "─") catch {}; }
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, "\n") catch {};
+}
+
+// ── Claude-style status bar ──
+
+pub fn renderClaudeStatus(app: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+    const streaming = app.streaming_idx != null;
+    const spin = if (app.cursor_visible) "◐" else "◑";
+    // The spinner is prepended to the regular shortcut/status hint instead
+    // of replacing it, so the hint (and the sidebar stats) stay visible.
+    const hint_full = if (streaming)
+        (std.fmt.allocPrint(a, "{s} generating  {s}", .{ spin, "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit" }) catch "generating…")
+    else
+        "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit";
+    defer if (streaming) a.free(@constCast(hint_full));
+    const cell_w = if (w >= 2) w - 2 else 0;
+    const content_w = if (cell_w > 1) cell_w - 1 else 0; // leading space
+
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, R) catch {};
+    out.appendSlice(a, " ") catch {};
+    out.appendSlice(a, Pal.fg_dim) catch {};
+
+    // Truncate hint if the terminal is too narrow
+    const hint = if (hint_full.len > content_w) hint_full[0..content_w] else hint_full;
+    out.appendSlice(a, hint) catch {};
+
+    var used: u16 = @as(u16, @intCast(1 + hint.len));
+    while (used < cell_w) : (used += 1) { out.appendSlice(a, " ") catch {}; }
+    out.appendSlice(a, D) catch {};
+    out.appendSlice(a, "│") catch {};
+    out.appendSlice(a, R) catch {};
+}
+
+// ── Claude-style chat rendering with markdown ──
+
+pub fn renderClaudeChat(app: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
+    _ = h;
+    var lines = std.ArrayList(u8).empty;
+    defer lines.deinit(a);
+
+    const total = app.messages.items.len;
+    if (total == 0) {
+        // Welcome / empty state
+        renderClaudeWelcome(app, &lines, a, w);
+        return lines.toOwnedSlice(a) catch "";
+    }
+
+    for (0..total) |i| {
+        const m = &app.messages.items[i];
+        const is_streaming = (app.streaming_idx == i);
+
+        // Role label
+        const role_color: []const u8 = switch (m.role) {
+            .user => Pal.blue, .assistant => Pal.green, .system => Pal.mauve, .tool => Pal.yellow,
+        };
+        const role_label: []const u8 = switch (m.role) {
+            .user => "You", .assistant => "Zeep", .system => "System", .tool => "Tool",
+        };
+        const spin = if (app.cursor_visible) " ◐" else " ◑";
+        const status_icon: []const u8 = if (is_streaming) spin else "";
+
+        lines.appendSlice(a, D) catch {};
+        lines.appendSlice(a, "│") catch {};
+        lines.appendSlice(a, R) catch {};
+        lines.appendSlice(a, " ") catch {};
+        lines.appendSlice(a, B) catch {};
+        lines.appendSlice(a, role_color) catch {};
+        lines.appendSlice(a, role_label) catch {};
+        lines.appendSlice(a, R) catch {};
+        if (status_icon.len > 0) {
+            lines.appendSlice(a, D) catch {};
+            lines.appendSlice(a, status_icon) catch {};
+            lines.appendSlice(a, R) catch {};
+        }
+        lines.appendSlice(a, "  ") catch {};
+
+        // Content — render markdown for assistant, plain for others
+        if (m.content.len > 0) {
+            if (m.role == .assistant) {
+                renderClaudeMarkdownContent(app, &lines, a, m.content, w - 10);
+            } else {
+                renderClaudePlainContent(app, &lines, a, m.content, w - 10);
+            }
+        } else if (is_streaming) {
+            lines.appendSlice(a, D) catch {};
+            lines.appendSlice(a, Pal.fg_dim) catch {};
+            lines.appendSlice(a, "(waiting...)") catch {};
+            lines.appendSlice(a, R) catch {};
+        }
+
+        // Thinking collapse toggle (only for assistant with thinking)
+        if (m.thinking) |th| {
+            if (th.len > 0) {
+                lines.appendSlice(a, "\n") catch {};
+                lines.appendSlice(a, D) catch {};
+                lines.appendSlice(a, "│   ") catch {};
+                lines.appendSlice(a, R) catch {};
+                const toggle_icon: []const u8 = if (m.think_collapsed) "▸" else "▾";
+                lines.appendSlice(a, Pal.cyan) catch {};
+                lines.appendSlice(a, toggle_icon) catch {};
+                lines.appendSlice(a, " ") catch {};
+                lines.appendSlice(a, Pal.fg_dim) catch {};
+                if (m.think_collapsed) {
+                    lines.appendSlice(a, "thinking...") catch {};
+                } else {
+                    lines.appendSlice(a, "thinking: ") catch {};
+                    lines.appendSlice(a, Pal.orange) catch {};
+                    lines.appendSlice(a, th) catch {};
+                }
+                lines.appendSlice(a, R) catch {};
+            }
+        }
+
+        // Tool calls
+        if (m.tool_calls.items.len > 0) {
+            lines.appendSlice(a, "\n") catch {};
+            lines.appendSlice(a, D) catch {};
+            lines.appendSlice(a, "│   ") catch {};
+            for (m.tool_calls.items) |tc| {
+                const tc_icon: []const u8 = switch (tc.status) {
+                    .running => "◐", .success => "✓", .failed => "✗",
+                };
+                const tc_clr: []const u8 = switch (tc.status) {
+                    .running => Pal.yellow, .success => Pal.green, .failed => Pal.red,
+                };
+                lines.appendSlice(a, tc_clr) catch {};
+                lines.appendSlice(a, tc_icon) catch {};
+                lines.appendSlice(a, R) catch {};
+                lines.appendSlice(a, " ") catch {};
+                lines.appendSlice(a, Pal.tool_call) catch {};
+                lines.appendSlice(a, tc.name) catch {};
+                lines.appendSlice(a, R) catch {};
+                lines.appendSlice(a, "  ") catch {};
+            }
+        }
+
+        if (i + 1 < total) {
+            // Faint separator line between messages.
+            lines.appendSlice(a, "\n") catch {};
+            lines.appendSlice(a, D) catch {};
+            lines.appendSlice(a, Pal.fg_dim) catch {};
+            lines.appendSlice(a, "  ············································") catch {};
+            lines.appendSlice(a, R) catch {};
+            lines.appendSlice(a, "\n") catch {};
+        }
+    }
+
+    return lines.toOwnedSlice(a) catch "";
+}
+
+pub fn renderClaudeWelcome(app: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
+    _ = app; _ = w;
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "│") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "\n") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "│") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "  ") catch {};
+    lines.appendSlice(a, B) catch {};
+    lines.appendSlice(a, Pal.yellow) catch {};
+    lines.appendSlice(a, "zeepseek") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, " — Claude CLI style TUI") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "\n") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "│") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "  ") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "Type a message to chat, or / for commands") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "\n") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "│") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "\n") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "│") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "  ") catch {};
+    lines.appendSlice(a, Pal.fg_dim) catch {};
+    lines.appendSlice(a, "Ctrl+P palette   Ctrl+F search   Ctrl+S sub-agents   Ctrl+N thinking   / commands") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "\n") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "│") catch {};
+    lines.appendSlice(a, R) catch {};
+    lines.appendSlice(a, "  ") catch {};
+    lines.appendSlice(a, D) catch {};
+    lines.appendSlice(a, "Press Ctrl+P or / to open command palette") catch {};
+    lines.appendSlice(a, R) catch {};
+}
+
+pub fn renderClaudeMarkdownContent(app: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, content: []const u8, w: u16) void {
+    _ = app;
+    var buf = std.ArrayList(u8).empty;
+    render_text.renderMarkdownAnsi(&buf, a, content, w);
+    lines.appendSlice(a, buf.items) catch {};
+    buf.deinit(a);
+}
+
+pub fn renderClaudePlainContent(app: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, content: []const u8, w: u16) void {
+    _ = app; _ = w;
+    lines.appendSlice(a, Pal.fg) catch {};
+    lines.appendSlice(a, content) catch {};
+    lines.appendSlice(a, R) catch {};
+}
+
+// ── Claude-style right sidebar ──
+
+pub fn renderClaudeSidebar(app: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
+    var lines = std.ArrayList(u8).empty;
+    defer lines.deinit(a);
+
+    const ctx_pct: f64 = if (app.ctx_max > 0) @as(f64, @floatFromInt(app.tokens_used)) / @as(f64, @floatFromInt(app.ctx_max)) * 100.0 else 0.0;
+    const cache_pct: f64 = app.cacheHitRate() * 100.0;
+    const streaming = app.streaming_idx != null;
+
+    const rows = [_]struct { label: []const u8, value: []const u8, color: []const u8 }{
+        .{ .label = "model", .value = app.model, .color = Pal.fg },
+        .{ .label = "provider", .value = app.provider, .color = Pal.cyan },
+        .{ .label = "turn", .value = "", .color = Pal.yellow },
+        .{ .label = "context", .value = "", .color = if (ctx_pct > 70) Pal.red else Pal.green },
+        .{ .label = "cache", .value = "", .color = Pal.cyan },
+        .{ .label = "git", .value = "", .color = if (app.git_changes > 0) Pal.yellow else Pal.fg_dim },
+        .{ .label = "mode", .value = @tagName(app.run_mode), .color = switch (app.run_mode) { .auto => Pal.green, .plan => Pal.yellow, .yolo => Pal.red } },
+        .{ .label = "status", .value = if (streaming) "streaming" else "idle", .color = if (streaming) Pal.yellow else Pal.fg_dim },
+    };
+
+    var r: u16 = 0;
+    while (r < h) : (r += 1) {
+        lines.appendSlice(a, D) catch {};
+        lines.appendSlice(a, "│") catch {};
+        lines.appendSlice(a, R) catch {};
+        lines.appendSlice(a, " ") catch {};
+
+        if (r == 0) {
+            // Title
+            lines.appendSlice(a, B) catch {};
+            lines.appendSlice(a, Pal.fg_dim) catch {};
+            lines.appendSlice(a, "INFO") catch {};
+            lines.appendSlice(a, R) catch {};
+            padToCol(&lines, a, w - 2, 5); // leading space + "INFO"
+        } else if (r - 1 < rows.len) {
+            const row = rows[r - 1];
+            lines.appendSlice(a, Pal.fg_dim) catch {};
+            lines.appendSlice(a, row.label) catch {};
+            lines.appendSlice(a, "  ") catch {};
+            lines.appendSlice(a, R) catch {};
+            lines.appendSlice(a, row.color) catch {};
+            const val: []const u8 = if (row.value.len > 0) row.value else val: {
+                if (std.mem.eql(u8, row.label, "turn")) {
+                    break :val std.fmt.allocPrint(a, "{d}", .{app.turn}) catch "";
+                } else if (std.mem.eql(u8, row.label, "git")) {
+                    // Always allocate so the free on static strings never fires.
+                    break :val if (app.git_changes > 0)
+                        std.fmt.allocPrint(a, "{d} changed", .{app.git_changes}) catch a.dupe(u8, "clean") catch ""
+                    else
+                        a.dupe(u8, "clean") catch "";
+                } else if (std.mem.eql(u8, row.label, "context")) {
+                    break :val std.fmt.allocPrint(a, "{d:.0}%", .{ctx_pct}) catch "";
+                } else if (std.mem.eql(u8, row.label, "cache")) {
+                    break :val std.fmt.allocPrint(a, "{d:.0}%", .{cache_pct}) catch "";
+                }
+                break :val "";
+            };
+            defer if (row.value.len == 0 and val.len > 0) a.free(@constCast(val));
+            lines.appendSlice(a, val) catch {};
+            lines.appendSlice(a, R) catch {};
+            const used = 1 + row.label.len + 2 + val.len; // leading space + label + gap + value
+            padToCol(&lines, a, w - 2, used);
+        } else {
+            // Empty rows
+            padToCol(&lines, a, w - 2, 1); // leading space only
+        }
+
+        lines.appendSlice(a, D) catch {};
+        lines.appendSlice(a, "│") catch {};
+        lines.appendSlice(a, R) catch {};
+        if (r + 1 < h) lines.appendSlice(a, "\n") catch {};
+    }
+
+    return lines.toOwnedSlice(a) catch "";
+}
+
+pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
+    _ = h;
+    const panel_w: u16 = @min(w, 48);
+    var lines = std.ArrayList([]const u8).empty;
+    defer lines.deinit(a);
+
+    const bo = Pal.fg_dim;
+    const title = std.fmt.allocPrint(a, "{s}┌─ Sub-Agents {s}", .{ bo, R }) catch "";
+    lines.append(a, title) catch {};
+    const top_pad = panel_w -| 15;
+    var top_line = std.ArrayList(u8).empty;
+    top_line.appendSlice(a, title) catch {};
+    var i: u16 = 0;
+    while (i < top_pad) : (i += 1) { top_line.appendSlice(a, "─") catch {}; }
+    top_line.appendSlice(a, "┐") catch {};
+    top_line.appendSlice(a, R) catch {};
+    lines.items[0] = top_line.toOwnedSlice(a) catch title;
+
+    if (app.subagents.items.len == 0) {
+        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  No active sub-agents  {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+    } else {
+        for (app.subagents.items) |sa| {
+            const status_icon: []const u8 = switch (sa.status) {
+                .pending => "○",
+                .streaming => "◐",
+                .complete => "✓",
+                .failed => "✗",
+                .truncated => "~",
+            };
+            const role_name = @tagName(sa.role);
+            const line = std.fmt.allocPrint(a, "{s}│{s} {s} {s}: {s}{s}│{s}", .{
+                bo, R, status_icon, sa.id, role_name, bo, R,
+            }) catch "";
+            lines.append(a, line) catch {};
+        }
+    }
+    lines.append(a, std.fmt.allocPrint(a, "{s}└──────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
+
+    return join.vertical(a, .left, lines.items) catch "";
+}
+

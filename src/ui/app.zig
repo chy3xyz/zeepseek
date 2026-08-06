@@ -961,8 +961,8 @@ pub const App = struct {
                 // Modal was dismissed; nothing extra to do
             }
             // Arrow keys navigate between messages while modal stays open
-            if (k == .left) { if (self.detail_idx > 0) self.detail_idx -= 1; self.updateDetailModal(); }
-            if (k == .right) { if (self.detail_idx + 1 < self.messages.items.len) self.detail_idx += 1; self.updateDetailModal(); }
+            if (k == .left) { if (self.detail_idx > 0) self.detail_idx -= 1; render_ui.updateDetailModal(self); }
+            if (k == .right) { if (self.detail_idx + 1 < self.messages.items.len) self.detail_idx += 1; render_ui.updateDetailModal(self); }
             return .none;
         }
 
@@ -1018,7 +1018,7 @@ pub const App = struct {
                 'c' => { self.should_quit = true; return .none; },
                 'f' => { self.search_active = true; self.search_query.clearRetainingCapacity(); },
                 's' => { self.show_subagents = !self.show_subagents; },
-                'o' => { if (self.messages.items.len > 0) { self.detail_idx = self.messages.items.len - 1; self.updateDetailModal(); self.detail_modal.show(); } },
+                'o' => { if (self.messages.items.len > 0) { self.detail_idx = self.messages.items.len - 1; render_ui.updateDetailModal(self); self.detail_modal.show(); } },
                 'p' => self.palette.open(),
                 'n' => self.show_thinking = !self.show_thinking,
                 't' => self.cycleTheme(),
@@ -1042,7 +1042,7 @@ pub const App = struct {
         // Ctrl+P opens the command palette for quick selection.
         // --- F1 / ? for help (when input empty)
         if (k == .f1 or (k == .char and k.char == '?' and self.text_input.getValue().len == 0)) {
-            self.updateHelpModal();
+            render_ui.updateHelpModal(self);
             self.help_modal.show();
             return .none;
         }
@@ -1576,7 +1576,7 @@ pub const App = struct {
     }
 
     /// Real semantic-cache hit rate from reasonix (falls back to 0).
-    fn cacheHitRate(self: *const App) f64 {
+    pub fn cacheHitRate(self: *const App) f64 {
         if (self.reasonix) |rx| return rx.hitRate();
         return 0;
     }
@@ -2530,7 +2530,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
             .scroll_top => { self.scroll_offset = 0; self.auto_scroll = false; },
             .scroll_bottom => { self.scroll_offset = 0; self.auto_scroll = true; },
             .compact_context => self.compactContext(),
-            .show_help => { self.updateHelpModal(); self.help_modal.show(); },
+            .show_help => { render_ui.updateHelpModal(self); self.help_modal.show(); },
 
             .set_model => |name| {
                 self.model = self.alloc.dupe(u8, name) catch self.model;
@@ -3000,7 +3000,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
         // Build header — title bar with model info
         var header_buf = std.ArrayList(u8).empty;
-        self.renderClaudeHeader(&header_buf, a, w);
+        render_ui.renderClaudeHeader(self, &header_buf, a, w);
         const header_text = header_buf.toOwnedSlice(a) catch return "";
 
         // Build footer — command hint (when typing '/'), separator, input + status
@@ -3046,19 +3046,19 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         footer_buf.appendSlice(a, "┤") catch {};
         footer_buf.appendSlice(a, R) catch {};
         footer_buf.appendSlice(a, "\n") catch {};
-        @constCast(self).renderClaudeInput(&footer_buf, a, w);
-        self.renderClaudeSeparator(&footer_buf, a, w);
-        self.renderClaudeStatus(&footer_buf, a, w);
+        render_ui.renderClaudeInput(@constCast(self), &footer_buf, a, w);
+        render_ui.renderClaudeSeparator(self, &footer_buf, a, w);
+        render_ui.renderClaudeStatus(self, &footer_buf, a, w);
         const footer_text = footer_buf.toOwnedSlice(a) catch "";
 
         // Build body: chat (left) + sidebar (right) using join.horizontal
-        const chat_text = self.renderClaudeChat(a, chat_w, body_h);
+        const chat_text = render_ui.renderClaudeChat(self, a, chat_w, body_h);
         defer a.free(chat_text);
         const chat_clipped = render_ui.clipFromBottom(a, chat_text, body_h, self.scroll_offset) catch chat_text;
         defer if (chat_clipped.ptr != chat_text.ptr) a.free(chat_clipped);
-        const sidebar_text = self.renderClaudeSidebar(a, sidebar_w, body_h);
+        const sidebar_text = render_ui.renderClaudeSidebar(self, a, sidebar_w, body_h);
         defer a.free(sidebar_text);
-        const sep_text = self.buildVerticalSeparator(a, body_h);
+        const sep_text = render_ui.buildVerticalSeparator(self, a, body_h);
         defer a.free(sep_text);
         const chat_padded = render_ui.enforceWidth(a, chat_clipped, chat_w) catch chat_clipped;
         defer if (chat_padded.ptr != chat_clipped.ptr) a.free(chat_padded);
@@ -3200,7 +3200,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         if (self.search_active) {
             var overlay_lines = std.ArrayList([]const u8).empty;
             defer overlay_lines.deinit(a);
-            self.renderSearchOverlay(&overlay_lines, a, w, h);
+            render_ui.renderSearchOverlay(self, &overlay_lines, a, w, h);
             if (overlay_lines.items.len > 0) {
                 const overlay_text = join.vertical(a, .left, overlay_lines.items) catch "";
                 defer a.free(overlay_text);
@@ -3212,7 +3212,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
 
         // Render sub-agent panel overlay (ANSI-aware overlay)
         if (self.show_subagents) {
-            const panel_view = self.renderClaudeSubAgentPanel(a, w, h);
+            const panel_view = render_ui.renderClaudeSubAgentPanel(self, a, w, h);
             defer a.free(panel_view);
             if (panel_view.len > 0) {
                 const pw = zz.layout.measure.maxLineWidth(panel_view);
@@ -3285,569 +3285,6 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
     }
 
     // ── Search overlay (kept custom because Modal has no built-in input) ──
-
-    fn renderSearchOverlay(self: *const App, lines: *std.ArrayList([]const u8), a: std.mem.Allocator, w: u16, h: u16) void {
-        _ = h; _ = w;
-        const bo = Pal.fg_dim;
-        lines.append(a, std.fmt.allocPrint(a, "{s}┌─ Search ─────────────────────────────────────────┐{s}", .{ bo, R }) catch "") catch {};
-        lines.append(a, std.fmt.allocPrint(a, "{s}│{s} {s}▸{s} {s}{s}{s}", .{ bo, R, Pal.yellow, R, Pal.fg, self.search_query.items, R }) catch "") catch {};
-        lines.append(a, std.fmt.allocPrint(a, "{s}└────────────────────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
-    }
-
-    fn updateHelpModal(self: *App) void {
-        self.help_modal.title = "Keybindings";
-        self.help_modal.body =
-            \\Ctrl+C      Quit
-            \\Ctrl+P      Open command palette
-            \\Ctrl+F      Search messages
-            \\Ctrl+N      Toggle thinking display
-            \\Ctrl+S      Toggle sub-agent panel
-            \\Ctrl+T      Cycle color theme
-            \\Ctrl+O      Message detail
-            \\Enter       Send message
-            \\Shift+Enter Newline in input
-            \\↑/↓         Scroll / navigate
-            \\/           Open command palette
-            \\F1 / ?      Toggle this help
-            \\Esc         Close overlay
-        ;
-    }
-
-    fn updateDetailModal(self: *App) void {
-        if (self.detail_idx >= self.messages.items.len) {
-            self.detail_modal.title = "Message Detail";
-            self.detail_modal.body = "";
-            return;
-        }
-        const m = self.messages.items[self.detail_idx];
-        self.detail_modal.title = std.fmt.allocPrint(self.alloc, "Message Detail ({d}/{d})", .{ self.detail_idx + 1, self.messages.items.len }) catch "Message Detail";
-        self.detail_modal.body = m.content;
-    }
-
-    // ── Claude-style header: border box with title + model info ──
-
-    fn renderClaudeHeader(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        const streaming = self.streaming_idx != null;
-        const cell_w = if (w >= 2) w - 2 else 0;
-
-        // Top border
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, Pal.fg_dim) catch {};
-        out.appendSlice(a, "┌") catch {};
-        var c: u16 = 1;
-        while (c < w - 1) : (c += 1) { out.appendSlice(a, "─") catch {}; }
-        out.appendSlice(a, "┐") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, "\n") catch {};
-
-        // Title row: left, center=model, right=status (+ ● generating)
-        // Pre-compute the right segment so we know its visual width.
-        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-        var right_buf = std.ArrayList(u8).empty;
-        right_buf.appendSlice(a, " ") catch {};
-        if (streaming) {
-            right_buf.appendSlice(a, Pal.red) catch {};
-            right_buf.appendSlice(a, "● ") catch {};
-            right_buf.appendSlice(a, R) catch {};
-        }
-        right_buf.appendSlice(a, Pal.fg_dim) catch {};
-        right_buf.appendSlice(a, "turn ") catch {};
-        right_buf.appendSlice(a, R) catch {};
-        right_buf.appendSlice(a, Pal.yellow) catch {};
-        render_ui.appendIntFn(&right_buf, a, self.turn);
-        right_buf.appendSlice(a, R) catch {};
-        right_buf.appendSlice(a, D) catch {};
-        right_buf.appendSlice(a, " ctx ") catch {};
-        right_buf.appendSlice(a, R) catch {};
-        // Context water level, color-banded to reasonix fold thresholds
-        // (fold_warn 50 / aggressive 70 / exit 80): green <50, yellow 50-70,
-        // orange 70-80, red >80.
-        const ctx_color: []const u8 = if (ctx_pct > 80) Pal.red else if (ctx_pct > 70) Pal.orange else if (ctx_pct > 50) Pal.yellow else Pal.green;
-        right_buf.appendSlice(a, ctx_color) catch {};
-        render_ui.appendFmtFn(&right_buf, a, "{d:.0}%", .{ctx_pct});
-        right_buf.appendSlice(a, R) catch {};
-        right_buf.appendSlice(a, D) catch {};
-        right_buf.appendSlice(a, " cache ") catch {};
-        right_buf.appendSlice(a, R) catch {};
-        right_buf.appendSlice(a, Pal.cyan) catch {};
-        render_ui.appendFmtFn(&right_buf, a, "{d:.0}%", .{self.cacheHitRate() * 100.0});
-        right_buf.appendSlice(a, R) catch {};
-        if (streaming) {
-            right_buf.appendSlice(a, " ") catch {};
-            right_buf.appendSlice(a, B) catch {};
-            right_buf.appendSlice(a, Pal.yellow) catch {};
-            right_buf.appendSlice(a, "◐") catch {};
-            right_buf.appendSlice(a, R) catch {};
-        }
-        const right_text = right_buf.toOwnedSlice(a) catch "";
-        const right_len = zz.layout.measure.width(right_text);
-
-        const left_text = " zeepseek ";
-        const left_len: u16 = 10;
-        const model_len: u16 = @min(@as(u16, @intCast(self.model.len)), if (cell_w > left_len + right_len) cell_w - left_len - right_len else 0);
-
-        // Distribute remaining space: center the model between left and right.
-        const total_fixed = left_len + model_len + @as(u16, @intCast(right_len));
-        const remaining = if (cell_w > total_fixed) cell_w - total_fixed else 0;
-        const left_pad = remaining / 2;
-        const right_pad = remaining - left_pad;
-
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, R) catch {};
-
-        // Left: zeepseek
-        out.appendSlice(a, B) catch {};
-        out.appendSlice(a, Pal.yellow) catch {};
-        out.appendSlice(a, left_text) catch {};
-        out.appendSlice(a, R) catch {};
-
-        // Center: model name
-        out.appendSlice(a, D) catch {};
-        var pad: u16 = 0;
-        while (pad < left_pad) : (pad += 1) { out.appendSlice(a, " ") catch {}; }
-        out.appendSlice(a, Pal.fg) catch {};
-        if (model_len < self.model.len) {
-            out.appendSlice(a, self.model[0..model_len]) catch {};
-            out.appendSlice(a, "…") catch {};
-        } else {
-            out.appendSlice(a, self.model) catch {};
-        }
-        out.appendSlice(a, R) catch {};
-        pad = 0;
-        while (pad < right_pad) : (pad += 1) { out.appendSlice(a, " ") catch {}; }
-
-        // Right: turn + ctx + cache
-        out.appendSlice(a, right_text) catch {};
-
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, "\n") catch {};
-
-        // Bottom border
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, Pal.fg_dim) catch {};
-        out.appendSlice(a, "└") catch {};
-        c = 1;
-        while (c < w - 1) : (c += 1) { out.appendSlice(a, "─") catch {}; }
-        out.appendSlice(a, "┘") catch {};
-        out.appendSlice(a, R) catch {};
-    }
-
-    // ── Claude-style input line ──
-
-    fn renderClaudeInput(self: *App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│ ") catch {};
-        out.appendSlice(a, R) catch {};
-
-        if (self.pending_tool != null) {
-            self.text_input.setEchoMode(.normal);
-            self.text_input.setPrompt("⚠ ");
-            self.text_input.setPlaceholder("Tool awaiting approval — Enter allow / Esc deny");
-        } else if (self.pending_action == .await_api_key) {
-            self.text_input.setEchoMode(.password);
-            self.text_input.setPrompt("🔑 ");
-            self.text_input.setPlaceholder("Enter API key...");
-        } else if (self.streaming_idx != null) {
-            self.text_input.setEchoMode(.normal);
-            self.text_input.setPrompt("▸ ");
-            // Input stays active during streaming; submissions are queued.
-            self.text_input.setPlaceholder("Type to queue… (auto-sends when done)");
-        } else {
-            self.text_input.setEchoMode(.normal);
-            self.text_input.setPrompt("▸ ");
-            self.text_input.setPlaceholder("Type a message, or / for commands");
-        }
-
-        const input_view = self.text_input.view(a) catch "Error";
-        defer if (input_view.ptr != "Error".ptr) a.free(input_view);
-        const input_vis = zz.layout.measure.width(input_view);
-        const max_input = if (w > 4) w - 4 else 0;
-        const input_with_cursor = blk: {
-            if (self.cursor_visible) {
-                break :blk std.fmt.allocPrint(a, "{s}|", .{input_view}) catch input_view;
-            }
-            break :blk input_view;
-        };
-        defer if (input_with_cursor.ptr != input_view.ptr and input_with_cursor.len > 0) a.free(input_with_cursor);
-        const display_input = if (input_vis > max_input)
-            (render_ui.ansiClip(a, input_with_cursor, max_input) catch input_with_cursor)
-        else
-            input_view;
-        defer if (display_input.ptr != input_view.ptr) a.free(display_input);
-        out.appendSlice(a, display_input) catch {};
-
-        // Pad to fill the cell (inside width is w - 2, leading "│ " consumes 2)
-        const display_vis = zz.layout.measure.width(display_input);
-        const pad_target = if (w > 3) w - 3 else 0;
-        var p = display_vis;
-        while (p < pad_target) : (p += 1) { out.appendSlice(a, " ") catch {}; }
-
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, "\n") catch {};
-    }
-
-    // ── Vertical separator between chat and sidebar ──
-
-    fn buildVerticalSeparator(self: *const App, a: std.mem.Allocator, h: u16) []const u8 {
-        _ = self;
-        var buf = std.ArrayList(u8).empty;
-        var row: u16 = 0;
-        while (row < h) : (row += 1) {
-            buf.appendSlice(a, D) catch {};
-            buf.appendSlice(a, Pal.fg_dim) catch {};
-            buf.appendSlice(a, "│") catch {};
-            buf.appendSlice(a, R) catch {};
-            if (row + 1 < h) buf.appendSlice(a, "\n") catch {};
-        }
-        return buf.toOwnedSlice(a) catch "";
-    }
-
-    // ── Separator line ──
-
-    fn renderClaudeSeparator(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        _ = self;
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, R) catch {};
-        var c: u16 = 2;
-        while (c < w) : (c += 1) { out.appendSlice(a, "─") catch {}; }
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, "\n") catch {};
-    }
-
-    // ── Claude-style status bar ──
-
-    fn renderClaudeStatus(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        const streaming = self.streaming_idx != null;
-        const spin = if (self.cursor_visible) "◐" else "◑";
-        // The spinner is prepended to the regular shortcut/status hint instead
-        // of replacing it, so the hint (and the sidebar stats) stay visible.
-        const hint_full = if (streaming)
-            (std.fmt.allocPrint(a, "{s} generating  {s}", .{ spin, "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit" }) catch "generating…")
-        else
-            "Ctrl+P palette  Ctrl+F search  Ctrl+S subagents  Ctrl+N thinking  Ctrl+C quit";
-        defer if (streaming) a.free(@constCast(hint_full));
-        const cell_w = if (w >= 2) w - 2 else 0;
-        const content_w = if (cell_w > 1) cell_w - 1 else 0; // leading space
-
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, R) catch {};
-        out.appendSlice(a, " ") catch {};
-        out.appendSlice(a, Pal.fg_dim) catch {};
-
-        // Truncate hint if the terminal is too narrow
-        const hint = if (hint_full.len > content_w) hint_full[0..content_w] else hint_full;
-        out.appendSlice(a, hint) catch {};
-
-        var used: u16 = @as(u16, @intCast(1 + hint.len));
-        while (used < cell_w) : (used += 1) { out.appendSlice(a, " ") catch {}; }
-        out.appendSlice(a, D) catch {};
-        out.appendSlice(a, "│") catch {};
-        out.appendSlice(a, R) catch {};
-    }
-
-    // ── Claude-style chat rendering with markdown ──
-
-    fn renderClaudeChat(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
-        _ = h;
-        var lines = std.ArrayList(u8).empty;
-        defer lines.deinit(a);
-
-        const total = self.messages.items.len;
-        if (total == 0) {
-            // Welcome / empty state
-            self.renderClaudeWelcome(&lines, a, w);
-            return lines.toOwnedSlice(a) catch "";
-        }
-
-        for (0..total) |i| {
-            const m = &self.messages.items[i];
-            const is_streaming = (self.streaming_idx == i);
-
-            // Role label
-            const role_color: []const u8 = switch (m.role) {
-                .user => Pal.blue, .assistant => Pal.green, .system => Pal.mauve, .tool => Pal.yellow,
-            };
-            const role_label: []const u8 = switch (m.role) {
-                .user => "You", .assistant => "Zeep", .system => "System", .tool => "Tool",
-            };
-            const spin = if (self.cursor_visible) " ◐" else " ◑";
-            const status_icon: []const u8 = if (is_streaming) spin else "";
-
-            lines.appendSlice(a, D) catch {};
-            lines.appendSlice(a, "│") catch {};
-            lines.appendSlice(a, R) catch {};
-            lines.appendSlice(a, " ") catch {};
-            lines.appendSlice(a, B) catch {};
-            lines.appendSlice(a, role_color) catch {};
-            lines.appendSlice(a, role_label) catch {};
-            lines.appendSlice(a, R) catch {};
-            if (status_icon.len > 0) {
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, status_icon) catch {};
-                lines.appendSlice(a, R) catch {};
-            }
-            lines.appendSlice(a, "  ") catch {};
-
-            // Content — render markdown for assistant, plain for others
-            if (m.content.len > 0) {
-                if (m.role == .assistant) {
-                    self.renderClaudeMarkdownContent(&lines, a, m.content, w - 10);
-                } else {
-                    self.renderClaudePlainContent(&lines, a, m.content, w - 10);
-                }
-            } else if (is_streaming) {
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, Pal.fg_dim) catch {};
-                lines.appendSlice(a, "(waiting...)") catch {};
-                lines.appendSlice(a, R) catch {};
-            }
-
-            // Thinking collapse toggle (only for assistant with thinking)
-            if (m.thinking) |th| {
-                if (th.len > 0) {
-                    lines.appendSlice(a, "\n") catch {};
-                    lines.appendSlice(a, D) catch {};
-                    lines.appendSlice(a, "│   ") catch {};
-                    lines.appendSlice(a, R) catch {};
-                    const toggle_icon: []const u8 = if (m.think_collapsed) "▸" else "▾";
-                    lines.appendSlice(a, Pal.cyan) catch {};
-                    lines.appendSlice(a, toggle_icon) catch {};
-                    lines.appendSlice(a, " ") catch {};
-                    lines.appendSlice(a, Pal.fg_dim) catch {};
-                    if (m.think_collapsed) {
-                        lines.appendSlice(a, "thinking...") catch {};
-                    } else {
-                        lines.appendSlice(a, "thinking: ") catch {};
-                        lines.appendSlice(a, Pal.orange) catch {};
-                        lines.appendSlice(a, th) catch {};
-                    }
-                    lines.appendSlice(a, R) catch {};
-                }
-            }
-
-            // Tool calls
-            if (m.tool_calls.items.len > 0) {
-                lines.appendSlice(a, "\n") catch {};
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, "│   ") catch {};
-                for (m.tool_calls.items) |tc| {
-                    const tc_icon: []const u8 = switch (tc.status) {
-                        .running => "◐", .success => "✓", .failed => "✗",
-                    };
-                    const tc_clr: []const u8 = switch (tc.status) {
-                        .running => Pal.yellow, .success => Pal.green, .failed => Pal.red,
-                    };
-                    lines.appendSlice(a, tc_clr) catch {};
-                    lines.appendSlice(a, tc_icon) catch {};
-                    lines.appendSlice(a, R) catch {};
-                    lines.appendSlice(a, " ") catch {};
-                    lines.appendSlice(a, Pal.tool_call) catch {};
-                    lines.appendSlice(a, tc.name) catch {};
-                    lines.appendSlice(a, R) catch {};
-                    lines.appendSlice(a, "  ") catch {};
-                }
-            }
-
-            if (i + 1 < total) {
-                // Faint separator line between messages.
-                lines.appendSlice(a, "\n") catch {};
-                lines.appendSlice(a, D) catch {};
-                lines.appendSlice(a, Pal.fg_dim) catch {};
-                lines.appendSlice(a, "  ············································") catch {};
-                lines.appendSlice(a, R) catch {};
-                lines.appendSlice(a, "\n") catch {};
-            }
-        }
-
-        return lines.toOwnedSlice(a) catch "";
-    }
-
-    fn renderClaudeWelcome(self: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, w: u16) void {
-        _ = self; _ = w;
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "│") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "\n") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "│") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "  ") catch {};
-        lines.appendSlice(a, B) catch {};
-        lines.appendSlice(a, Pal.yellow) catch {};
-        lines.appendSlice(a, "zeepseek") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, " — Claude CLI style TUI") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "\n") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "│") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "  ") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "Type a message to chat, or / for commands") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "\n") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "│") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "\n") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "│") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "  ") catch {};
-        lines.appendSlice(a, Pal.fg_dim) catch {};
-        lines.appendSlice(a, "Ctrl+P palette   Ctrl+F search   Ctrl+S sub-agents   Ctrl+N thinking   / commands") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "\n") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "│") catch {};
-        lines.appendSlice(a, R) catch {};
-        lines.appendSlice(a, "  ") catch {};
-        lines.appendSlice(a, D) catch {};
-        lines.appendSlice(a, "Press Ctrl+P or / to open command palette") catch {};
-        lines.appendSlice(a, R) catch {};
-    }
-
-    fn renderClaudeMarkdownContent(self: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, content: []const u8, w: u16) void {
-        _ = self;
-        var buf = std.ArrayList(u8).empty;
-        render_text.renderMarkdownAnsi(&buf, a, content, w);
-        lines.appendSlice(a, buf.items) catch {};
-        buf.deinit(a);
-    }
-
-    fn renderClaudePlainContent(self: *const App, lines: *std.ArrayList(u8), a: std.mem.Allocator, content: []const u8, w: u16) void {
-        _ = self; _ = w;
-        lines.appendSlice(a, Pal.fg) catch {};
-        lines.appendSlice(a, content) catch {};
-        lines.appendSlice(a, R) catch {};
-    }
-
-    // ── Claude-style right sidebar ──
-
-    fn renderClaudeSidebar(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
-        var lines = std.ArrayList(u8).empty;
-        defer lines.deinit(a);
-
-        const ctx_pct: f64 = if (self.ctx_max > 0) @as(f64, @floatFromInt(self.tokens_used)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0 else 0.0;
-        const cache_pct: f64 = self.cacheHitRate() * 100.0;
-        const streaming = self.streaming_idx != null;
-
-        const rows = [_]struct { label: []const u8, value: []const u8, color: []const u8 }{
-            .{ .label = "model", .value = self.model, .color = Pal.fg },
-            .{ .label = "provider", .value = self.provider, .color = Pal.cyan },
-            .{ .label = "turn", .value = "", .color = Pal.yellow },
-            .{ .label = "context", .value = "", .color = if (ctx_pct > 70) Pal.red else Pal.green },
-            .{ .label = "cache", .value = "", .color = Pal.cyan },
-            .{ .label = "git", .value = "", .color = if (self.git_changes > 0) Pal.yellow else Pal.fg_dim },
-            .{ .label = "mode", .value = @tagName(self.run_mode), .color = switch (self.run_mode) { .auto => Pal.green, .plan => Pal.yellow, .yolo => Pal.red } },
-            .{ .label = "status", .value = if (streaming) "streaming" else "idle", .color = if (streaming) Pal.yellow else Pal.fg_dim },
-        };
-
-        var r: u16 = 0;
-        while (r < h) : (r += 1) {
-            lines.appendSlice(a, D) catch {};
-            lines.appendSlice(a, "│") catch {};
-            lines.appendSlice(a, R) catch {};
-            lines.appendSlice(a, " ") catch {};
-
-            if (r == 0) {
-                // Title
-                lines.appendSlice(a, B) catch {};
-                lines.appendSlice(a, Pal.fg_dim) catch {};
-                lines.appendSlice(a, "INFO") catch {};
-                lines.appendSlice(a, R) catch {};
-                render_ui.padToCol(&lines, a, w - 2, 5); // leading space + "INFO"
-            } else if (r - 1 < rows.len) {
-                const row = rows[r - 1];
-                lines.appendSlice(a, Pal.fg_dim) catch {};
-                lines.appendSlice(a, row.label) catch {};
-                lines.appendSlice(a, "  ") catch {};
-                lines.appendSlice(a, R) catch {};
-                lines.appendSlice(a, row.color) catch {};
-                const val: []const u8 = if (row.value.len > 0) row.value else val: {
-                    if (std.mem.eql(u8, row.label, "turn")) {
-                        break :val std.fmt.allocPrint(a, "{d}", .{self.turn}) catch "";
-                    } else if (std.mem.eql(u8, row.label, "git")) {
-                        // Always allocate so the free on static strings never fires.
-                        break :val if (self.git_changes > 0)
-                            std.fmt.allocPrint(a, "{d} changed", .{self.git_changes}) catch a.dupe(u8, "clean") catch ""
-                        else
-                            a.dupe(u8, "clean") catch "";
-                    } else if (std.mem.eql(u8, row.label, "context")) {
-                        break :val std.fmt.allocPrint(a, "{d:.0}%", .{ctx_pct}) catch "";
-                    } else if (std.mem.eql(u8, row.label, "cache")) {
-                        break :val std.fmt.allocPrint(a, "{d:.0}%", .{cache_pct}) catch "";
-                    }
-                    break :val "";
-                };
-                defer if (row.value.len == 0 and val.len > 0) a.free(@constCast(val));
-                lines.appendSlice(a, val) catch {};
-                lines.appendSlice(a, R) catch {};
-                const used = 1 + row.label.len + 2 + val.len; // leading space + label + gap + value
-                render_ui.padToCol(&lines, a, w - 2, used);
-            } else {
-                // Empty rows
-                render_ui.padToCol(&lines, a, w - 2, 1); // leading space only
-            }
-
-            lines.appendSlice(a, D) catch {};
-            lines.appendSlice(a, "│") catch {};
-            lines.appendSlice(a, R) catch {};
-            if (r + 1 < h) lines.appendSlice(a, "\n") catch {};
-        }
-
-        return lines.toOwnedSlice(a) catch "";
-    }
-
-    fn renderClaudeSubAgentPanel(self: *const App, a: std.mem.Allocator, w: u16, h: u16) []const u8 {
-        _ = h;
-        const panel_w: u16 = @min(w, 48);
-        var lines = std.ArrayList([]const u8).empty;
-        defer lines.deinit(a);
-
-        const bo = Pal.fg_dim;
-        const title = std.fmt.allocPrint(a, "{s}┌─ Sub-Agents {s}", .{ bo, R }) catch "";
-        lines.append(a, title) catch {};
-        const top_pad = panel_w -| 15;
-        var top_line = std.ArrayList(u8).empty;
-        top_line.appendSlice(a, title) catch {};
-        var i: u16 = 0;
-        while (i < top_pad) : (i += 1) { top_line.appendSlice(a, "─") catch {}; }
-        top_line.appendSlice(a, "┐") catch {};
-        top_line.appendSlice(a, R) catch {};
-        lines.items[0] = top_line.toOwnedSlice(a) catch title;
-
-        if (self.subagents.items.len == 0) {
-            lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  No active sub-agents  {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
-        } else {
-            for (self.subagents.items) |sa| {
-                const status_icon: []const u8 = switch (sa.status) {
-                    .pending => "○",
-                    .streaming => "◐",
-                    .complete => "✓",
-                    .failed => "✗",
-                    .truncated => "~",
-                };
-                const role_name = @tagName(sa.role);
-                const line = std.fmt.allocPrint(a, "{s}│{s} {s} {s}: {s}{s}│{s}", .{
-                    bo, R, status_icon, sa.id, role_name, bo, R,
-                }) catch "";
-                lines.append(a, line) catch {};
-            }
-        }
-        lines.append(a, std.fmt.allocPrint(a, "{s}└──────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
-
-        return join.vertical(a, .left, lines.items) catch "";
-    }
 
 };
 

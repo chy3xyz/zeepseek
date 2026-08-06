@@ -179,6 +179,21 @@ test "memory add and recall" {
     try std.testing.expect(std.mem.indexOf(u8, r, "zig") == null);
 }
 
+test "memory add writes the fact to the file" {
+    const alloc = std.testing.allocator;
+    var mem = Memory.init(alloc);
+    defer mem.deinit();
+    const path = "/tmp/zz_mem_add_test.md";
+    mem.add(path, "user prefers tabs");
+    const fd = std.c.open(path, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    try std.testing.expect(fd >= 0);
+    defer _ = std.c.close(fd);
+    var buf: [256]u8 = undefined;
+    const r = std.c.read(fd, &buf, buf.len);
+    try std.testing.expect(r > 0);
+    try std.testing.expectEqualStrings("user prefers tabs\n", buf[0..@intCast(r)]);
+}
+
 test "memory empty recall" {
     const alloc = std.testing.allocator;
     var mem = Memory.init(alloc);

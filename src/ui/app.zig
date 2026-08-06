@@ -1543,9 +1543,12 @@ pub const App = struct {
 
         // /memory <fact>: add a long-term fact; /memory recall <q>: show matches.
         if (std.mem.startsWith(u8, text_slice, "/memory")) {
+            const arg_slice = std.mem.trim(u8, text_slice["/memory".len..], " ");
+            // Dupe BEFORE setValue("") — the input buffer is recycled below.
+            const arg = self.alloc.dupe(u8, arg_slice) catch return;
+            defer self.alloc.free(arg);
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;
-            const arg = std.mem.trim(u8, text_slice["/memory".len..], " ");
             if (std.mem.startsWith(u8, arg, "recall ")) {
                 const q = std.mem.trim(u8, arg["recall ".len..], " ");
                 if (self.memory) |mem| {

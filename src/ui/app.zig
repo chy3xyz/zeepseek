@@ -25,6 +25,7 @@ const render_text = @import("render_text.zig");
 const render_ui = @import("render_ui.zig");
 const slash_commands = @import("slash_commands.zig");
 const tools_run = @import("tools_run.zig");
+const sessions = @import("sessions.zig");
 const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
@@ -851,8 +852,8 @@ pub const App = struct {
             .tool_output => |t| self.onToolOutput(t.name, t.output, t.success),
             .subagent_start => |s| self.onSubAgentStart(s.id, s.role, s.goal),
             .subagent_update => |s| self.onSubAgentUpdate(s.id, s.summary, s.status),
-            .save_session => self.saveSession(self.session_id),
-            .load_session => |path| self.loadSession(path),
+            .save_session => sessions.saveSession(self, self.session_id),
+            .load_session => |path| sessions.loadSession(self, path),
             .tick => |t| {
                 self.cursor_visible = (t.timestamp / 500_000_000) % 2 == 0; // blink every 500ms
                 // Periodic reasonix TTL cleanup (~every 5s at 60fps).
@@ -974,7 +975,7 @@ pub const App = struct {
             if (k == .enter) {
                 // Jump to first matching message
                 if (self.search_query.items.len > 0) {
-                    self.jumpToMatch();
+                    sessions.jumpToMatch(self);
                 }
                 self.search_active = false;
                 return .none;
@@ -1979,175 +1980,6 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
 
     pub fn setNotification(self: *App, msg: []const u8) void {
         self.toast.push(msg, .info, 2000, 0) catch {};
-    }
-
-    pub fn saveSession(self: *App, name: []const u8) void {
-        if (!isValidSessionName(name)) {
-            self.setNotification("Invalid session name (letters, digits, - and _ only)");
-            return;
-        }
-        const home_ptr = std.c.getenv("HOME") orelse return;
-        const home = std.mem.sliceTo(home_ptr, 0);
-        if (home.len == 0) return;
-        // Ensure dirs exist (mkdir is not recursive; both levels needed)
-        var home_dir_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&home_dir_buf, "{s}/.zeepseek", .{home}, 0) catch return;
-        _ = std.c.mkdir(&home_dir_buf, 0o755);
-        var dir_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&dir_buf, "{s}/.zeepseek/sessions", .{home}, 0) catch return;
-        _ = std.c.mkdir(&dir_buf, 0o755);
-        // Build file path
-        var path_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, name }, 0) catch return;
-        // Serialize via the shared length-prefixed format
-        var msgs = std.ArrayList(session_format.SerializedMessage).empty;
-        defer msgs.deinit(self.alloc);
-        for (self.messages.items) |m| {
-            const role: session_format.Role = switch (m.role) {
-                .user => .user, .assistant => .assistant, .system => .system, .tool => .tool,
-            };
-            msgs.append(self.alloc, .{ .role = role, .content = m.content }) catch {};
-        }
-        const blob = session_format.serialize(self.alloc, msgs.items) catch {
-            self.setNotification("Save failed: serialization error");
-            return;
-        };
-        defer self.alloc.free(blob);
-
-        // Atomic write: tmp file + full write with error checks + fsync +
-        // rename, so a crash never leaves a truncated/partial session file.
-        var tmp_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&tmp_buf, "{s}/.zeepseek/sessions/.{s}.tmp", .{ home, name }, 0) catch return;
-        const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
-        const fd = std.c.open(&tmp_buf, flags, @as(std.c.mode_t, 0o644));
-        if (fd < 0) {
-            self.setNotification("Save failed: cannot open session file");
-            return;
-        }
-        defer _ = std.c.close(fd);
-        var off: usize = 0;
-        while (off < blob.len) {
-            const n = std.c.write(fd, blob.ptr + off, blob.len - off);
-            if (n <= 0) {
-                self.setNotification("Save failed: write error");
-                return;
-            }
-            off += @intCast(n);
-        }
-        _ = std.c.fsync(fd);
-        if (std.c.rename(&tmp_buf, &path_buf) != 0) {
-            self.setNotification("Save failed: rename error");
-            return;
-        }
-        const note = std.fmt.allocPrint(self.alloc, "Session saved: {s}", .{name}) catch return;
-        defer self.alloc.free(note);
-        self.setNotification(note);
-    }
-
-    fn isValidSessionName(name: []const u8) bool {
-        if (name.len == 0 or name.len > 100) return false;
-        for (name) |c| {
-            if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_') return false;
-        }
-        return true;
-    }
-
-    fn setSessionName(self: *App, name: []const u8) void {
-        if (!isValidSessionName(name)) return;
-        const new = self.alloc.dupe(u8, name) catch return;
-        if (self.session_id_alloc) |a| a.free(self.session_id);
-        self.session_id = new;
-        self.session_id_alloc = self.alloc;
-    }
-
-    pub fn loadSession(self: *App, name: []const u8) void {
-        if (!isValidSessionName(name)) {
-            self.setNotification("Invalid session name (letters, digits, - and _ only)");
-            return;
-        }
-        const home_ptr = std.c.getenv("HOME") orelse return;
-        const home = std.mem.sliceTo(home_ptr, 0);
-        var path_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/sessions/{s}.txt", .{ home, name }, 0) catch return;
-        const fd = std.c.open(&path_buf, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
-        if (fd < 0) {
-            const msg = std.fmt.allocPrint(self.alloc, "No saved session \"{s}\"", .{name}) catch return;
-            defer self.alloc.free(msg);
-            self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
-            return;
-        }
-        defer _ = std.c.close(fd);
-        // Read entire file
-        var data = std.ArrayList(u8).empty;
-        defer data.deinit(self.alloc);
-        var read_buf: [4096]u8 = undefined;
-        while (true) {
-            const n = std.c.read(fd, &read_buf, read_buf.len);
-            if (n <= 0) break;
-            data.appendSlice(self.alloc, read_buf[0..@intCast(n)]) catch break;
-        }
-        // Parse via the shared module; parsed content ownership moves into
-        // the message list (owns = true).
-        const parsed = session_format.parse(self.alloc, data.items) catch return;
-        defer self.alloc.free(parsed);
-        self.clearMessages();
-        for (parsed) |pm| {
-            const role: Role = switch (pm.role) {
-                .user => .user, .assistant => .assistant, .system => .system, .tool => .tool,
-            };
-            self.messages.append(self.alloc, .{
-                .role = role,
-                .content = pm.content,
-                .owns = true,
-            }) catch {};
-        }
-        self.setSessionName(name);
-        self.auto_scroll = true;
-        self.streaming_idx = null;
-    }
-
-    pub fn listSessions(self: *App) void {
-        const home_ptr = std.c.getenv("HOME") orelse return;
-        const home = std.mem.sliceTo(home_ptr, 0);
-        var dir_buf: [512:0]u8 = undefined;
-        _ = std.fmt.bufPrintSentinel(&dir_buf, "{s}/.zeepseek/sessions", .{home}, 0) catch return;
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-        out.appendSlice(self.alloc, "Saved sessions:\n") catch {};
-        var dir = std.Io.Dir.openDirAbsolute(self.io, std.mem.sliceTo(&dir_buf, 0), .{}) catch {
-            out.appendSlice(self.alloc, "  (no sessions directory yet)\n") catch {};
-            const msg = self.alloc.dupe(u8, out.items) catch return;
-            self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
-            return;
-        };
-        defer dir.close(self.io);
-        var it = dir.iterate();
-        var count: usize = 0;
-        while (it.next(self.io) catch null) |e| {
-            if (e.kind != .file) continue;
-            if (!std.mem.endsWith(u8, e.name, ".txt")) continue;
-            const name = e.name[0 .. e.name.len - 4];
-            if (name.len == 0) continue;
-            out.appendSlice(self.alloc, "  ") catch {};
-            out.appendSlice(self.alloc, name) catch {};
-            out.appendSlice(self.alloc, "\n") catch {};
-            count += 1;
-        }
-        if (count == 0) out.appendSlice(self.alloc, "  (none)\n") catch {};
-        const msg = self.alloc.dupe(u8, out.items) catch return;
-        self.messages.append(self.alloc, .{ .role = .system, .content = msg, .owns = true }) catch {};
-    }
-
-    fn jumpToMatch(self: *App) void {
-        const q = self.search_query.items;
-        if (q.len == 0) return;
-        self.auto_scroll = false;
-        for (self.messages.items, 0..) |m, idx| {
-            if (std.mem.indexOf(u8, m.content, q) != null) {
-                self.scroll_offset = @intCast(idx);
-                return;
-            }
-        }
     }
 
     pub fn toggleToolCollapse(self: *App) void {

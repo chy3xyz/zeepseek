@@ -14,6 +14,7 @@ const SlashDispatcher = @import("slash_command_dispatcher.zig");
 const memory_mod = @import("../cache/memory.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
 const render_ui = @import("render_ui.zig");
+const sessions = @import("sessions.zig");
 
 /// Handle the inline slash commands in the submit path. Returns true if the
 /// input was consumed as a command.
@@ -338,8 +339,8 @@ pub fn executeSlashCommand(app: *App, id: []const u8, args: []const u8) void {
 
         .quit => app.should_quit = true,
         .clear_chat => app.clearMessages(),
-        .save_session => app.saveSession(if (args.len > 0) args else app.session_id),
-        .load_session => app.loadSession(if (args.len > 0) args else app.session_id),
+        .save_session => sessions.saveSession(app, if (args.len > 0) args else app.session_id),
+        .load_session => sessions.loadSession(app, if (args.len > 0) args else app.session_id),
         .toggle_thinking => app.show_thinking = !app.show_thinking,
         .toggle_tools => app.toggleToolCollapse(),
         .toggle_subagents => app.show_subagents = !app.show_subagents,

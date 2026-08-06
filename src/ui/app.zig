@@ -903,8 +903,8 @@ pub const App = struct {
 
         // --- Tool approval overlay (highest priority)
         if (self.pending_tool != null) {
-            if (k == .enter or (k == .char and k.char == '1')) { self.approvePendingTool(); return .none; }
-            if (k == .escape or (k == .char and k.char == '2')) { self.rejectPendingTool(); return .none; }
+            if (k == .enter or (k == .char and k.char == '1')) { tools_run.approvePendingTool(self); return .none; }
+            if (k == .escape or (k == .char and k.char == '2')) { tools_run.rejectPendingTool(self); return .none; }
             return .none;
         }
 
@@ -1322,7 +1322,7 @@ pub const App = struct {
         return start;
     }
 
-    fn startStreaming(self: *App, user_input: []const u8, git_ctx_owned: []const u8) void {
+    pub fn startStreaming(self: *App, user_input: []const u8, git_ctx_owned: []const u8) void {
         // Join the previous thread first: it may still be pushing into ss.
         if (self.stream_thread) |t| t.join();
         if (self.stream_state) |ss| {
@@ -1614,112 +1614,11 @@ pub const App = struct {
         }
         self.tool_run = tr;
 
-        self.processNextTool();
+        tools_run.processNextTool(self);
     }
 
     /// Process the next queued tool call. Pauses at the first call that
     /// requires user approval (pending_tool) and resumes on Enter/Esc.
-    fn processNextTool(self: *App) void {
-        const tr = self.tool_run orelse return;
-        if (tr.idx >= tr.calls.items.len) {
-            self.finishToolRun();
-            return;
-        }
-        const call = tr.calls.items[tr.idx];
-        self.onToolStart(call.name, call.arguments);
-
-        const approval_needed = switch (self.run_mode) {
-            .auto => tools_mod.requiresApproval(self.sandbox, call),
-            .plan => true,
-            .yolo => false,
-        };
-        if (approval_needed) {
-            const cwd_ptr = std.c.getenv("PWD") orelse ".";
-            const cwd = std.mem.sliceTo(cwd_ptr, 0);
-            self.pending_tool = .{
-                .idx = tr.idx,
-                .cwd = self.alloc.dupe(u8, cwd) catch return,
-            };
-            self.setNotification("Tool approval required — Enter to allow, Esc to deny");
-            return;
-        }
-
-        self.executeCurrentTool();
-    }
-
-    fn executeCurrentTool(self: *App) void {
-        const tr = self.tool_run orelse return;
-        const call = tr.calls.items[tr.idx];
-        const cwd_ptr = std.c.getenv("PWD") orelse ".";
-        const cwd = std.mem.sliceTo(cwd_ptr, 0);
-
-        const result = tools_run.runTool(self, call, cwd);
-        defer {
-            if (result.len > 0) self.alloc.free(result);
-        }
-        const success = result.len > 0 and !std.mem.startsWith(u8, result, "Error:");
-        self.onToolOutput(call.name, result, success);
-
-        tr.results.appendSlice(self.alloc, "Tool ") catch {};
-        tr.results.appendSlice(self.alloc, call.name) catch {};
-        tr.results.appendSlice(self.alloc, " result:\n") catch {};
-        tr.results.appendSlice(self.alloc, result) catch {};
-        tr.results.appendSlice(self.alloc, "\n\n") catch {};
-
-        tr.idx += 1;
-        self.processNextTool();
-    }
-
-    fn approvePendingTool(self: *App) void {
-        const pt = self.pending_tool orelse return;
-        self.alloc.free(pt.cwd);
-        self.pending_tool = null;
-        self.executeCurrentTool();
-    }
-
-    fn rejectPendingTool(self: *App) void {
-        const pt = self.pending_tool orelse return;
-        const tr = self.tool_run orelse return;
-        const call = tr.calls.items[pt.idx];
-        const denied = tools_run.toolErr(self, "Rejected by user", .{});
-        defer self.alloc.free(denied);
-        self.onToolOutput(call.name, denied, false);
-        tr.results.appendSlice(self.alloc, "Tool ") catch {};
-        tr.results.appendSlice(self.alloc, call.name) catch {};
-        tr.results.appendSlice(self.alloc, " result:\nRejected by user\n\n") catch {};
-        self.alloc.free(pt.cwd);
-        self.pending_tool = null;
-        tr.idx += 1;
-        self.processNextTool();
-    }
-
-    /// All calls executed (or rejected) — re-submit the accumulated results.
-    fn finishToolRun(self: *App) void {
-        const tr = self.tool_run orelse return;
-        if (tr.results.items.len > 0) {
-            const result_text = self.alloc.dupe(u8, tr.results.items) catch return;
-            self.messages.append(self.alloc, .{
-                .role = .tool,
-                .content = result_text,
-                .tool_call_id = if (tr.calls.items.len > 0) tr.calls.items[0].id else "",
-                .owns = true,
-            }) catch {};
-
-            // Start a new stream with the tool results in context
-            self.startStreaming("(tool results)", "");
-        }
-        // Cleanup run state
-        for (tr.calls.items) |c| {
-            if (c.id.len > 0) self.alloc.free(c.id);
-            self.alloc.free(c.name);
-            self.alloc.free(c.arguments);
-        }
-        tr.calls.deinit(self.alloc);
-        tr.results.deinit(self.alloc);
-        self.alloc.destroy(tr);
-        self.tool_run = null;
-    }
-
     /// Execute one tool through the unified tools/ pipeline with extra guards.
     /// Returns a caller-owned string (empty slice on failure).
 
@@ -1866,7 +1765,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         self.streaming_idx = null;
     }
 
-    fn onToolStart(self: *App, name: []const u8, args: []const u8) void {
+    pub fn onToolStart(self: *App, name: []const u8, args: []const u8) void {
         // Add tool call to the last assistant message, or create a tool message
         const last_idx = if (self.messages.items.len > 0) self.messages.items.len - 1 else 0;
         const target = if (self.messages.items.len > 0 and self.messages.items[last_idx].role == .assistant)
@@ -1907,7 +1806,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         }
     }
 
-    fn onToolOutput(self: *App, name: []const u8, output: []const u8, success: bool) void {
+    pub fn onToolOutput(self: *App, name: []const u8, output: []const u8, success: bool) void {
         // Find the last matching tool call and update it
         var i: usize = self.messages.items.len;
         while (i > 0) {

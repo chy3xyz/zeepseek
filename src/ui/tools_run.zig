@@ -90,3 +90,105 @@ pub fn runTool(app: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 
 pub fn toolErr(app: *App, comptime fmt: []const u8, args: anytype) []const u8 {
     return std.fmt.allocPrint(app.alloc, fmt, args) catch "";
 }
+
+pub fn processNextTool(app: *App) void {
+    const tr = app.tool_run orelse return;
+    if (tr.idx >= tr.calls.items.len) {
+        finishToolRun(app, );
+        return;
+    }
+    const call = tr.calls.items[tr.idx];
+    app.onToolStart(call.name, call.arguments);
+
+    const approval_needed = switch (app.run_mode) {
+        .auto => tools_mod.requiresApproval(app.sandbox, call),
+        .plan => true,
+        .yolo => false,
+    };
+    if (approval_needed) {
+        const cwd_ptr = std.c.getenv("PWD") orelse ".";
+        const cwd = std.mem.sliceTo(cwd_ptr, 0);
+        app.pending_tool = .{
+            .idx = tr.idx,
+            .cwd = app.alloc.dupe(u8, cwd) catch return,
+        };
+        app.setNotification("Tool approval required — Enter to allow, Esc to deny");
+        return;
+    }
+
+    executeCurrentTool(app, );
+}
+
+pub fn executeCurrentTool(app: *App) void {
+    const tr = app.tool_run orelse return;
+    const call = tr.calls.items[tr.idx];
+    const cwd_ptr = std.c.getenv("PWD") orelse ".";
+    const cwd = std.mem.sliceTo(cwd_ptr, 0);
+
+    const result = runTool(app, call, cwd);
+    defer {
+        if (result.len > 0) app.alloc.free(result);
+    }
+    const success = result.len > 0 and !std.mem.startsWith(u8, result, "Error:");
+    app.onToolOutput(call.name, result, success);
+
+    tr.results.appendSlice(app.alloc, "Tool ") catch {};
+    tr.results.appendSlice(app.alloc, call.name) catch {};
+    tr.results.appendSlice(app.alloc, " result:\n") catch {};
+    tr.results.appendSlice(app.alloc, result) catch {};
+    tr.results.appendSlice(app.alloc, "\n\n") catch {};
+
+    tr.idx += 1;
+    processNextTool(app, );
+}
+
+pub fn approvePendingTool(app: *App) void {
+    const pt = app.pending_tool orelse return;
+    app.alloc.free(pt.cwd);
+    app.pending_tool = null;
+    executeCurrentTool(app, );
+}
+
+pub fn rejectPendingTool(app: *App) void {
+    const pt = app.pending_tool orelse return;
+    const tr = app.tool_run orelse return;
+    const call = tr.calls.items[pt.idx];
+    const denied = toolErr(app, "Rejected by user", .{});
+    defer app.alloc.free(denied);
+    app.onToolOutput(call.name, denied, false);
+    tr.results.appendSlice(app.alloc, "Tool ") catch {};
+    tr.results.appendSlice(app.alloc, call.name) catch {};
+    tr.results.appendSlice(app.alloc, " result:\nRejected by user\n\n") catch {};
+    app.alloc.free(pt.cwd);
+    app.pending_tool = null;
+    tr.idx += 1;
+    processNextTool(app, );
+}
+
+/// All calls executed (or rejected) — re-submit the accumulated results.
+pub fn finishToolRun(app: *App) void {
+    const tr = app.tool_run orelse return;
+    if (tr.results.items.len > 0) {
+        const result_text = app.alloc.dupe(u8, tr.results.items) catch return;
+        app.messages.append(app.alloc, .{
+            .role = .tool,
+            .content = result_text,
+            .tool_call_id = if (tr.calls.items.len > 0) tr.calls.items[0].id else "",
+            .owns = true,
+        }) catch {};
+
+        // Start a new stream with the tool results in context
+        app.startStreaming("(tool results)", "");
+    }
+    // Cleanup run state
+    for (tr.calls.items) |c| {
+        if (c.id.len > 0) app.alloc.free(c.id);
+        app.alloc.free(c.name);
+        app.alloc.free(c.arguments);
+    }
+    tr.calls.deinit(app.alloc);
+    tr.results.deinit(app.alloc);
+    app.alloc.destroy(tr);
+    app.tool_run = null;
+}
+

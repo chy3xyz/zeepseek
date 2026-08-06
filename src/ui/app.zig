@@ -66,11 +66,11 @@ const SearchHighlight = Pal.bg_highlight;
 // Formatting helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn appendFmt(buf: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
-    if (std.fmt.allocPrint(a, fmt, args)) |s| {
-        buf.appendSlice(a, s) catch {};
-    } else |_| {}
-}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Markdown → ANSI renderer (lightweight, inline)
+// ═══════════════════════════════════════════════════════════════════════
+
 
 // ═══════════════════════════════════════════════════════════════════════
 // Data Types

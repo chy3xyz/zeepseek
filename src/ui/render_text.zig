@@ -4,7 +4,24 @@
 const std = @import("std");
 const theme = @import("theme.zig");
 
-fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, width: u16) void {
+const Pal = theme.Pal;
+const R = Pal.R;
+const B = Pal.B;
+const D = Pal.D;
+const U = Pal.U;
+const I = "\x1b[3m"; // italic
+
+const CodeBg = Pal.bg_code;
+const CodeInlineBg = Pal.bg_code_inline;
+const SearchHighlight = Pal.bg_highlight;
+
+fn appendFmt(buf: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
+    if (std.fmt.allocPrint(a, fmt, args)) |s| {
+        buf.appendSlice(a, s) catch {};
+    } else |_| {}
+}
+
+pub fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, width: u16) void {
     var in_code_block = false;
     var code_lang: []const u8 = "";
     var code_lines: [512][]const u8 = undefined;
@@ -94,7 +111,7 @@ fn renderMarkdownAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []con
 // Code block renderer with line numbers
 // ═══════════════════════════════════════════════════════════════════════
 
-fn renderCodeBlockWithLineNums(
+pub fn renderCodeBlockWithLineNums(
     buf: *std.ArrayList(u8),
     a: std.mem.Allocator,
     code_lines: [][]const u8,
@@ -192,7 +209,7 @@ fn renderCodeBlockWithLineNums(
     buf.appendSlice(a, "\n") catch {};
 }
 
-fn renderInlineAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) void {
+pub fn renderInlineAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8) void {
     var i: usize = 0;
     while (i < text.len) {
         // Inline code `...`
@@ -260,7 +277,7 @@ fn renderInlineAnsi(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const
     }
 }
 
-fn appendHighlighted(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, query: []const u8) void {
+pub fn appendHighlighted(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []const u8, query: []const u8) void {
     if (query.len == 0 or text.len == 0) {
         buf.appendSlice(a, text) catch {};
         return;
@@ -279,3 +296,5 @@ fn appendHighlighted(buf: *std.ArrayList(u8), a: std.mem.Allocator, text: []cons
             buf.appendSlice(a, text[pos..]) catch {};
             break;
         }
+    }
+}

@@ -18,3 +18,4 @@ zig-pkg/
 *.o
 *.a
 *.obj
+_ref/DeepSeek-Reasonix/

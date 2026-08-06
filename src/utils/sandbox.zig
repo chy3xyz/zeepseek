@@ -157,7 +157,7 @@ pub const Sandbox = struct {
             return;
         }
 
-        if (builtin.mode == .Debug) {
+        if (builtin.mode == .debug) {
             std.debug.print("[sandbox] Seatbelt initialized\n", .{});
         }
     }
@@ -179,7 +179,7 @@ pub const Sandbox = struct {
 
     fn initJobObject(_: *Sandbox) !void {
         if (builtin.os.tag != .windows) return;
-        if (builtin.mode == .Debug) {
+        if (builtin.mode == .debug) {
             std.debug.print("[sandbox] Job Object: initializing\n", .{});
         }
     }

@@ -37,7 +37,15 @@ Keys: `Ctrl+P` palette · `Ctrl+F` search · `Ctrl+S` subagents · `Ctrl+N` thin
 
 ```
 src/
-  ui/app.zig            App state, event loop, rendering, command handling
+  ui/
+    app.zig             App state, event loop, init/deinit
+    render_text.zig     markdown -> ANSI rendering (pure)
+    render_ui.zig       renderClaude* views + ANSI layout helpers
+    slash_commands.zig  slash-command dispatch + executeSlashCommand
+    tools_run.zig       tool-execution pipeline (parse/approve/run/MCP forward)
+    sessions.zig        session save/load/list
+    stream_flow.zig     SSE streaming consumption + /compact flow
+    agent_flow.zig      sub-agent start/poll/update
   net/                  HTTP client (http_client2), h2 over TLS (h2_client),
                         SSE parsing, streaming client, MCP client + runner
   tools/                shell / file / git / web tools, sandbox policy,
@@ -48,6 +56,9 @@ src/
   utils/                git worker (independent subprocess), dangerous-pattern
                         detection, sandbox (Seatbelt/Landlock), config
 ```
+The UI modules import each other via Zig's lazy circular imports
+(`@import("app.zig").App`) — the codebase is split by responsibility while
+`App` remains the single state container.
 
 ## Safety model
 

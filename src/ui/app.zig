@@ -1523,20 +1523,22 @@ pub const App = struct {
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;
             var found = false;
-            if (self.skill_registry) |reg| {
-                if (reg.findByName(name) != null or reg.findByCommand(name) != null) {
-                    const owned = self.alloc.dupe(u8, name) catch null;
-                    if (owned) |o| {
-                        if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
-                        self.active_skill = o;
+            if (name) |n| {
+                if (self.skill_registry) |reg| {
+                    if (reg.findByName(n) != null or reg.findByCommand(n) != null) {
+                        const owned = self.alloc.dupe(u8, n) catch null;
+                        if (owned) |o| {
+                            if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
+                            self.active_skill = o;
+                        }
+                        found = true;
                     }
-                    found = true;
                 }
             }
             const skill_msg = if (found)
-                std.fmt.allocPrint(self.alloc, "Skill activated: {s}", .{name}) catch ""
+                std.fmt.allocPrint(self.alloc, "Skill activated: {s}", .{name orelse ""}) catch ""
             else
-                std.fmt.allocPrint(self.alloc, "Unknown skill: {s}", .{name}) catch "";
+                std.fmt.allocPrint(self.alloc, "Unknown skill: {s}", .{name orelse ""}) catch "";
             defer if (skill_msg.len > 0) self.alloc.free(skill_msg);
             self.setNotification(skill_msg);
             return;

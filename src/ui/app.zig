@@ -2275,7 +2275,30 @@ pub const App = struct {
 
     /// Execute one tool through the unified tools/ pipeline with extra guards.
     /// Returns a caller-owned string (empty slice on failure).
+    fn isBuiltinToolName(name: []const u8) bool {
+        const builtin = [_][]const u8{ "shell", "file_read", "file_write", "file_edit", "git_status", "git_commit", "web_search", "web_scrape" };
+        for (builtin) |b| {
+            if (std.mem.eql(u8, name, b)) return true;
+        }
+        return false;
+    }
+
+    /// Forward a tool call to the connected MCP server via tools/call.
+    fn callMcpTool(self: *App, name: []const u8, arguments: []const u8) []const u8 {
+        const sess = &(self.mcp_session orelse return self.toolErr("Error: no MCP session", .{}));
+        const req = mcp_client_mod.buildToolsCall(self.alloc, 1, name, arguments) catch return self.toolErr("Error: MCP call build failed", .{});
+        defer self.alloc.free(req);
+        const resp = sess.roundTrip(req, 8000) catch |e| return self.toolErr("Error: MCP call: {s}", .{@errorName(e)});
+        defer self.alloc.free(resp);
+        return self.alloc.dupe(u8, resp) catch "";
+    }
+
     fn runTool(self: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 {
+        // MCP tool forwarding: names outside the built-in set are routed to
+        // the connected MCP server's tools/call.
+        if (self.mcp_session != null and !isBuiltinToolName(call.name)) {
+            return self.callMcpTool(call.name, call.arguments);
+        }
         // Extra guards on top of the sandbox: dangerous shell commands and
         // sensitive paths are refused before anything executes.
         if (std.mem.eql(u8, call.name, "shell")) {

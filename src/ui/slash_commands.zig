@@ -1,0 +1,299 @@
+//! Slash-command handling — split out of app.zig (submit path).
+
+const std = @import("std");
+const App = @import("app.zig").App;
+const RunMode = @import("app.zig").RunMode;
+const stream_client_mod = @import("../net/stream_client.zig");
+const mcp_runner_mod = @import("../net/mcp_runner.zig");
+const mcp_client_mod = @import("../net/mcp_client.zig");
+const dangerous_patterns = @import("dangerous_patterns");
+const tools_mod = @import("../tools/mod.zig");
+const session_format = @import("session_format");
+const SlashDispatcher = @import("slash_command_dispatcher.zig");
+const memory_mod = @import("../cache/memory.zig");
+const git_worker_mod = @import("../utils/git_worker.zig");
+
+/// Handle the inline slash commands in the submit path. Returns true if the
+/// input was consumed as a command.
+pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
+    if (std.mem.eql(u8, text_slice, "/rewind")) {
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        var removed: usize = 0;
+        while (app.messages.items.len > 0) {
+            const last = app.messages.items[app.messages.items.len - 1];
+            if (last.role == .user and removed > 0) break;
+            // Free owned content and pop.
+            if (last.owns) {
+                app.alloc.free(last.content);
+                if (last.tool_call_id.len > 0) app.alloc.free(last.tool_call_id);
+            }
+            _ = app.messages.pop();
+            removed += 1;
+            if (last.role == .user) break;
+        }
+        app.setNotification(if (removed > 0) "Rewound one turn" else "Nothing to rewind");
+        return true;
+    }
+
+    // /skills: list registered skills; /skill <name>: activate (prompt inject).
+    if (std.mem.eql(u8, text_slice, "/skills")) {
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        var list_buf = std.ArrayList(u8).empty;
+        defer list_buf.deinit(app.alloc);
+        if (app.skill_registry) |reg| {
+            for (reg.list()) |sk| {
+                list_buf.appendSlice(app.alloc, sk.name) catch {};
+                list_buf.appendSlice(app.alloc, "  ") catch {};
+                list_buf.appendSlice(app.alloc, sk.description) catch {};
+                list_buf.appendSlice(app.alloc, "\n") catch {};
+            }
+        }
+        app.setNotification(if (list_buf.items.len > 0) list_buf.items else "No skills registered");
+        return true;
+    }
+    if (std.mem.eql(u8, text_slice, "/mcp")) {
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        var info_buf = std.ArrayList(u8).empty;
+        defer info_buf.deinit(app.alloc);
+        // Lazy-load ~/.zeepseek/mcp.json ({"servers":[{"name","command"}]}).
+        if (app.mcp_servers.items.len == 0) {
+            var cfg_buf: [4096]u8 = undefined;
+            var cfg_len: usize = 0;
+            if (std.c.getenv("HOME")) |home_z| {
+                const home = std.mem.sliceTo(home_z, 0);
+                var path_buf: [512:0]u8 = undefined;
+                if (std.fmt.bufPrintSentinel(&path_buf, "{s}/.zeepseek/mcp.json", .{home}, 0)) |pb| {
+                    const fd = std.c.open(pb, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+                    if (fd >= 0) {
+                        defer _ = std.c.close(fd);
+                        const rlen = std.c.read(fd, &cfg_buf, @as(usize, cfg_buf.len));
+                        cfg_len = if (rlen > 0) @intCast(rlen) else 0;
+                    }
+                } else |_| {}
+            }
+            if (cfg_len > 0) {
+                var parsed = std.json.parseFromSlice(std.json.Value, app.alloc, cfg_buf[0..cfg_len], .{}) catch null;
+                if (parsed) |pdoc| {
+                    defer parsed.?.deinit();
+                    if (pdoc.value.object.get("servers")) |arr| {
+                        if (arr == .array) {
+                            for (arr.array.items) |srv| {
+                                const obj = srv.object;
+                                const nm = if (obj.get("name")) |v| (if (v == .string) v.string else "?") else "?";
+                                const cmd = if (obj.get("command")) |v| (if (v == .string) v.string else "") else "";
+                                if (cmd.len > 0) {
+                                    var arg_list = std.ArrayList([]const u8).empty;
+                                    if (obj.get("args")) |av| {
+                                        if (av == .array) {
+                                            for (av.array.items) |a| {
+                                                if (a == .string) arg_list.append(app.alloc, a.string) catch {};
+                                            }
+                                        }
+                                    }
+                                    const args_owned = arg_list.toOwnedSlice(app.alloc) catch &.{};
+                                    app.mcp_servers.append(app.alloc, .{ .cfg_name = nm, .command = cmd, .args = args_owned }) catch {};
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (app.mcp_servers.items.len == 0) {
+            app.setNotification("No MCP servers in ~/.zeepseek/mcp.json");
+            return true;
+        }
+        for (app.mcp_servers.items) |srv| {
+            info_buf.appendSlice(app.alloc, srv.cfg_name) catch {};
+            info_buf.appendSlice(app.alloc, ": ") catch {};
+            info_buf.appendSlice(app.alloc, srv.command) catch {};
+            info_buf.appendSlice(app.alloc, "\n") catch {};
+        }
+        if (app.mcp_session == null) {
+            app.mcp_session = mcp_runner_mod.McpSession.spawn(app.app_io, app.alloc, app.mcp_servers.items[0]) catch |e| {
+                info_buf.appendSlice(app.alloc, " spawn error: ") catch {};
+                info_buf.appendSlice(app.alloc, @errorName(e)) catch {};
+                app.setNotification(info_buf.items);
+                return true;
+            };
+        }
+        const req = mcp_client_mod.buildInitialize(app.alloc, 1) catch return true;
+        defer app.alloc.free(req);
+        const resp = app.mcp_session.?.roundTrip(req, 4000) catch |e| {
+            info_buf.appendSlice(app.alloc, " init error: ") catch {};
+            info_buf.appendSlice(app.alloc, @errorName(e)) catch {};
+            app.setNotification(info_buf.items);
+            return true;
+        };
+        defer app.alloc.free(resp);
+        info_buf.appendSlice(app.alloc, " init ok\n") catch {};
+        defer app.alloc.free(resp);
+        const tl_req = mcp_client_mod.buildToolsList(app.alloc, 2) catch return true;
+        defer app.alloc.free(tl_req);
+        const tl_resp = app.mcp_session.?.roundTrip(tl_req, 4000) catch |e| {
+            info_buf.appendSlice(app.alloc, " tools/list error: ") catch {};
+            info_buf.appendSlice(app.alloc, @errorName(e)) catch {};
+            app.setNotification(info_buf.items);
+            return true;
+        };
+        defer app.alloc.free(tl_resp);
+        // Parse MCP tools into OpenAI-format definitions for the model.
+        var mcp_tools = std.ArrayList(u8).empty;
+        defer mcp_tools.deinit(app.alloc);
+        var parsed_tl = std.json.parseFromSlice(std.json.Value, app.alloc, tl_resp, .{}) catch null;
+        if (parsed_tl) |pdoc| {
+            defer parsed_tl.?.deinit();
+            if (pdoc.value.object.get("result")) |res| {
+                if (res.object.get("tools")) |tarr| {
+                    if (tarr == .array) {
+                        var first = true;
+                        for (tarr.array.items) |t| {
+                            const obj = t.object;
+                            const nm = if (obj.get("name")) |v| (if (v == .string) v.string else "") else "";
+                            const desc = if (obj.get("description")) |v| (if (v == .string) v.string else "") else "";
+                            // NOTE: 0.17 std.json has no stringifyAlloc; the
+                            // schema is passed as a generic object for now.
+                            const schema: ?[]const u8 = null;
+                            if (nm.len == 0) continue;
+                            if (!first) mcp_tools.appendSlice(app.alloc, ",") catch {};
+                            first = false;
+                            mcp_tools.appendSlice(app.alloc, "{\"type\":\"function\",\"function\":{\"name\":\"") catch {};
+                            mcp_tools.appendSlice(app.alloc, nm) catch {};
+                            mcp_tools.appendSlice(app.alloc, "\",\"description\":\"") catch {};
+                            mcp_tools.appendSlice(app.alloc, desc) catch {};
+                            mcp_tools.appendSlice(app.alloc, "\",\"parameters\":") catch {};
+                            mcp_tools.appendSlice(app.alloc, schema orelse "{\"type\":\"object\"}") catch {};
+                            mcp_tools.appendSlice(app.alloc, "}}") catch {};
+                        }
+                    }
+                }
+            }
+        }
+        if (app.mcp_tools_json.len > 0) app.alloc.free(app.mcp_tools_json);
+        app.mcp_tools_json = mcp_tools.toOwnedSlice(app.alloc) catch "";
+        info_buf.appendSlice(app.alloc, "tools: ") catch {};
+        info_buf.appendSlice(app.alloc, tl_resp[0..@min(tl_resp.len, 400)]) catch {};
+        app.setNotification(info_buf.items);
+        return true;
+    }
+
+    if (std.mem.startsWith(u8, text_slice, "/skill ")) {
+        const name = app.alloc.dupe(u8, std.mem.trim(u8, text_slice["/skill ".len..], " ")) catch null;
+        defer if (name) |n| app.alloc.free(n);
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        var found = false;
+        if (name) |n| {
+            if (app.skill_registry) |reg| {
+                if (reg.findByName(n) != null or reg.findByCommand(n) != null) {
+                    const owned = app.alloc.dupe(u8, n) catch null;
+                    if (owned) |o| {
+                        if (app.active_skill.len > 0) app.alloc.free(app.active_skill);
+                        app.active_skill = o;
+                    }
+                    found = true;
+                }
+            }
+        }
+        const skill_msg = if (found)
+            std.fmt.allocPrint(app.alloc, "Skill activated: {s}", .{name orelse ""}) catch ""
+        else
+            std.fmt.allocPrint(app.alloc, "Unknown skill: {s}", .{name orelse ""}) catch "";
+        defer if (skill_msg.len > 0) app.alloc.free(skill_msg);
+        app.setNotification(skill_msg);
+        return true;
+    }
+
+    // /memory <fact>: add a long-term fact; /memory recall <q>: show matches.
+    if (std.mem.startsWith(u8, text_slice, "/memory")) {
+        const arg_slice = std.mem.trim(u8, text_slice["/memory".len..], " ");
+        // Dupe BEFORE setValue("") — the input buffer is recycled below.
+        const arg = app.alloc.dupe(u8, arg_slice) catch return true;
+        defer app.alloc.free(arg);
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        if (std.mem.startsWith(u8, arg, "recall ")) {
+            const q = std.mem.trim(u8, arg["recall ".len..], " ");
+            if (app.memory) |mem| {
+                const recalled = mem.recall(q, 4, 1200);
+                // recalled is allocated with memory's allocator (page_allocator).
+                defer std.heap.page_allocator.free(recalled);
+                app.setNotification(if (recalled.len > 0) recalled else "No memory matches");
+            }
+        } else if (arg.len > 0) {
+            if (app.memory) |mem| {
+                var mem_path_buf: [512:0]u8 = undefined;
+                if (std.c.getenv("HOME")) |home_z| {
+                    const home = std.mem.sliceTo(home_z, 0);
+                    _ = std.fmt.bufPrintSentinel(&mem_path_buf, "{s}/.zeepseek/memory.md", .{home}, 0) catch null;
+                    mem.add(mem_path_buf[0..], arg);
+                    app.setNotification("Memory saved");
+                }
+            }
+        } else {
+            app.setNotification("Usage: /memory <fact> | /memory recall <query>");
+        }
+        return true;
+    }
+
+    // /mode auto|plan|yolo: switch tool execution mode.
+    if (std.mem.startsWith(u8, text_slice, "/mode")) {
+        const arg_dup = app.alloc.dupe(u8, std.mem.trim(u8, text_slice["/mode".len..], " ")) catch null;
+        defer if (arg_dup) |ad| app.alloc.free(ad);
+        const arg = arg_dup orelse "";
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        const new_mode: ?RunMode = if (std.mem.eql(u8, arg, "plan"))
+            .plan
+        else if (std.mem.eql(u8, arg, "yolo"))
+            .yolo
+        else if (std.mem.eql(u8, arg, "auto") or arg.len == 0)
+            .auto
+        else
+            null;
+        if (new_mode) |m| {
+            app.run_mode = m;
+            const mode_msg = std.fmt.allocPrint(app.alloc, "Mode: {s}", .{@tagName(m)}) catch "";
+            defer if (mode_msg.len > 0) app.alloc.free(mode_msg);
+            app.setNotification(mode_msg);
+        } else {
+            app.setNotification("Usage: /mode auto|plan|yolo");
+        }
+        return true;
+    }
+
+    // /copy: copy the whole conversation (plain text) to the clipboard.
+    if (std.mem.eql(u8, text_slice, "/copy") or std.mem.startsWith(u8, text_slice, "/copy ")) {
+        std.debug.print("[dbg] /copy triggered, gw={any}\n", .{app.git_worker != null});
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        var buf = std.ArrayList(u8).empty;
+        defer buf.deinit(app.alloc);
+        for (app.messages.items) |m| {
+            const role_str: []const u8 = switch (m.role) {
+                .user => "You", .assistant => "Zeep", .system => "System", .tool => "Tool",
+            };
+            buf.appendSlice(app.alloc, role_str) catch break;
+            buf.appendSlice(app.alloc, ": ") catch break;
+            buf.appendSlice(app.alloc, m.content) catch break;
+            buf.appendSlice(app.alloc, "\n\n") catch break;
+        }
+        if (app.git_worker) |*gw| {
+            std.debug.print("[dbg] copy {d} bytes\n", .{buf.items.len});
+            if (gw.copy(buf.items)) {
+                app.setNotification("Conversation copied to clipboard");
+            } else {
+                app.setNotification("Copy failed");
+            }
+        } else {
+            std.debug.print("[dbg] no worker\n", .{});
+        }
+        return true;
+    }
+
+
+    return false;
+}

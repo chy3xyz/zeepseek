@@ -27,6 +27,7 @@ const slash_commands = @import("slash_commands.zig");
 const tools_run = @import("tools_run.zig");
 const sessions = @import("sessions.zig");
 const stream_flow = @import("stream_flow.zig");
+const agent_flow = @import("agent_flow.zig");
 const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
@@ -46,7 +47,7 @@ const git_worker_mod = @import("../utils/git_worker.zig");
 
 const join = zz.join;
 
-const CacheDecision = enum { none, hit, miss };
+pub const CacheDecision = enum { none, hit, miss };
 
 /// Hard cap on tool output / file read size (bytes) to prevent OOM from
 /// runaway commands (yes, cat /dev/zero) or oversized files.
@@ -304,16 +305,16 @@ const SubAgentRun = struct {
         self.failed.store(true, .release);
         self.done.store(true, .release);
     }
-    fn isDone(self: *SubAgentRun) bool {
+    pub fn isDone(self: *SubAgentRun) bool {
         return self.done.load(.acquire);
     }
-    fn drainSummary(self: *SubAgentRun, alloc: std.mem.Allocator) ?[]const u8 {
+    pub fn drainSummary(self: *SubAgentRun, alloc: std.mem.Allocator) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.summary.items.len == 0) return null;
         return alloc.dupe(u8, self.summary.items) catch null;
     }
-    fn deinit(self: *SubAgentRun) void {
+    pub fn deinit(self: *SubAgentRun) void {
         self.summary.deinit(self.arena.allocator());
         self.arena.deinit();
     }
@@ -354,14 +355,14 @@ const CompactRun = struct {
         self.failed.store(true, .release);
         self.done.store(true, .release);
     }
-    fn isDone(self: *CompactRun) bool { return self.done.load(.acquire); }
-    fn drainResult(self: *CompactRun, alloc: std.mem.Allocator) ?[]const u8 {
+    pub fn isDone(self: *CompactRun) bool { return self.done.load(.acquire); }
+    pub fn drainResult(self: *CompactRun, alloc: std.mem.Allocator) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.result.items.len == 0) return null;
         return alloc.dupe(u8, self.result.items) catch null;
     }
-    fn deinit(self: *CompactRun) void {
+    pub fn deinit(self: *CompactRun) void {
         self.result.deinit(self.arena.allocator());
         self.arena.deinit();
     }
@@ -851,8 +852,8 @@ pub const App = struct {
             .stream_error => |e| stream_flow.onStreamError(self, e),
             .tool_start => |t| self.onToolStart(t.name, t.args),
             .tool_output => |t| self.onToolOutput(t.name, t.output, t.success),
-            .subagent_start => |s| self.onSubAgentStart(s.id, s.role, s.goal),
-            .subagent_update => |s| self.onSubAgentUpdate(s.id, s.summary, s.status),
+            .subagent_start => |s| agent_flow.onSubAgentStart(self, s.id, s.role, s.goal),
+            .subagent_update => |s| agent_flow.onSubAgentUpdate(self, s.id, s.summary, s.status),
             .save_session => sessions.saveSession(self, self.session_id),
             .load_session => |path| sessions.loadSession(self, path),
             .tick => |t| {
@@ -864,8 +865,8 @@ pub const App = struct {
                     if (self.reasonix) |rx| rx.cleanupExpired();
                 }
                 stream_flow.pollStream(self);
-                self.pollSubAgents();
-                self.pollCompact();
+                agent_flow.pollSubAgents(self);
+                stream_flow.pollCompact(self);
                 // Toast auto-dismiss is handled by zz.components.Toast based on timestamps
             },
         }
@@ -1551,7 +1552,7 @@ pub const App = struct {
         };
     }
 
-    fn freeToolCall(self: *App, tc: ToolCall) void {
+    pub fn freeToolCall(self: *App, tc: ToolCall) void {
         if (tc.owns) {
             if (tc.name.len > 0) self.alloc.free(tc.name);
             if (tc.args.len > 0) self.alloc.free(tc.args);
@@ -1575,140 +1576,6 @@ pub const App = struct {
                     return;
                 }
             }
-        }
-    }
-
-    fn onSubAgentStart(self: *App, id: []const u8, role: SubAgentRole, goal: []const u8) void {
-        self.subagents.append(self.alloc, .{
-            .id = id,
-            .role = role,
-            .goal = goal,
-            .status = .pending,
-        }) catch {};
-    }
-
-    fn onSubAgentUpdate(self: *App, id: []const u8, summary: []const u8, status: MsgStatus) void {
-        for (self.subagents.items) |*sa| {
-            if (std.mem.eql(u8, sa.id, id)) {
-                sa.status = status;
-                if (summary.len > 0) sa.summary = summary;
-                break;
-            }
-        }
-    }
-
-    fn startSubAgent(self: *App, goal: []const u8) void {
-        const g = std.mem.trim(u8, goal, " ");
-        if (g.len == 0) {
-            self.setNotification("Usage: /subagent <goal>");
-            return;
-        }
-        if (self.api_key.len == 0) {
-            self.setNotification("Set an API key first (/apikey sk-...)");
-            return;
-        }
-        if (self.subagent_runs.items.len >= 4) {
-            self.setNotification("Too many concurrent sub-agents (max 4)");
-            return;
-        }
-
-        const sa_index = self.subagents.items.len;
-        const id = std.fmt.allocPrint(self.alloc, "sa-{d}", .{sa_index}) catch return;
-        const goal_owned = self.alloc.dupe(u8, g) catch {
-            self.alloc.free(id);
-            return;
-        };
-        // id/goal ownership moves into subagents (released by deinit)
-        self.onSubAgentStart(id, .researcher, goal_owned);
-
-        const run = std.heap.page_allocator.create(SubAgentRun) catch return;
-        run.* = SubAgentRun.init(std.heap.page_allocator, sa_index);
-        const ra = run.allocator();
-
-        const api_key_owned = ra.dupe(u8, self.api_key) catch {
-            std.heap.page_allocator.destroy(run);
-            return;
-        };
-        const model_owned = ra.dupe(u8, self.model) catch {
-            std.heap.page_allocator.destroy(run);
-            return;
-        };
-        const prompt_owned = ra.dupe(u8, g) catch {
-            std.heap.page_allocator.destroy(run);
-            return;
-        };
-
-        const thread = std.Thread.spawn(.{}, struct {
-            fn runSubAgent(api_k: []const u8, prompt: []const u8, mdl: []const u8, a: std.mem.Allocator, rr: *SubAgentRun) void {
-                // a is the run's arena allocator — freed wholesale by deinit.
-                // Use a dedicated Io so a blocked network connect cannot stall
-                // the UI thread's shared std.Io (would deadlock Ctrl+C exit).
-                var threaded = std.Io.Threaded.init(a, .{ .argv0 = .empty, .environ = .empty });
-                const sio_own = threaded.io();
-                defer threaded.deinit();
-                var client = stream_client_mod.DeepSeekStreamClient.init(a, sio_own, null, null);
-                defer client.deinit();
-
-                const role_prompt = "You are a focused research sub-agent. Complete the assigned goal, then reply with a concise summary of what you did and found.";
-                const ctx_empty = [_]stream_client_mod.CtxItem{};
-                var stream = client.streamMessage(api_k, prompt, &ctx_empty, mdl, CacheDecision.none, role_prompt, null) catch {
-                    rr.setFailed();
-                    return;
-                };
-                defer stream.deinit();
-
-                while (true) {
-                    const chunk = stream.nextChunk() catch {
-                        rr.setFailed();
-                        return;
-                    };
-                    if (chunk == null) break;
-                    switch (chunk.?) {
-                        .content => |c| rr.pushSummary(c),
-                        .reasoning => {},
-                    }
-                }
-                rr.setDone();
-            }
-        }.runSubAgent, .{ api_key_owned, prompt_owned, model_owned, ra, run }) catch {
-            std.heap.page_allocator.destroy(run);
-            self.setNotification("Failed to start sub-agent thread");
-            return;
-        };
-        run.thread = thread;
-        self.subagent_runs.append(self.alloc, run) catch {
-            std.heap.page_allocator.destroy(run);
-            self.setNotification("Failed to register sub-agent");
-            return;
-        };
-        self.setNotification("Sub-agent started");
-    }
-
-    fn pollSubAgents(self: *App) void {
-        var i: usize = 0;
-        while (i < self.subagent_runs.items.len) {
-            const run = self.subagent_runs.items[i];
-            if (run.isDone()) {
-                run.thread.join();
-                const failed = run.failed.load(.acquire);
-                const summary = run.drainSummary(self.alloc);
-                defer {
-                    if (summary) |s| self.alloc.free(s);
-                }
-                if (run.sa_index < self.subagents.items.len) {
-                    const sa = &self.subagents.items[run.sa_index];
-                    sa.status = if (failed) .failed else .complete;
-                    if (summary) |s| {
-                        if (s.len > 0) {
-                            if (sa.summary.len > 0) self.alloc.free(sa.summary);
-                            sa.summary = self.alloc.dupe(u8, s) catch "";
-                        }
-                    }
-                }
-                run.deinit();
-                std.heap.page_allocator.destroy(run);
-                _ = self.subagent_runs.orderedRemove(i);
-            } else i += 1;
         }
     }
 
@@ -1910,54 +1777,6 @@ pub const App = struct {
         self.compact_run = run;
         self.setNotification("Compacting context in background...");
     }
-
-    fn pollCompact(self: *App) void {
-        const run = self.compact_run orelse return;
-        if (!run.isDone()) return;
-        run.thread.join();
-        const failed = run.failed.load(.acquire);
-        const result = run.drainResult(self.alloc);
-        defer {
-            if (result) |r| self.alloc.free(r);
-        }
-        if (failed or result == null or result.?.len == 0) {
-            self.setNotification("Compaction failed (check API key / network)");
-        } else {
-            self.applyCompact(run.keep_end, result.?);
-        }
-        run.deinit();
-        std.heap.page_allocator.destroy(run);
-        self.compact_run = null;
-    }
-
-    fn applyCompact(self: *App, keep_end: usize, summary: []const u8) void {
-        const replaced = @min(keep_end, self.messages.items.len);
-        // Free the compacted messages
-        for (self.messages.items[0..replaced]) |*m| {
-            if (m.owns and m.content.len > 0) self.alloc.free(m.content);
-            if (m.thinking) |t| self.alloc.free(t);
-            for (m.tool_calls.items) |tc| {
-                self.freeToolCall(tc);
-            }
-            m.tool_calls.deinit(self.alloc);
-        }
-        for (0..replaced) |_| {
-            _ = self.messages.orderedRemove(0);
-        }
-        // Insert the LLM summary as a system message
-        const duped = self.alloc.dupe(u8, summary) catch return;
-        self.messages.insert(self.alloc, 0, .{
-            .role = .system,
-            .content = duped,
-            .owns = true,
-            .status = .complete,
-        }) catch {};
-        self.setNotification("Context compacted via LLM summary");
-    }
-
-    // ═════════════════════════════════════════════════════════════════════
-    // View & Renderers — Claude CLI inspired layout
-    // ═════════════════════════════════════════════════════════════════════
 
     pub fn view(self: *const App, ctx: *const zz.Context) []const u8 {
         const a = ctx.allocator;

@@ -206,3 +206,51 @@ pub fn onStreamError(app: *App, err_msg: []const u8) void {
     app.streaming_idx = null;
 }
 
+pub fn pollCompact(app: *App) void {
+    const run = app.compact_run orelse return;
+    if (!run.isDone()) return;
+    run.thread.join();
+    const failed = run.failed.load(.acquire);
+    const result = run.drainResult(app.alloc);
+    defer {
+        if (result) |r| app.alloc.free(r);
+    }
+    if (failed or result == null or result.?.len == 0) {
+        app.setNotification("Compaction failed (check API key / network)");
+    } else {
+        applyCompact(app, run.keep_end, result.?);
+    }
+    run.deinit();
+    std.heap.page_allocator.destroy(run);
+    app.compact_run = null;
+}
+
+pub fn applyCompact(app: *App, keep_end: usize, summary: []const u8) void {
+    const replaced = @min(keep_end, app.messages.items.len);
+    // Free the compacted messages
+    for (app.messages.items[0..replaced]) |*m| {
+        if (m.owns and m.content.len > 0) app.alloc.free(m.content);
+        if (m.thinking) |t| app.alloc.free(t);
+        for (m.tool_calls.items) |tc| {
+            app.freeToolCall(tc);
+        }
+        m.tool_calls.deinit(app.alloc);
+    }
+    for (0..replaced) |_| {
+        _ = app.messages.orderedRemove(0);
+    }
+    // Insert the LLM summary as a system message
+    const duped = app.alloc.dupe(u8, summary) catch return;
+    app.messages.insert(app.alloc, 0, .{
+        .role = .system,
+        .content = duped,
+        .owns = true,
+        .status = .complete,
+    }) catch {};
+    app.setNotification("Context compacted via LLM summary");
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// View & Renderers — Claude CLI inspired layout
+// ═════════════════════════════════════════════════════════════════════
+

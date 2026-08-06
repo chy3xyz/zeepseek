@@ -22,6 +22,7 @@ const session_format = @import("session_format");
 const SlashDispatcher = @import("slash_command_dispatcher.zig");
 const theme = @import("theme.zig");
 const render_text = @import("render_text.zig");
+const render_ui = @import("render_ui.zig");
 const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
@@ -3764,7 +3765,7 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
                 lines.appendSlice(a, Pal.fg_dim) catch {};
                 lines.appendSlice(a, "INFO") catch {};
                 lines.appendSlice(a, R) catch {};
-                self.padToCol(&lines, a, w - 2, 5); // leading space + "INFO"
+                render_ui.padToCol(&lines, a, w - 2, 5); // leading space + "INFO"
             } else if (r - 1 < rows.len) {
                 const row = rows[r - 1];
                 lines.appendSlice(a, Pal.fg_dim) catch {};
@@ -3792,10 +3793,10 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
                 lines.appendSlice(a, val) catch {};
                 lines.appendSlice(a, R) catch {};
                 const used = 1 + row.label.len + 2 + val.len; // leading space + label + gap + value
-                self.padToCol(&lines, a, w - 2, used);
+                render_ui.padToCol(&lines, a, w - 2, used);
             } else {
                 // Empty rows
-                self.padToCol(&lines, a, w - 2, 1); // leading space only
+                render_ui.padToCol(&lines, a, w - 2, 1); // leading space only
             }
 
             lines.appendSlice(a, D) catch {};
@@ -3848,16 +3849,6 @@ fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         return join.vertical(a, .left, lines.items) catch "";
     }
 
-    fn padToCol(self: *const App, out: *std.ArrayList(u8), a: std.mem.Allocator, target: u16, used: usize) void {
-        _ = self;
-        if (used < target) {
-            var p = used;
-            while (p < target) : (p += 1) { out.appendSlice(a, " ") catch {}; }
-        }
-    }
-
-    /// Pad or truncate every line of a multi-line string to an exact visual width.
-    /// The returned string is always a fresh allocation that the caller must free.
     fn enforceWidth(a: std.mem.Allocator, text: []const u8, target: u16) ![]const u8 {
         var result = std.ArrayList(u8).empty;
         defer result.deinit(a);

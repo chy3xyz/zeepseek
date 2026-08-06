@@ -7,8 +7,8 @@ const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_client_mod = @import("../net/mcp_client.zig");
 const dangerous_patterns = @import("dangerous_patterns");
 const git_worker_mod = @import("../utils/git_worker.zig");
-const extractJsonString = @import("app.zig").extractJsonString;
-const isSensitivePath = App.isSensitivePath;
+const extractJsonString = @import("stream_flow.zig").extractJsonString;
+const isSensitivePath = @import("stream_flow.zig").isSensitivePath;
 const ToolRunState = @import("app.zig").ToolRunState;
 
 fn isBuiltinToolName(name: []const u8) bool {
@@ -38,7 +38,7 @@ pub fn runTool(app: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 
     // Extra guards on top of the sandbox: dangerous shell commands and
     // sensitive paths are refused before anything executes.
     if (std.mem.eql(u8, call.name, "shell")) {
-        if (app.extractJsonString(call.arguments, "command")) |cmd| {
+        if (extractJsonString(app, call.arguments, "command")) |cmd| {
             if (app.run_mode != .yolo) {
             if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
                 return toolErr(app, "Error: blocked dangerous command ({s}). Prefer a direct command (e.g. 'ls' instead of 'sh -c \"ls\"')", .{p.description});
@@ -59,7 +59,7 @@ pub fn runTool(app: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 
         std.mem.eql(u8, call.name, "file_write") or
         std.mem.eql(u8, call.name, "file_edit"))
     {
-        if (app.extractJsonString(call.arguments, "path")) |path| {
+        if (extractJsonString(app, call.arguments, "path")) |path| {
             if (isSensitivePath(path)) {
                 return toolErr(app, "Error: blocked sensitive path", .{});
             }

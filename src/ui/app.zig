@@ -26,6 +26,7 @@ const render_ui = @import("render_ui.zig");
 const slash_commands = @import("slash_commands.zig");
 const tools_run = @import("tools_run.zig");
 const sessions = @import("sessions.zig");
+const stream_flow = @import("stream_flow.zig");
 const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
@@ -189,7 +190,7 @@ const StreamState = struct {
         self.has_tool_calls.store(true, .release);
     }
 
-    fn drainToolCallJson(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
+    pub fn drainToolCallJson(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.tool_call_json.items.len == 0) return null;
@@ -213,7 +214,7 @@ const StreamState = struct {
         self.done.store(true, .release);
     }
 
-    fn drainContent(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
+    pub fn drainContent(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.content_queue.items.len == 0) return null;
@@ -222,7 +223,7 @@ const StreamState = struct {
         return result;
     }
 
-    fn drainReasoning(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
+    pub fn drainReasoning(self: *StreamState, alloc: std.mem.Allocator) ?[]const u8 {
         self.lock();
         defer self.unlock();
         if (self.reasoning_queue.items.len == 0) return null;
@@ -231,11 +232,11 @@ const StreamState = struct {
         return result;
     }
 
-    fn isDone(self: *StreamState) bool {
+    pub fn isDone(self: *StreamState) bool {
         return self.done.load(.acquire);
     }
 
-    fn deinit(self: *StreamState) void {
+    pub fn deinit(self: *StreamState) void {
         self.content_queue.deinit(self.alloc);
         self.reasoning_queue.deinit(self.alloc);
         self.tool_call_json.deinit(self.alloc);
@@ -862,7 +863,7 @@ pub const App = struct {
                     self.cleanup_tick = 0;
                     if (self.reasonix) |rx| rx.cleanupExpired();
                 }
-                self.pollStream();
+                stream_flow.pollStream(self);
                 self.pollSubAgents();
                 self.pollCompact();
                 // Toast auto-dismiss is handled by zz.components.Toast based on timestamps
@@ -1517,99 +1518,7 @@ pub const App = struct {
         self.stream_thread = thread;
     }
 
-    fn pollStream(self: *App) void {
-        const ss = self.stream_state orelse return;
-
-        // Drain content
-        if (ss.drainContent(self.alloc)) |content| {
-            defer self.alloc.free(content);
-            self.onStreamContent(content);
-        }
-
-        // Drain reasoning
-        if (ss.drainReasoning(self.alloc)) |reasoning| {
-            defer self.alloc.free(reasoning);
-            self.onStreamReasoning(reasoning);
-        }
-
-        // Check done
-        if (ss.isDone()) {
-            // Check for tool calls BEFORE marking done
-            const has_tc = ss.has_tool_calls.load(.acquire);
-            const tc_json = if (has_tc) ss.drainToolCallJson(self.alloc) else null;
-
-            if (ss.error_msg) |msg| {
-                self.onStreamError(msg);
-                if (msg.len > 0) self.alloc.free(msg);
-                ss.error_msg = null;
-            } else if (tc_json != null) {
-                // Handle tool calls — don't mark stream done yet
-                tools_run.handleToolCalls(self, tc_json.?);
-                self.alloc.free(tc_json.?);
-                // Cleanup stream state but keep streaming_idx alive
-                if (self.stream_thread) |t| {
-                    t.join();
-                    self.stream_thread = null;
-                }
-                ss.deinit();
-                self.alloc.destroy(ss);
-                self.stream_state = null;
-                return;
-            } else {
-                self.onStreamDone();
-            }
-            // Cleanup
-            if (self.stream_thread) |t| {
-                t.join();
-                self.stream_thread = null;
-            }
-            ss.deinit();
-            self.alloc.destroy(ss);
-            self.stream_state = null;
-        }
-    }
-
-
-    /// Process the next queued tool call. Pauses at the first call that
-    /// requires user approval (pending_tool) and resumes on Enter/Esc.
-    /// Execute one tool through the unified tools/ pipeline with extra guards.
-    /// Returns a caller-owned string (empty slice on failure).
-
-pub fn isSensitivePath(path: []const u8) bool {
-    const sensitive_dirs = [_][]const u8{ ".ssh", ".aws", ".gnupg", ".kube", ".config" };
-    const sensitive_files = [_][]const u8{ "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "sudoers", "apikey" };
-    const sensitive_prefixes = [_][]const u8{ "/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/private/" };
-
-    var it = std.mem.splitScalar(u8, path, '/');
-    while (it.next()) |seg| {
-        if (seg.len == 0) continue;
-        for (sensitive_dirs) |d| {
-            if (std.mem.eql(u8, seg, d)) return true;
-        }
-        for (sensitive_files) |f| {
-            if (std.mem.eql(u8, seg, f)) return true;
-        }
-    }
-    for (sensitive_prefixes) |p| {
-        if (std.mem.startsWith(u8, path, p)) return true;
-    }
-    return false;
-}
-
-pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
-        // Simple JSON string extractor: finds "key":"value"
-        var search_buf: [256]u8 = undefined;
-        const search = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
-        if (std.mem.indexOf(u8, json, search)) |start| {
-            const val_start = start + search.len;
-            if (std.mem.indexOfScalarPos(u8, json, val_start, '"')) |end| {
-                return json[val_start..end];
-            }
-        }
-        return null;
-    }
-
-    fn onStreamContent(self: *App, text: []const u8) void {
+    pub fn onStreamContent(self: *App, text: []const u8) void {
         if (self.streaming_idx) |idx| {
             if (idx < self.messages.items.len) {
                 const old = self.messages.items[idx].content;
@@ -1633,7 +1542,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         if (self.auto_scroll) self.scroll_offset = 0;
     }
 
-    fn onStreamReasoning(self: *App, text: []const u8) void {
+    pub fn onStreamReasoning(self: *App, text: []const u8) void {
         if (self.streaming_idx) |idx| {
             if (idx < self.messages.items.len) {
                 const old = self.messages.items[idx].thinking orelse "";
@@ -1644,7 +1553,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         }
     }
 
-    fn onStreamDone(self: *App) void {
+    pub fn onStreamDone(self: *App) void {
         // Cache successful (non-tool) replies for exact-prompt reuse.
         if (self.reasonix) |rx| {
             if (self.streaming_idx) |si| {
@@ -1704,7 +1613,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         }
     }
 
-    fn onStreamError(self: *App, err_msg: []const u8) void {
+    pub fn onStreamError(self: *App, err_msg: []const u8) void {
         if (self.streaming_idx) |idx| {
             if (idx < self.messages.items.len) {
                 self.messages.items[idx].status = .failed;

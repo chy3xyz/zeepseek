@@ -24,6 +24,7 @@ const theme = @import("theme.zig");
 const render_text = @import("render_text.zig");
 const render_ui = @import("render_ui.zig");
 const slash_commands = @import("slash_commands.zig");
+const tools_run = @import("tools_run.zig");
 const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
@@ -1652,7 +1653,7 @@ pub const App = struct {
         const cwd_ptr = std.c.getenv("PWD") orelse ".";
         const cwd = std.mem.sliceTo(cwd_ptr, 0);
 
-        const result = self.runTool(call, cwd);
+        const result = tools_run.runTool(self, call, cwd);
         defer {
             if (result.len > 0) self.alloc.free(result);
         }
@@ -1680,7 +1681,7 @@ pub const App = struct {
         const pt = self.pending_tool orelse return;
         const tr = self.tool_run orelse return;
         const call = tr.calls.items[pt.idx];
-        const denied = self.toolErr("Rejected by user", .{});
+        const denied = tools_run.toolErr(self, "Rejected by user", .{});
         defer self.alloc.free(denied);
         self.onToolOutput(call.name, denied, false);
         tr.results.appendSlice(self.alloc, "Tool ") catch {};
@@ -1721,89 +1722,8 @@ pub const App = struct {
 
     /// Execute one tool through the unified tools/ pipeline with extra guards.
     /// Returns a caller-owned string (empty slice on failure).
-    fn isBuiltinToolName(name: []const u8) bool {
-        const builtin = [_][]const u8{ "shell", "file_read", "file_write", "file_edit", "git_status", "git_commit", "web_search", "web_scrape" };
-        for (builtin) |b| {
-            if (std.mem.eql(u8, name, b)) return true;
-        }
-        return false;
-    }
 
-    /// Forward a tool call to the connected MCP server via tools/call.
-    fn callMcpTool(self: *App, name: []const u8, arguments: []const u8) []const u8 {
-        const sess = &(self.mcp_session orelse return self.toolErr("Error: no MCP session", .{}));
-        const req = mcp_client_mod.buildToolsCall(self.alloc, 1, name, arguments) catch return self.toolErr("Error: MCP call build failed", .{});
-        defer self.alloc.free(req);
-        const resp = sess.roundTrip(req, 8000) catch |e| return self.toolErr("Error: MCP call: {s}", .{@errorName(e)});
-        defer self.alloc.free(resp);
-        return self.alloc.dupe(u8, resp) catch "";
-    }
-
-    fn runTool(self: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 {
-        // MCP tool forwarding: names outside the built-in set are routed to
-        // the connected MCP server's tools/call.
-        if (self.mcp_session != null and !isBuiltinToolName(call.name)) {
-            return self.callMcpTool(call.name, call.arguments);
-        }
-        // Extra guards on top of the sandbox: dangerous shell commands and
-        // sensitive paths are refused before anything executes.
-        if (std.mem.eql(u8, call.name, "shell")) {
-            if (self.extractJsonString(call.arguments, "command")) |cmd| {
-                if (self.run_mode != .yolo) {
-                if (dangerous_patterns.checkDangerousCommand(cmd)) |p| {
-                    return self.toolErr("Error: blocked dangerous command ({s}). Prefer a direct command (e.g. 'ls' instead of 'sh -c \"ls\"')", .{p.description});
-                }
-                // Execute through the worker process (pipe I/O, 30s timeout,
-                // kill on hang) so a long-running command can never freeze
-                // the UI indefinitely.
-                if (self.git_worker) |*gw| {
-                    if (gw.runShell(self.alloc, cwd, cmd)) |out| {
-                        return out;
-                    }
-                    return self.toolErr("Error: shell execution failed or timed out", .{});
-                }
-            }
-        }
-        }
-        if (std.mem.eql(u8, call.name, "file_read") or
-            std.mem.eql(u8, call.name, "file_write") or
-            std.mem.eql(u8, call.name, "file_edit"))
-        {
-            if (self.extractJsonString(call.arguments, "path")) |path| {
-                if (isSensitivePath(path)) {
-                    return self.toolErr("Error: blocked sensitive path", .{});
-                }
-            }
-        }
-
-        // Recovery guardrail (Reasonix borrow): consecutive tool failures
-        // stop the tool to avoid a retry loop.
-        const res = tools_mod.executeTool(self.alloc, self.sandbox, cwd, call) catch {
-            self.tool_fail_streak += 1;
-            if (self.tool_fail_streak >= 3) {
-                self.tool_fail_streak = 0;
-                self.setNotification("Tool failed 3x in a row — stopped (use /clear to reset)");
-            }
-            return self.toolErr("Error: tool execution failed", .{});
-        };
-        // ToolResult.output is allocator-owned when non-empty, static "" on error.
-        self.tool_fail_streak = 0;
-        if (res.output.len > 0) {
-            const owned = self.alloc.dupe(u8, res.output) catch "";
-            self.alloc.free(res.output);
-            return owned;
-        }
-        return self.toolErr("Error: {s}", .{res.err_msg orelse "tool failed"});
-    }
-
-    /// Allocate an error/status string owned by the caller (freed by
-    /// handleToolCalls). Returns an empty slice on allocation failure —
-    /// callers must not free empty results.
-    fn toolErr(self: *App, comptime fmt: []const u8, args: anytype) []const u8 {
-        return std.fmt.allocPrint(self.alloc, fmt, args) catch "";
-    }
-
-fn isSensitivePath(path: []const u8) bool {
+pub fn isSensitivePath(path: []const u8) bool {
     const sensitive_dirs = [_][]const u8{ ".ssh", ".aws", ".gnupg", ".kube", ".config" };
     const sensitive_files = [_][]const u8{ "id_rsa", "id_ed25519", "authorized_keys", "known_hosts", "shadow", "sudoers", "apikey" };
     const sensitive_prefixes = [_][]const u8{ "/etc/", "/proc/", "/sys/", "/dev/", "/boot/", "/private/" };
@@ -1824,7 +1744,7 @@ fn isSensitivePath(path: []const u8) bool {
     return false;
 }
 
-fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
+pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
         // Simple JSON string extractor: finds "key":"value"
         var search_buf: [256]u8 = undefined;
         const search = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;

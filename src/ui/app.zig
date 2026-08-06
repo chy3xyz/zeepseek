@@ -386,11 +386,11 @@ pub const App = struct {
         tick: struct { timestamp: u64, delta: u64 },
     };
 
-    const OutputData = union(enum) {
+    pub const OutputData = union(enum) {
         table: SlashDispatcher.TableData,
         list: SlashDispatcher.ListData,
 
-        fn deinit(self: *OutputData, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *OutputData, allocator: std.mem.Allocator) void {
             switch (self.*) {
                 .table => |t| {
                     for (t.rows) |row| SlashDispatcher.freeRow(allocator, row);
@@ -911,7 +911,7 @@ pub const App = struct {
         // --- Slash output modal
         if (self.slash_output_active) {
             if (k == .escape or k == .enter or (k == .char and k.char == 'q')) {
-                self.closeSlashOutput();
+                slash_commands.closeSlashOutput(self);
             }
             return .none;
         }
@@ -919,7 +919,7 @@ pub const App = struct {
         // --- Slash prompt overlay
         if (self.slash_awaiting_cmd != null) {
             if (k == .escape) {
-                self.closeSlashPrompt();
+                slash_commands.closeSlashPrompt(self);
                 return .none;
             }
             if (k == .enter) {
@@ -927,8 +927,8 @@ pub const App = struct {
                 defer self.alloc.free(cmd_id);
                 const value = self.alloc.dupe(u8, self.slash_prompt_input.getValue()) catch return .none;
                 defer self.alloc.free(value);
-                self.closeSlashPrompt();
-                self.executeSlashCommand(cmd_id, value);
+                slash_commands.closeSlashPrompt(self);
+                slash_commands.executeSlashCommand(self, cmd_id, value);
                 return .none;
             }
             _ = self.slash_prompt_input.handleKey(key);
@@ -941,7 +941,7 @@ pub const App = struct {
             switch (result) {
                 .accepted => if (self.palette.selected()) |cmd| {
                     self.palette.close();
-                    self.executeSlashCommand(cmd.id, "");
+                    slash_commands.executeSlashCommand(self, cmd.id, "");
                 },
                 .cancelled => self.palette.close(),
                 .consumed, .ignored => {},
@@ -1131,7 +1131,7 @@ pub const App = struct {
             var it = std.mem.splitScalar(u8, rest, ' ');
             const cmd_id = it.first();
             const args = std.mem.trim(u8, rest[cmd_id.len..], " ");
-            self.executeSlashCommand(cmd_id, args);
+            slash_commands.executeSlashCommand(self, cmd_id, args);
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;
             return;
@@ -2067,7 +2067,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         self.setNotification(msg);
     }
 
-    fn setThemeByName(self: *App, name: []const u8) void {
+    pub fn setThemeByName(self: *App, name: []const u8) void {
         for (theme.themes) |t| {
             if (std.mem.eql(u8, name, t.name) or std.mem.eql(u8, name, @tagName(t.id))) {
                 self.theme_manager.setTheme(t.id);
@@ -2085,7 +2085,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
     // ═════════════════════════════════════════════════════════════════
 
 
-    fn setApiKey(self: *App, key: []const u8) void {
+    pub fn setApiKey(self: *App, key: []const u8) void {
         if (key.len == 0) {
             self.setNotification("Usage: /apikey <your-api-key>");
             return;
@@ -2130,163 +2130,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         self.toast.push(msg, .info, 2000, 0) catch {};
     }
 
-    fn executeSlashCommand(self: *App, id: []const u8, args: []const u8) void {
-        const ctx = SlashDispatcher.CommandContext{
-            .allocator = self.alloc,
-            .io = self.io,
-            .provider = self.provider,
-            .model = self.model,
-            .subsystems_initialized = self.subsystems_initialized,
-            .provider_mgr = &self.provider_mgr,
-            .sandbox = if (self.sandbox) |s| s else null,
-            .tokens_used = self.tokens_used,
-            .ctx_max = self.ctx_max,
-            .cache_hit_rate = self.cache_hit_rate,
-            .session_id = self.session_id,
-        };
-
-        const result = SlashDispatcher.Dispatcher.execute(ctx, id, args) catch |err| {
-            const msg = std.fmt.allocPrint(self.alloc, "Command error: {s}", .{@errorName(err)}) catch return;
-            defer self.alloc.free(msg);
-            self.setNotification(msg);
-            return;
-        };
-
-        switch (result) {
-            .none => {},
-
-            .set_input => |text| {
-                self.text_input.setValue(text) catch {};
-                self.text_input.cursor = self.text_input.getValue().len;
-                self.alloc.free(text);
-            },
-
-            .notify => |msg| {
-                self.setNotification(msg);
-                self.alloc.free(msg);
-            },
-
-            .quit => self.should_quit = true,
-            .clear_chat => self.clearMessages(),
-            .save_session => self.saveSession(if (args.len > 0) args else self.session_id),
-            .load_session => self.loadSession(if (args.len > 0) args else self.session_id),
-            .toggle_thinking => self.show_thinking = !self.show_thinking,
-            .toggle_tools => self.toggleToolCollapse(),
-            .toggle_subagents => self.show_subagents = !self.show_subagents,
-            .scroll_top => { self.scroll_offset = 0; self.auto_scroll = false; },
-            .scroll_bottom => { self.scroll_offset = 0; self.auto_scroll = true; },
-            .compact_context => self.compactContext(),
-            .show_help => { render_ui.updateHelpModal(self); self.help_modal.show(); },
-
-            .set_model => |name| {
-                self.model = self.alloc.dupe(u8, name) catch self.model;
-                if (self.subsystems_initialized) {
-                    if (self.provider_mgr.getActive()) |cfg| {
-                        var new_cfg = cfg;
-                        new_cfg.default_model = name;
-                        self.provider_mgr.addProvider(new_cfg) catch {};
-                    }
-                }
-                const msg = std.fmt.allocPrint(self.alloc, "Model: {s} (via {s})", .{ name, self.provider }) catch return;
-                defer self.alloc.free(msg);
-                self.setNotification(msg);
-                self.alloc.free(name);
-            },
-
-            .set_theme => |name| {
-                self.setThemeByName(name);
-                self.alloc.free(name);
-            },
-
-            .set_apikey => |key| {
-                self.setApiKey(key);
-                self.alloc.free(key);
-                self.setNotification("API key set");
-            },
-
-            .set_provider => |name| {
-                if (self.subsystems_initialized) {
-                    self.provider_mgr.setActive(name) catch {};
-                }
-                self.provider = self.alloc.dupe(u8, name) catch self.provider;
-                const resolved_model = if (self.subsystems_initialized)
-                    self.provider_mgr.resolveModel(name)
-                else
-                    "deepseek-chat";
-                self.model = self.alloc.dupe(u8, resolved_model) catch self.model;
-
-                const title = std.fmt.allocPrint(self.alloc, "Enter API key for {s}", .{name}) catch return;
-                self.alloc.free(name);
-                self.openSlashPrompt("apikey", title, "sk-...");
-                self.alloc.free(title);
-            },
-
-            .prompt => |p| {
-                const title = self.alloc.dupe(u8, p.title) catch return;
-                const placeholder = self.alloc.dupe(u8, p.placeholder) catch {
-                    self.alloc.free(title);
-                    return;
-                };
-                self.alloc.free(p.title);
-                self.alloc.free(p.placeholder);
-                self.openSlashPrompt(id, title, placeholder);
-            },
-
-            .show_table => |t| {
-                self.setSlashOutput(.{ .table = t });
-            },
-
-            .show_list => |l| {
-                self.setSlashOutput(.{ .list = l });
-            },
-        }
-    }
-
-    fn openSlashPrompt(self: *App, cmd_id: []const u8, title: []const u8, placeholder: []const u8) void {
-        if (self.slash_awaiting_cmd) |old| self.alloc.free(old);
-        if (self.slash_prompt_title) |old| self.alloc.free(old);
-        if (self.slash_prompt_placeholder) |old| self.alloc.free(old);
-
-        self.slash_awaiting_cmd = self.alloc.dupe(u8, cmd_id) catch return;
-        self.slash_prompt_title = self.alloc.dupe(u8, title) catch return;
-        self.slash_prompt_placeholder = self.alloc.dupe(u8, placeholder) catch return;
-
-        self.slash_prompt_input.setValue("") catch {};
-        self.slash_prompt_input.setPlaceholder(placeholder);
-    }
-
-    fn closeSlashPrompt(self: *App) void {
-        if (self.slash_awaiting_cmd) |s| self.alloc.free(s);
-        if (self.slash_prompt_title) |s| self.alloc.free(s);
-        if (self.slash_prompt_placeholder) |s| self.alloc.free(s);
-        self.slash_awaiting_cmd = null;
-        self.slash_prompt_title = null;
-        self.slash_prompt_placeholder = null;
-        self.slash_prompt_input.setValue("") catch {};
-    }
-
-    fn setSlashOutput(self: *App, data: OutputData) void {
-        if (self.slash_output_data) |*old| {
-            old.deinit(self.alloc);
-        }
-        self.slash_output_data = data;
-
-        self.slash_output_title = switch (data) {
-            .table => |t| t.title,
-            .list => |l| l.title,
-        };
-        self.slash_output_active = true;
-    }
-
-    fn closeSlashOutput(self: *App) void {
-        self.slash_output_active = false;
-        if (self.slash_output_data) |*d| {
-            d.deinit(self.alloc);
-            self.slash_output_data = null;
-        }
-    }
-
-    fn saveSession(self: *App, name: []const u8) void {
+    pub fn saveSession(self: *App, name: []const u8) void {
         if (!isValidSessionName(name)) {
             self.setNotification("Invalid session name (letters, digits, - and _ only)");
             return;
@@ -2365,7 +2209,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         self.session_id_alloc = self.alloc;
     }
 
-    fn loadSession(self: *App, name: []const u8) void {
+    pub fn loadSession(self: *App, name: []const u8) void {
         if (!isValidSessionName(name)) {
             self.setNotification("Invalid session name (letters, digits, - and _ only)");
             return;
@@ -2411,7 +2255,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         self.streaming_idx = null;
     }
 
-    fn listSessions(self: *App) void {
+    pub fn listSessions(self: *App) void {
         const home_ptr = std.c.getenv("HOME") orelse return;
         const home = std.mem.sliceTo(home_ptr, 0);
         var dir_buf: [512:0]u8 = undefined;
@@ -2455,7 +2299,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         }
     }
 
-    fn toggleToolCollapse(self: *App) void {
+    pub fn toggleToolCollapse(self: *App) void {
         for (self.messages.items) |*m| {
             if (m.tool_calls.items.len > 0) {
                 m.tool_collapsed = !m.tool_collapsed;
@@ -2463,7 +2307,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
         }
     }
 
-    fn clearMessages(self: *App) void {
+    pub fn clearMessages(self: *App) void {
         for (self.messages.items) |*m| {
             if (m.owns and m.content.len > 0) self.alloc.free(m.content);
             if (m.thinking) |t| self.alloc.free(t);
@@ -2482,7 +2326,7 @@ pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8
     /// into a single compacted summary system message.
     /// Start a background LLM summarization of older messages (/compact).
     /// The result replaces the compacted range once the thread finishes.
-    fn compactContext(self: *App) void {
+    pub fn compactContext(self: *App) void {
         const KEEP_EXCHANGES: usize = 6; // last 6 user↔assistant rounds
         const total = self.messages.items.len;
         if (total <= KEEP_EXCHANGES * 2) {

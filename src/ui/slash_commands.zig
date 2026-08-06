@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const App = @import("app.zig").App;
+const OutputData = App.OutputData;
 const RunMode = @import("app.zig").RunMode;
 const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_runner_mod = @import("../net/mcp_runner.zig");
@@ -12,6 +13,7 @@ const session_format = @import("session_format");
 const SlashDispatcher = @import("slash_command_dispatcher.zig");
 const memory_mod = @import("../cache/memory.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
+const render_ui = @import("render_ui.zig");
 
 /// Handle the inline slash commands in the submit path. Returns true if the
 /// input was consumed as a command.
@@ -297,3 +299,161 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
 
     return false;
 }
+
+pub fn executeSlashCommand(app: *App, id: []const u8, args: []const u8) void {
+    const ctx = SlashDispatcher.CommandContext{
+        .allocator = app.alloc,
+        .io = app.io,
+        .provider = app.provider,
+        .model = app.model,
+        .subsystems_initialized = app.subsystems_initialized,
+        .provider_mgr = &app.provider_mgr,
+        .sandbox = if (app.sandbox) |s| s else null,
+        .tokens_used = app.tokens_used,
+        .ctx_max = app.ctx_max,
+        .cache_hit_rate = app.cache_hit_rate,
+        .session_id = app.session_id,
+    };
+
+    const result = SlashDispatcher.Dispatcher.execute(ctx, id, args) catch |err| {
+        const msg = std.fmt.allocPrint(app.alloc, "Command error: {s}", .{@errorName(err)}) catch return;
+        defer app.alloc.free(msg);
+        app.setNotification(msg);
+        return;
+    };
+
+    switch (result) {
+        .none => {},
+
+        .set_input => |text| {
+            app.text_input.setValue(text) catch {};
+            app.text_input.cursor = app.text_input.getValue().len;
+            app.alloc.free(text);
+        },
+
+        .notify => |msg| {
+            app.setNotification(msg);
+            app.alloc.free(msg);
+        },
+
+        .quit => app.should_quit = true,
+        .clear_chat => app.clearMessages(),
+        .save_session => app.saveSession(if (args.len > 0) args else app.session_id),
+        .load_session => app.loadSession(if (args.len > 0) args else app.session_id),
+        .toggle_thinking => app.show_thinking = !app.show_thinking,
+        .toggle_tools => app.toggleToolCollapse(),
+        .toggle_subagents => app.show_subagents = !app.show_subagents,
+        .scroll_top => { app.scroll_offset = 0; app.auto_scroll = false; },
+        .scroll_bottom => { app.scroll_offset = 0; app.auto_scroll = true; },
+        .compact_context => app.compactContext(),
+        .show_help => { render_ui.updateHelpModal(app); app.help_modal.show(); },
+
+        .set_model => |name| {
+            app.model = app.alloc.dupe(u8, name) catch app.model;
+            if (app.subsystems_initialized) {
+                if (app.provider_mgr.getActive()) |cfg| {
+                    var new_cfg = cfg;
+                    new_cfg.default_model = name;
+                    app.provider_mgr.addProvider(new_cfg) catch {};
+                }
+            }
+            const msg = std.fmt.allocPrint(app.alloc, "Model: {s} (via {s})", .{ name, app.provider }) catch return;
+            defer app.alloc.free(msg);
+            app.setNotification(msg);
+            app.alloc.free(name);
+        },
+
+        .set_theme => |name| {
+            app.setThemeByName(name);
+            app.alloc.free(name);
+        },
+
+        .set_apikey => |key| {
+            app.setApiKey(key);
+            app.alloc.free(key);
+            app.setNotification("API key set");
+        },
+
+        .set_provider => |name| {
+            if (app.subsystems_initialized) {
+                app.provider_mgr.setActive(name) catch {};
+            }
+            app.provider = app.alloc.dupe(u8, name) catch app.provider;
+            const resolved_model = if (app.subsystems_initialized)
+                app.provider_mgr.resolveModel(name)
+            else
+                "deepseek-chat";
+            app.model = app.alloc.dupe(u8, resolved_model) catch app.model;
+
+            const title = std.fmt.allocPrint(app.alloc, "Enter API key for {s}", .{name}) catch return;
+            app.alloc.free(name);
+            openSlashPrompt(app, "apikey", title, "sk-...");
+            app.alloc.free(title);
+        },
+
+        .prompt => |p| {
+            const title = app.alloc.dupe(u8, p.title) catch return;
+            const placeholder = app.alloc.dupe(u8, p.placeholder) catch {
+                app.alloc.free(title);
+                return;
+            };
+            app.alloc.free(p.title);
+            app.alloc.free(p.placeholder);
+            openSlashPrompt(app, id, title, placeholder);
+        },
+
+        .show_table => |t| {
+            setSlashOutput(app, .{ .table = t });
+        },
+
+        .show_list => |l| {
+            setSlashOutput(app, .{ .list = l });
+        },
+    }
+}
+
+pub fn openSlashPrompt(app: *App, cmd_id: []const u8, title: []const u8, placeholder: []const u8) void {
+    if (app.slash_awaiting_cmd) |old| app.alloc.free(old);
+    if (app.slash_prompt_title) |old| app.alloc.free(old);
+    if (app.slash_prompt_placeholder) |old| app.alloc.free(old);
+
+    app.slash_awaiting_cmd = app.alloc.dupe(u8, cmd_id) catch return;
+    app.slash_prompt_title = app.alloc.dupe(u8, title) catch return;
+    app.slash_prompt_placeholder = app.alloc.dupe(u8, placeholder) catch return;
+
+    app.slash_prompt_input.setValue("") catch {};
+    app.slash_prompt_input.setPlaceholder(placeholder);
+}
+
+pub fn closeSlashPrompt(app: *App) void {
+    if (app.slash_awaiting_cmd) |s| app.alloc.free(s);
+    if (app.slash_prompt_title) |s| app.alloc.free(s);
+    if (app.slash_prompt_placeholder) |s| app.alloc.free(s);
+    app.slash_awaiting_cmd = null;
+    app.slash_prompt_title = null;
+    app.slash_prompt_placeholder = null;
+    app.slash_prompt_input.setValue("") catch {};
+}
+
+pub fn setSlashOutput(app: *App, data: OutputData) void {
+    if (app.slash_output_data) |*old| {
+        old.deinit(app.alloc);
+    }
+    app.slash_output_data = data;
+
+    app.slash_output_title = switch (data) {
+        .table => |t| t.title,
+        .list => |l| l.title,
+    };
+    app.slash_output_active = true;
+}
+
+pub fn closeSlashOutput(app: *App) void {
+    app.slash_output_active = false;
+    if (app.slash_output_data) |*d| {
+        d.deinit(app.alloc);
+        app.slash_output_data = null;
+    }
+}
+
+

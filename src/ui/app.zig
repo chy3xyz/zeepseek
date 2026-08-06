@@ -1518,9 +1518,10 @@ pub const App = struct {
         }
 
         if (std.mem.startsWith(u8, text_slice, "/skill ")) {
+            const name = self.alloc.dupe(u8, std.mem.trim(u8, text_slice["/skill ".len..], " ")) catch null;
+            defer if (name) |n| self.alloc.free(n);
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;
-            const name = std.mem.trim(u8, text_slice["/skill ".len..], " ");
             var found = false;
             if (self.skill_registry) |reg| {
                 if (reg.findByName(name) != null or reg.findByCommand(name) != null) {
@@ -1574,9 +1575,11 @@ pub const App = struct {
 
         // /mode auto|plan|yolo: switch tool execution mode.
         if (std.mem.startsWith(u8, text_slice, "/mode")) {
+            const arg_dup = self.alloc.dupe(u8, std.mem.trim(u8, text_slice["/mode".len..], " ")) catch null;
+            defer if (arg_dup) |ad| self.alloc.free(ad);
+            const arg = arg_dup orelse "";
             self.text_input.setValue("") catch {};
             self.text_input.cursor = 0;
-            const arg = std.mem.trim(u8, text_slice["/mode".len..], " ");
             const new_mode: ?RunMode = if (std.mem.eql(u8, arg, "plan"))
                 .plan
             else if (std.mem.eql(u8, arg, "yolo"))

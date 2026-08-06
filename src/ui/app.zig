@@ -845,10 +845,10 @@ pub const App = struct {
         switch (msg) {
             .key => |k| return self.onKey(k),
             .mouse => |m| return self.onMouse(m),
-            .stream_content => |text| self.onStreamContent(text),
-            .stream_reasoning => |text| self.onStreamReasoning(text),
-            .stream_done => self.onStreamDone(),
-            .stream_error => |e| self.onStreamError(e),
+            .stream_content => |text| stream_flow.onStreamContent(self, text),
+            .stream_reasoning => |text| stream_flow.onStreamReasoning(self, text),
+            .stream_done => stream_flow.onStreamDone(self),
+            .stream_error => |e| stream_flow.onStreamError(self, e),
             .tool_start => |t| self.onToolStart(t.name, t.args),
             .tool_output => |t| self.onToolOutput(t.name, t.output, t.success),
             .subagent_start => |s| self.onSubAgentStart(s.id, s.role, s.goal),
@@ -1516,115 +1516,6 @@ pub const App = struct {
             return;
         };
         self.stream_thread = thread;
-    }
-
-    pub fn onStreamContent(self: *App, text: []const u8) void {
-        if (self.streaming_idx) |idx| {
-            if (idx < self.messages.items.len) {
-                const old = self.messages.items[idx].content;
-                const new = std.mem.concat(self.alloc, u8, &.{ old, text }) catch return;
-                if (self.messages.items[idx].owns and old.len > 0) self.alloc.free(old);
-                self.messages.items[idx].content = new;
-                self.messages.items[idx].owns = true;
-            }
-        } else {
-            const idx = self.messages.items.len;
-            const duped = self.alloc.dupe(u8, text) catch return;
-            self.messages.append(self.alloc, .{
-                .role = .assistant,
-                .content = duped,
-                .status = .streaming,
-                .timestamp = 0, // TODO: use std.Io.Timestamp when ctx is available
-                .owns = true,
-            }) catch return;
-            self.streaming_idx = idx;
-        }
-        if (self.auto_scroll) self.scroll_offset = 0;
-    }
-
-    pub fn onStreamReasoning(self: *App, text: []const u8) void {
-        if (self.streaming_idx) |idx| {
-            if (idx < self.messages.items.len) {
-                const old = self.messages.items[idx].thinking orelse "";
-                const new = std.mem.concat(self.alloc, u8, &.{ old, text }) catch return;
-                if (old.len > 0) self.alloc.free(old);
-                self.messages.items[idx].thinking = new;
-            }
-        }
-    }
-
-    pub fn onStreamDone(self: *App) void {
-        // Cache successful (non-tool) replies for exact-prompt reuse.
-        if (self.reasonix) |rx| {
-            if (self.streaming_idx) |si| {
-                if (si > 0 and si < self.messages.items.len) {
-                    const user_msg = self.messages.items[si - 1];
-                    const asst_msg = self.messages.items[si];
-                    if (user_msg.role == .user and user_msg.content.len >= 15 and asst_msg.content.len > 0) {
-                        rx.put(user_msg.content, asst_msg.content) catch {};
-                    }
-                }
-            }
-        }
-        if (self.streaming_idx) |idx| {
-            if (idx < self.messages.items.len) {
-                self.messages.items[idx].status = .complete;
-            }
-        }
-        self.streaming_idx = null;
-        self.turn += 1;
-
-        // Auto-send the next queued input, if any (streaming/tool loop done).
-        if (self.pending_inputs.items.len > 0) {
-            const queued = self.pending_inputs.orderedRemove(0);
-            self.messages.append(self.alloc, .{
-                .role = .user,
-                .content = queued,
-                .timestamp = 0,
-                .owns = true,
-            }) catch {
-                self.alloc.free(queued);
-                return;
-            };
-            self.history_edit_idx = null;
-            self.auto_scroll = true;
-            self.turn += 1;
-            if (self.api_key.len > 0) {
-                self.startStreaming(queued, "");
-            }
-        }
-
-        // One-shot context water-level hint (aligned with reasonix fold
-        // thresholds): suggest /compact once the conversation passes 70%.
-        if (!self.compact_hinted) {
-            var total: usize = 0;
-            for (self.messages.items) |m| total += tokenizer_mod.Tokenizer.count(m.content);
-            if (self.ctx_max > 0) {
-                const pct = @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(self.ctx_max)) * 100.0;
-                if (pct > 70) {
-                    const hint = std.fmt.allocPrint(self.alloc, "Context at {d:.0}% — run /compact to summarize", .{pct}) catch null;
-                    if (hint) |h| {
-                        self.setNotification(h);
-                        self.alloc.free(h);
-                    }
-                    self.compact_hinted = true;
-                }
-            }
-        }
-    }
-
-    pub fn onStreamError(self: *App, err_msg: []const u8) void {
-        if (self.streaming_idx) |idx| {
-            if (idx < self.messages.items.len) {
-                self.messages.items[idx].status = .failed;
-                const old = self.messages.items[idx].content;
-                const new = std.fmt.allocPrint(self.alloc, "{s}\n[Error: {s}]", .{ old, err_msg }) catch return;
-                if (self.messages.items[idx].owns and old.len > 0) self.alloc.free(old);
-                self.messages.items[idx].content = new;
-                self.messages.items[idx].owns = true;
-            }
-        }
-        self.streaming_idx = null;
     }
 
     pub fn onToolStart(self: *App, name: []const u8, args: []const u8) void {

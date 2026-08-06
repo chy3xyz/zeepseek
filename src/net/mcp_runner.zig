@@ -122,6 +122,12 @@ test "roundTrip handshake against a local demo server" {
     const tl_resp = try sess.roundTrip(tl, 4000);
     defer alloc.free(tl_resp);
     try std.testing.expect(std.mem.indexOf(u8, tl_resp, "demo_tool") != null);
+    // tools/call: invoke demo_tool and verify the text result comes back.
+    const call = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"demo_tool\",\"arguments\":{{}}}}}}", .{});
+    defer alloc.free(call);
+    const call_resp = try sess.roundTrip(call, 4000);
+    defer alloc.free(call_resp);
+    try std.testing.expect(std.mem.indexOf(u8, call_resp, "demo result from mcp") != null);
 }
 
 test "spawn fails cleanly for missing command" {

@@ -1556,7 +1556,8 @@ pub const App = struct {
                 const q = std.mem.trim(u8, arg["recall ".len..], " ");
                 if (self.memory) |mem| {
                     const recalled = mem.recall(q, 4, 1200);
-                    defer self.alloc.free(recalled);
+                    // recalled is allocated with memory's allocator (page_allocator).
+                    defer std.heap.page_allocator.free(recalled);
                     self.setNotification(if (recalled.len > 0) recalled else "No memory matches");
                 }
             } else if (arg.len > 0) {

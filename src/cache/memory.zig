@@ -194,6 +194,16 @@ test "memory add writes the fact to the file" {
     try std.testing.expectEqualStrings("user prefers tabs\n", buf[0..@intCast(r)]);
 }
 
+test "memory recall single token query" {
+    const alloc = std.testing.allocator;
+    var mem = Memory.init(alloc);
+    defer mem.deinit();
+    mem.facts.append(alloc, alloc.dupe(u8, "project uses zig") catch return) catch {};
+    const r = mem.recall("zig", 4, 1200);
+    defer alloc.free(r);
+    try std.testing.expect(std.mem.indexOf(u8, r, "zig") != null);
+}
+
 test "memory empty recall" {
     const alloc = std.testing.allocator;
     var mem = Memory.init(alloc);

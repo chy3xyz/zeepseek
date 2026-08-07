@@ -556,6 +556,25 @@ pub fn openSubMenu(app: *App, menu: SlashDispatcher.SubMenu) void {
     SlashDispatcher.freeSubMenu(app.alloc, menu);
 }
 
+/// Restore the top-level "/" command list after a sub-menu was opened. Used
+/// when Esc is pressed in a sub-menu: instead of dismissing everything, the
+/// user returns one level up to the main command list.
+pub fn restoreMainMenu(app: *App) void {
+    var cmds: std.ArrayList(zz.components.Command) = .empty;
+    defer cmds.deinit(app.alloc);
+    for (SlashDispatcher.Dispatcher.commands()) |cmd| {
+        cmds.append(app.alloc, .{
+            .id = cmd.id,
+            .label = cmd.label,
+            .description = cmd.desc,
+        }) catch break;
+    }
+    app.palette.setCommands(cmds.items) catch {};
+    app.palette.clear() catch {};
+    app.palette.open();
+    app.submenu_active = false;
+}
+
 /// Route a sub-menu selection. `action` is the slash line stored on the item
 /// (e.g. "/model deepseek-v4-pro", "/note list", "/memory recall ").
 pub fn applySubmenuAction(app: *App, action: []const u8) void {

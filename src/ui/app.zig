@@ -1045,8 +1045,12 @@ pub const App = struct {
                     }
                 },
                 .cancelled => {
-                    self.submenu_active = false;
-                    self.palette.close();
+                    if (self.submenu_active) {
+                        // Esc in a sub-menu: go back one level to the main "/" menu.
+                        slash_commands.restoreMainMenu(self);
+                    } else {
+                        self.palette.close();
+                    }
                 },
                 .consumed, .ignored => {},
             }

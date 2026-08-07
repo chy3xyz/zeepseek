@@ -29,6 +29,9 @@ pub const TextInput = struct {
 
     // State
     focused: bool,
+    /// Blink gate — when false the cursor glyph is not rendered. Driven by
+    /// the host each frame so the caret blinks without re-entering styling.
+    cursor_visible: bool = true,
 
     // Validation
     validate_fn: ?*const fn ([]const u8) bool,
@@ -78,6 +81,7 @@ pub const TextInput = struct {
                 break :blk s;
             },
             .focused = true,
+            .cursor_visible = true,
             .validate_fn = null,
             .suggestions = &.{},
             .current_suggestion_idx = 0,
@@ -384,6 +388,7 @@ pub const TextInput = struct {
         // Write prompt
         if (self.prompt.len > 0) {
             const rendered_prompt = try self.prompt_style.render(allocator, self.prompt);
+            defer allocator.free(rendered_prompt);
             try writer.writeAll(rendered_prompt);
         }
 
@@ -392,17 +397,25 @@ pub const TextInput = struct {
             // Show placeholder
             if (self.placeholder.len > 0) {
                 const rendered = try self.placeholder_style.render(allocator, self.placeholder);
+                defer allocator.free(rendered);
                 try writer.writeAll(rendered);
+            }
+            // Blinking block caret even when empty, so focus is always visible.
+            if (self.focused and self.cursor_visible) {
+                const caret = try self.cursor_style.render(allocator, " ");
+                defer allocator.free(caret);
+                try writer.writeAll(caret);
             }
         } else {
             // Show value (possibly masked)
             switch (self.echo_mode) {
                 .normal => {
-                    // Render with cursor
-                    if (self.focused) {
+                    // Render with cursor (blinking when cursor_visible toggles)
+                    if (self.focused and self.cursor_visible) {
                         try self.renderWithCursor(writer, allocator);
                     } else {
                         const rendered = try self.text_style.render(allocator, self.value.items);
+                        defer allocator.free(rendered);
                         try writer.writeAll(rendered);
                     }
                 },
@@ -410,8 +423,10 @@ pub const TextInput = struct {
                     // Show asterisks
                     const char_count = self.charCount();
                     const masked = try allocator.alloc(u8, char_count);
+                    defer allocator.free(masked);
                     @memset(masked, '*');
                     const rendered = try self.text_style.render(allocator, masked);
+                    defer allocator.free(rendered);
                     try writer.writeAll(rendered);
                 },
                 .none => {
@@ -427,6 +442,7 @@ pub const TextInput = struct {
         // Text before cursor
         if (self.cursor > 0) {
             const before = try self.text_style.render(allocator, self.value.items[0..self.cursor]);
+            defer allocator.free(before);
             try writer.writeAll(before);
         }
 
@@ -435,16 +451,19 @@ pub const TextInput = struct {
             const byte_len = std.unicode.utf8ByteSequenceLength(self.value.items[self.cursor]) catch 1;
             const cursor_char = self.value.items[self.cursor..][0..byte_len];
             const cursor_rendered = try self.cursor_style.render(allocator, cursor_char);
+            defer allocator.free(cursor_rendered);
             try writer.writeAll(cursor_rendered);
 
             // Text after cursor
             if (self.cursor + byte_len < self.value.items.len) {
                 const after = try self.text_style.render(allocator, self.value.items[self.cursor + byte_len ..]);
+                defer allocator.free(after);
                 try writer.writeAll(after);
             }
         } else {
             // Cursor at end - show cursor on space
             const cursor_rendered = try self.cursor_style.render(allocator, " ");
+            defer allocator.free(cursor_rendered);
             try writer.writeAll(cursor_rendered);
         }
 
@@ -454,6 +473,7 @@ pub const TextInput = struct {
                 if (suggestion.len > self.value.items.len) {
                     const ghost = suggestion[self.value.items.len..];
                     const ghost_rendered = try self.suggestion_style.render(allocator, ghost);
+                    defer allocator.free(ghost_rendered);
                     try writer.writeAll(ghost_rendered);
                 }
             }

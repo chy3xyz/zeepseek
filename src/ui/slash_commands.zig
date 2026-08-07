@@ -1,20 +1,37 @@
 //! Slash-command handling — split out of app.zig (submit path).
 
 const std = @import("std");
+const zz = @import("zigzag");
 const App = @import("app.zig").App;
 const OutputData = App.OutputData;
 const RunMode = @import("app.zig").RunMode;
 const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_runner_mod = @import("../net/mcp_runner.zig");
 const mcp_client_mod = @import("../net/mcp_client.zig");
-const dangerous_patterns = @import("dangerous_patterns");
+const dangerous_patterns = @import("../utils/dangerous_patterns.zig");
 const tools_mod = @import("../tools/mod.zig");
-const session_format = @import("session_format");
+const session_format = @import("../storage/session_format.zig");
 const SlashDispatcher = @import("slash_command_dispatcher.zig");
 const memory_mod = @import("../cache/memory.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
 const render_ui = @import("render_ui.zig");
 const sessions = @import("sessions.zig");
+
+/// Read a file into a caller-owned buffer (raw syscalls), or null if unreadable.
+fn readNoteFile(alloc: std.mem.Allocator, path: [:0]const u8) ?[]u8 {
+    const fd = std.c.open(path.ptr, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    if (fd < 0) return null;
+    defer _ = std.c.close(fd);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(alloc);
+    var buf: [4096]u8 = undefined;
+    while (true) {
+        const n = std.c.read(fd, &buf, buf.len);
+        if (n <= 0) break;
+        out.appendSlice(alloc, buf[0..@intCast(n)]) catch return null;
+    }
+    return out.toOwnedSlice(alloc) catch null;
+}
 
 /// Handle the inline slash commands in the submit path. Returns true if the
 /// input was consumed as a command.
@@ -268,6 +285,89 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
         return true;
     }
 
+    // /note: add / list / clear persistent notes.
+    if (std.mem.startsWith(u8, text_slice, "/note")) {
+        const arg_slice = std.mem.trim(u8, text_slice["/note".len..], " ");
+        const arg = app.alloc.dupe(u8, arg_slice) catch return true;
+        defer app.alloc.free(arg);
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+
+        const home_z = std.c.getenv("HOME") orelse null;
+        if (home_z == null) {
+            app.setNotification("HOME not set");
+            return true;
+        }
+        const home = std.mem.sliceTo(home_z.?, 0);
+        var buf: [1024:0]u8 = undefined;
+        const path = std.fmt.bufPrintSentinel(&buf, "{s}/.zeepseek/notes.md", .{home}, 0) catch {
+            app.setNotification("Note path too long");
+            return true;
+        };
+
+        if (std.mem.eql(u8, arg, "clear")) {
+            if (std.c.open(path.ptr, .{ .ACCMODE = .WRONLY }, @as(std.c.mode_t, 0)) != -1) {
+                _ = std.c.unlink(path.ptr);
+            }
+            app.setNotification("Notes cleared");
+            return true;
+        }
+
+        if (std.mem.startsWith(u8, arg, "add ")) {
+            const body = std.mem.trim(u8, arg["add ".len..], " ");
+            if (body.len == 0) {
+                app.setNotification("Empty note ignored — usage: /note add <text>");
+                return true;
+            }
+            var dir_buf: [512:0]u8 = undefined;
+            _ = std.fmt.bufPrintSentinel(&dir_buf, "{s}/.zeepseek", .{home}, 0) catch return true;
+            _ = std.c.mkdir(&dir_buf, 0o755);
+            const existing_owned = readNoteFile(app.alloc, &buf);
+            defer if (existing_owned) |e| app.alloc.free(e);
+            const existing: []const u8 = existing_owned orelse "";
+            var line = std.ArrayList(u8).empty;
+            defer line.deinit(app.alloc);
+            line.appendSlice(app.alloc, existing) catch {};
+            if (existing.len > 0 and existing[existing.len - 1] != '\n') line.append(app.alloc, '\n') catch {};
+            line.appendSlice(app.alloc, "- ") catch {};
+            line.appendSlice(app.alloc, body) catch {};
+            line.append(app.alloc, '\n') catch {};
+            const flags = std.c.O{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true };
+            const fd = std.c.open(path.ptr, flags, @as(std.c.mode_t, 0o644));
+            if (fd < 0) {
+                app.setNotification("Cannot write notes");
+                return true;
+            }
+            defer _ = std.c.close(fd);
+            var off: usize = 0;
+            while (off < line.items.len) {
+                const n = std.c.write(fd, line.items.ptr + off, line.items.len - off);
+                if (n <= 0) {
+                    app.setNotification("Cannot write notes");
+                    return true;
+                }
+                off += @intCast(n);
+            }
+            app.setNotification("Note saved");
+            return true;
+        }
+
+        // /note list (default when not add/clear)
+        const content_owned = readNoteFile(app.alloc, &buf);
+        defer if (content_owned) |c| app.alloc.free(c);
+        const raw: []const u8 = content_owned orelse "";
+        const trimmed = std.mem.trim(u8, raw, "\n");
+        if (trimmed.len == 0) {
+            app.setNotification("No notes yet");
+        } else {
+            const suffix: []const u8 = if (trimmed.len > 600) "\n…(truncated)" else "";
+            const shown = std.fmt.allocPrint(app.alloc, "{s}{s}", .{ trimmed, suffix }) catch "";
+            defer if (shown.len > 0) app.alloc.free(shown);
+            app.setNotification(shown);
+        }
+        return true;
+    }
+
     // /copy: copy the whole conversation (plain text) to the clipboard.
     if (std.mem.eql(u8, text_slice, "/copy") or std.mem.startsWith(u8, text_slice, "/copy ")) {
         std.debug.print("[dbg] /copy triggered, gw={any}\n", .{app.git_worker != null});
@@ -301,7 +401,19 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
     return false;
 }
 
+/// Entry point used by the submit path, the palette, and the slash-prompt
+/// overlay. Destructive commands are intercepted and routed to a confirmation
+/// dialog (see `runSlashCommand` for the actual side effect).
 pub fn executeSlashCommand(app: *App, id: []const u8, args: []const u8) void {
+    if (SlashDispatcher.Dispatcher.needsConfirm(id)) {
+        openConfirmSlash(app, id);
+        return;
+    }
+    runSlashCommand(app, id, args);
+}
+
+/// Run a slash command after the confirmation gate has been satisfied.
+pub fn runSlashCommand(app: *App, id: []const u8, args: []const u8) void {
     const ctx = SlashDispatcher.CommandContext{
         .allocator = app.alloc,
         .io = app.io,
@@ -317,6 +429,14 @@ pub fn executeSlashCommand(app: *App, id: []const u8, args: []const u8) void {
     };
 
     const result = SlashDispatcher.Dispatcher.execute(ctx, id, args) catch |err| {
+        if (err == error.UnknownCommand) {
+            const msg = std.fmt.allocPrint(app.alloc, "Unknown command: /{s}", .{id}) catch return;
+            app.messages.append(app.alloc, .{ .role = .system, .content = msg, .timestamp = 0, .owns = true }) catch {
+                app.alloc.free(msg);
+                return;
+            };
+            return;
+        }
         const msg = std.fmt.allocPrint(app.alloc, "Command error: {s}", .{@errorName(err)}) catch return;
         defer app.alloc.free(msg);
         app.setNotification(msg);
@@ -383,7 +503,7 @@ pub fn executeSlashCommand(app: *App, id: []const u8, args: []const u8) void {
             const resolved_model = if (app.subsystems_initialized)
                 app.provider_mgr.resolveModel(name)
             else
-                "deepseek-chat";
+                @import("../providers/manager.zig").DefaultModel;
             app.model = app.alloc.dupe(u8, resolved_model) catch app.model;
 
             const title = std.fmt.allocPrint(app.alloc, "Enter API key for {s}", .{name}) catch return;
@@ -410,7 +530,80 @@ pub fn executeSlashCommand(app: *App, id: []const u8, args: []const u8) void {
         .show_list => |l| {
             setSlashOutput(app, .{ .list = l });
         },
+
+        .submenu => |m| {
+            openSubMenu(app, m);
+        },
     }
+}
+
+/// Render a second-level command menu using the palette component. The palette
+/// clones every string, so the passed `SubMenu` can be freed immediately.
+pub fn openSubMenu(app: *App, menu: SlashDispatcher.SubMenu) void {
+    var cmds: std.ArrayList(zz.components.Command) = .empty;
+    defer cmds.deinit(app.alloc);
+    for (menu.items) |item| {
+        cmds.append(app.alloc, .{
+            .id = item.action,
+            .label = item.label,
+            .description = item.desc,
+        }) catch break;
+    }
+    app.palette.setCommands(cmds.items) catch {};
+    app.palette.clear() catch {};
+    app.palette.open();
+    app.submenu_active = true;
+    SlashDispatcher.freeSubMenu(app.alloc, menu);
+}
+
+/// Route a sub-menu selection. `action` is the slash line stored on the item
+/// (e.g. "/model deepseek-v4-pro", "/note list", "/memory recall ").
+pub fn applySubmenuAction(app: *App, action: []const u8) void {
+    const a = std.mem.trim(u8, action, " ");
+    if (a.len == 0) return;
+    const sp = std.mem.indexOfScalar(u8, a, ' ');
+    const word_slice = if (sp) |i| a[0..i] else a;
+    const rest = if (sp) |i| std.mem.trim(u8, a[i + 1 ..], " ") else "";
+    const word = if (word_slice.len > 0 and word_slice[0] == '/') word_slice[1..] else word_slice;
+
+    // Inline-only commands (handled in handleSlashCommand, not the Dispatcher)
+    // are filled back into the input box so the user confirms with Enter. This
+    // avoids re-dispatching them through the menu and re-opening it.
+    if (std.mem.eql(u8, word, "memory") or
+        std.mem.eql(u8, word, "note") or
+        std.mem.eql(u8, word, "rewind") or
+        std.mem.eql(u8, word, "mode") or
+        std.mem.eql(u8, word, "copy") or
+        std.mem.eql(u8, word, "mcp"))
+    {
+        const text = if (rest.len > 0)
+            std.fmt.allocPrint(app.alloc, "/{s} {s}", .{ word, rest }) catch return
+        else
+            std.fmt.allocPrint(app.alloc, "/{s} ", .{word}) catch return;
+        return setInputText(app, text);
+    }
+
+    if (std.mem.eql(u8, word, "skill")) {
+        if (rest.len > 0) {
+            const full = std.fmt.allocPrint(app.alloc, "/skill {s}", .{rest}) catch return;
+            _ = handleSlashCommand(app, full);
+            app.alloc.free(full);
+        } else {
+            setInputText(app, "/skill ");
+        }
+        return;
+    }
+
+    runSlashCommand(app, word, rest);
+}
+
+fn setInputText(app: *App, text: []const u8) void {
+    app.text_input.setValue(text) catch {
+        app.alloc.free(text);
+        return;
+    };
+    app.text_input.cursor = text.len;
+    app.alloc.free(text);
 }
 
 pub fn openSlashPrompt(app: *App, cmd_id: []const u8, title: []const u8, placeholder: []const u8) void {
@@ -424,6 +617,34 @@ pub fn openSlashPrompt(app: *App, cmd_id: []const u8, title: []const u8, placeho
 
     app.slash_prompt_input.setValue("") catch {};
     app.slash_prompt_input.setPlaceholder(placeholder);
+}
+
+/// Show a destructive-command confirmation dialog using the ZigZag Modal
+/// component (arrow keys navigate, Enter selects, shortkeys y/n act).
+pub fn openConfirmSlash(app: *App, cmd_id: []const u8) void {
+    if (app.confirm_modal.isVisible()) app.confirm_modal.hide();
+    if (app.pending_confirm_cmd) |old| app.alloc.free(old);
+    if (app.pending_confirm_body) |old| app.alloc.free(old);
+
+    const body = std.fmt.allocPrint(app.alloc, "Run /{s}?\nThis action may be irreversible.", .{cmd_id}) catch "";
+    app.pending_confirm_cmd = app.alloc.dupe(u8, cmd_id) catch {
+        if (body.len > 0) app.alloc.free(body);
+        return;
+    };
+    app.pending_confirm_body = if (body.len > 0) body else null;
+
+    app.confirm_modal = zz.components.Modal.confirm("Confirm action", app.pending_confirm_body orelse "");
+    app.confirm_modal.backdrop = .{};
+    app.confirm_modal.show();
+}
+
+/// Release the pending confirmation and dismiss the dialog.
+pub fn clearPendingConfirm(app: *App) void {
+    if (app.pending_confirm_cmd) |s| app.alloc.free(s);
+    if (app.pending_confirm_body) |s| app.alloc.free(s);
+    app.pending_confirm_cmd = null;
+    app.pending_confirm_body = null;
+    app.confirm_modal.hide();
 }
 
 pub fn closeSlashPrompt(app: *App) void {

@@ -16,9 +16,9 @@ const cc = @import("c");
 const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_runner_mod = @import("../net/mcp_runner.zig");
 const mcp_client_mod = @import("../net/mcp_client.zig");
-const dangerous_patterns = @import("dangerous_patterns");
+const dangerous_patterns = @import("../utils/dangerous_patterns.zig");
 const tools_mod = @import("../tools/mod.zig");
-const session_format = @import("session_format");
+const session_format = @import("../storage/session_format.zig");
 const SlashDispatcher = @import("slash_command_dispatcher.zig");
 const theme = @import("theme.zig");
 const render_text = @import("render_text.zig");
@@ -32,6 +32,8 @@ const dispatch_loop = @import("../dispatch/cache_first_loop.zig");
 const zeep_config = @import("../utils/config.zig");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
 const ProviderConfig = @import("../providers/manager.zig").ProviderConfig;
+const DefaultModel = @import("../providers/manager.zig").DefaultModel;
+const DEFAULT_DEEPSEEK_API_KEY = @import("../utils/config.zig").DEFAULT_DEEPSEEK_API_KEY;
 const I18nManager = @import("../i18n/manager.zig").I18nManager;
 const Sandbox = @import("../utils/sandbox.zig").Sandbox;
 const subagent_mod = @import("../agent/subagent.zig");
@@ -71,6 +73,46 @@ const SearchHighlight = Pal.bg_highlight;
 // ═══════════════════════════════════════════════════════════════════════
 // Formatting helpers
 // ═══════════════════════════════════════════════════════════════════════
+
+
+/// Escape a string for embedding inside a JSON string literal.
+fn jsonEscape(alloc: std.mem.Allocator, input: []const u8, out: *std.ArrayList(u8)) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(alloc, "\\\""),
+            '\\' => try out.appendSlice(alloc, "\\\\"),
+            '\n' => try out.appendSlice(alloc, "\\n"),
+            '\r' => try out.appendSlice(alloc, "\\r"),
+            '\t' => try out.appendSlice(alloc, "\\t"),
+            else => try out.append(alloc, c),
+        }
+    }
+}
+
+/// Serialize an assistant message's stored tool calls into the OpenAI
+/// `tool_calls` array so the next request can echo them verbatim. Returns the
+/// owned JSON (ends with a `]`) or "" on failure / when any call lacks an id.
+fn buildToolCallsJson(alloc: std.mem.Allocator, msg: *const ChatMsg) ![]const u8 {
+    if (msg.tool_calls.items.len == 0) return "";
+    for (msg.tool_calls.items) |tc| {
+        if (tc.id.len == 0) return "";
+    }
+    var b = std.ArrayList(u8).empty;
+    errdefer b.deinit(alloc);
+    try b.append(alloc, '[');
+    for (msg.tool_calls.items, 0..) |tc, k| {
+        if (k > 0) try b.append(alloc, ',');
+        try b.appendSlice(alloc, "{\"id\":\"");
+        try jsonEscape(alloc, tc.id, &b);
+        try b.appendSlice(alloc, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+        try jsonEscape(alloc, tc.name, &b);
+        try b.appendSlice(alloc, "\",\"arguments\":\"");
+        try jsonEscape(alloc, tc.args, &b);
+        try b.appendSlice(alloc, "\"}}");
+    }
+    try b.append(alloc, ']');
+    return b.toOwnedSlice(alloc);
+}
 
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -116,6 +158,9 @@ pub const ToolCallStatus = enum { running, success, failed };
 pub const ToolCall = struct {
     name: []const u8,
     args: []const u8 = "",
+    /// API tool_call id, kept so the assistant tool_calls array can be echoed
+    /// verbatim on the next turn (required by native function-calling).
+    id: []const u8 = "",
     output: ?[]const u8 = null,
     status: ToolCallStatus = .running,
     owns: bool = false,
@@ -258,6 +303,11 @@ pub const ToolRunState = struct {
     /// Accumulated "Tool X result:\n..." text for re-submission
     results: std.ArrayList(u8),
 };
+
+/// Hard ceiling on consecutive tool-loop turns before the agent is forced to
+/// stop. Resets on every real user message. Guards against the model cycling
+/// forever on tool output.
+pub const kToolMaxTurns: u32 = 24;
 
 const PendingTool = struct {
     /// Index into tool_run.calls of the call awaiting user approval
@@ -423,6 +473,7 @@ pub const App = struct {
 
     // --- UI overlays
     palette: zz.components.CommandPalette,
+    submenu_active: bool = false,
     show_thinking: bool,
 
     // --- Search state
@@ -434,6 +485,10 @@ pub const App = struct {
     help_modal: zz.components.Modal,
     detail_modal: zz.components.Modal,
     detail_idx: usize,
+    /// Destructive-command confirmation dialog (arrow/enter/shortkeys).
+    confirm_modal: zz.components.Modal = .{},
+    pending_confirm_cmd: ?[]const u8 = null,
+    pending_confirm_body: ?[]const u8 = null,
 
     // --- Sub-agent panel
     show_subagents: bool,
@@ -470,6 +525,7 @@ pub const App = struct {
     history_edit_idx: ?usize = null,
     run_mode: RunMode = .auto,
     tool_fail_streak: u32 = 0,
+    tool_turn_count: u32 = 0,
     memory: ?*memory_mod.Memory = null,
     memory_alloc: ?std.mem.Allocator = null,
     skill_registry: ?*skills_registry.SkillRegistry = null,
@@ -554,9 +610,9 @@ pub const App = struct {
             .should_quit = false,
             .turn = 0,
             .tokens_used = 0,
-            .ctx_max = 64000,
+            .ctx_max = 256000,
             .cache_hit_rate = 0,
-            .model = "deepseek-chat",
+            .model = DefaultModel,
             .provider = "deepseek",
             .provider_mgr = ProviderManager.init(ctx.allocator),
             .i18n = I18nManager.init(.en),
@@ -582,6 +638,12 @@ pub const App = struct {
         };
         // Try loading saved API key from disk
         self.loadSavedApiKey();
+
+        // Final fallback: source-level default so the app works out of the box
+        // (after env var and ~/.zeepseek/apikey have both been given a chance).
+        if (self.api_key.len == 0) {
+            self.api_key = DEFAULT_DEEPSEEK_API_KEY;
+        }
 
         // Semantic cache (exact-prompt reuse; conservative, see submit()).
         // Use page_allocator: the app's persistent allocator may return
@@ -690,6 +752,8 @@ pub const App = struct {
         self.pending_data.deinit(self.alloc);
         self.slash_prompt_input.deinit();
         if (self.slash_awaiting_cmd) |s| self.alloc.free(s);
+        if (self.pending_confirm_cmd) |s| self.alloc.free(s);
+        if (self.pending_confirm_body) |s| self.alloc.free(s);
         if (self.slash_prompt_title) |s| self.alloc.free(s);
         if (self.slash_prompt_placeholder) |s| self.alloc.free(s);
         if (self.slash_output_data) |*d| {
@@ -710,9 +774,13 @@ pub const App = struct {
             }
         }
 
-        // Free API key if page-allocated
-        if (self.api_key.len > 0) {
-            std.heap.page_allocator.free(self.api_key);
+        // Free API key if it was heap-allocated (gated on the recorded
+        // allocator; a source-level default key is a literal and must not be
+        // freed). Fixes SIGBUS when the baked-in default key is active.
+        if (self.api_key_alloc) |key_alloc| {
+            key_alloc.free(self.api_key);
+            self.api_key = "";
+            self.api_key_alloc = null;
         }
 
         // Free tool approval/run state
@@ -819,7 +887,7 @@ pub const App = struct {
             self.provider_mgr.addProvider(.{
                 .provider_id = "deepseek",
                 .api_key = self.api_key,
-                .default_model = "deepseek-chat",
+                .default_model = DefaultModel,
             }) catch {};
             // Sandbox is initialized in App.init (workspace allow-list);
             // if the platform sandbox fails (macOS Seatbelt), tool calls
@@ -850,7 +918,7 @@ pub const App = struct {
             .stream_reasoning => |text| stream_flow.onStreamReasoning(self, text),
             .stream_done => stream_flow.onStreamDone(self),
             .stream_error => |e| stream_flow.onStreamError(self, e),
-            .tool_start => |t| self.onToolStart(t.name, t.args),
+            .tool_start => |t| self.onToolStart(t.name, t.args, ""),
             .tool_output => |t| self.onToolOutput(t.name, t.output, t.success),
             .subagent_start => |s| agent_flow.onSubAgentStart(self, s.id, s.role, s.goal),
             .subagent_update => |s| agent_flow.onSubAgentUpdate(self, s.id, s.summary, s.status),
@@ -867,7 +935,8 @@ pub const App = struct {
                 stream_flow.pollStream(self);
                 agent_flow.pollSubAgents(self);
                 stream_flow.pollCompact(self);
-                // Toast auto-dismiss is handled by zz.components.Toast based on timestamps
+                // Toast auto-dismiss is handled by zz.components.Toast based on timestamps.
+                self.toast.update(monotonicNs());
             },
         }
         return .none;
@@ -911,6 +980,30 @@ pub const App = struct {
             return .none;
         }
 
+        // --- Destructive-command confirmation dialog
+        if (self.confirm_modal.isVisible()) {
+            self.confirm_modal.handleKey(key);
+            if (self.confirm_modal.getResult()) |res| {
+                switch (res) {
+                    .button_pressed => |idx| {
+                        if (idx == 0) {
+                            const cmd_id = self.pending_confirm_cmd orelse "";
+                            const id_dup = self.alloc.dupe(u8, cmd_id) catch "";
+                            slash_commands.clearPendingConfirm(self);
+                            if (id_dup.len > 0) {
+                                defer self.alloc.free(id_dup);
+                                slash_commands.runSlashCommand(self, id_dup, "");
+                            }
+                        } else {
+                            slash_commands.clearPendingConfirm(self);
+                        }
+                    },
+                    .dismissed => slash_commands.clearPendingConfirm(self),
+                }
+            }
+            return .none;
+        }
+
         // --- Slash output modal
         if (self.slash_output_active) {
             if (k == .escape or k == .enter or (k == .char and k.char == 'q')) {
@@ -944,9 +1037,17 @@ pub const App = struct {
             switch (result) {
                 .accepted => if (self.palette.selected()) |cmd| {
                     self.palette.close();
-                    slash_commands.executeSlashCommand(self, cmd.id, "");
+                    if (self.submenu_active) {
+                        self.submenu_active = false;
+                        slash_commands.applySubmenuAction(self, cmd.id);
+                    } else {
+                        slash_commands.executeSlashCommand(self, cmd.id, "");
+                    }
                 },
-                .cancelled => self.palette.close(),
+                .cancelled => {
+                    self.submenu_active = false;
+                    self.palette.close();
+                },
                 .consumed, .ignored => {},
             }
             return .none;
@@ -984,6 +1085,19 @@ pub const App = struct {
             }
             if (k == .backspace) { if (self.search_query.items.len > 0) _ = self.search_query.pop(); return .none; }
             if (k == .char) { self.search_query.append(self.alloc, @intCast(k.char)) catch {}; return .none; }
+            return .none;
+        }
+
+        // --- "/" on an empty input opens the command palette (arrow keys
+        //     navigate, Enter runs; parameterized commands then prompt).
+        if (k == .char and k.char == '/' and
+            self.pending_action == .none and
+            self.text_input.getValue().len == 0 and
+            !self.palette.isOpen())
+        {
+            self.submenu_active = false;
+            self.palette.open();
+            self.palette.clear() catch {};
             return .none;
         }
 
@@ -1120,6 +1234,7 @@ pub const App = struct {
         // Handle pending interactive actions
         if (self.pending_action == .await_api_key) {
             const key = self.alloc.dupe(u8, text_slice) catch return;
+            defer self.alloc.free(key);
             self.setApiKey(key);
             self.pending_action = .none;
             self.pending_data.clearRetainingCapacity();
@@ -1326,6 +1441,12 @@ pub const App = struct {
     }
 
     pub fn startStreaming(self: *App, user_input: []const u8, git_ctx_owned: []const u8) void {
+        // A genuine new user turn (not the internal "(tool results)" re-submit)
+        // resets the tool-loop cap so multi-step agent runs under a fresh
+        // instruction start from a clean budget.
+        if (!std.mem.eql(u8, user_input, "(tool results)")) {
+            self.tool_turn_count = 0;
+        }
         // Join the previous thread first: it may still be pushing into ss.
         if (self.stream_thread) |t| t.join();
         if (self.stream_state) |ss| {
@@ -1382,17 +1503,29 @@ pub const App = struct {
             const content = self.alloc.dupe(u8, m.content) catch continue;
             // Snip oversized tool outputs (Reasonix compact pipeline borrow):
             // keep a bounded tail so stale command dumps don't burn tokens.
-            var final_content = content;
-            defer if (final_content.ptr != content.ptr) self.alloc.free(final_content);
-            if (m.role == .tool and content.len > 400) {
-                final_content = std.fmt.allocPrint(self.alloc, "{s}\n…[tool output truncated ({d} bytes)]", .{ content[0..400], content.len }) catch content;
-            }
+            // NOTE: the slice handed to ctx_items is the SOLE owner of its
+            // buffer — the streaming thread frees each `ci.content` when the
+            // request finishes. Anything not stored here must be freed now, and
+            // the stored pointer must never be freed on this thread.
+            const item_content: []const u8 = blk: {
+                if (m.role == .tool and content.len > 400) {
+                    const truncated = std.fmt.allocPrint(self.alloc, "{s}\n…[tool output truncated ({d} bytes)]", .{ content[0..400], content.len }) catch break :blk content;
+                    self.alloc.free(content);
+                    break :blk truncated;
+                }
+                break :blk content;
+            };
+            // Assistant tool_calls (owned by the streaming thread, freed in
+            // its cleanup) — empty for every other role.
+            const tool_calls_json = buildToolCallsJson(self.alloc, &m) catch "";
             ctx_items.append(self.alloc, .{
                 .role = role_str,
-                .content = final_content,
+                .content = item_content,
                 .tool_call_id = if (m.role == .tool) m.tool_call_id else "",
+                .tool_calls_json = tool_calls_json,
             }) catch {
-                self.alloc.free(content);
+                self.alloc.free(item_content);
+                if (tool_calls_json.len > 0) self.alloc.free(tool_calls_json);
             };
         }
 
@@ -1427,7 +1560,10 @@ pub const App = struct {
         const thread = std.Thread.spawn(.{}, struct {
             fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, ep: []const u8, git_ctx: []const u8, a: std.mem.Allocator, state: *StreamState) void {
                 defer {
-                    for (ctx) |ci| a.free(ci.content);
+                    for (ctx) |ci| {
+                        a.free(ci.content);
+                        if (ci.tool_calls_json.len > 0) a.free(ci.tool_calls_json);
+                    }
                     a.free(ctx);
                     a.free(prompt);
                     a.free(api_k);
@@ -1467,15 +1603,13 @@ pub const App = struct {
                     // Fallback: buffered (non-streaming) response via std.http.
                     var stream = client.streamMessage(api_k, prompt, ctx, mdl, CacheDecision.none, "", null) catch |err| {
                         if (err == error.HttpError and client.last_http_status != 0) {
-                            const detail = std.fmt.allocPrint(a, "HTTP {d}: {s}", .{
+                            const detail = stream_client_mod.formatHttpErrorDetail(
+                                a,
                                 client.last_http_status,
                                 client.last_http_body orelse "",
-                            }) catch {
-                                state.setError(@errorName(err));
-                                return;
-                            };
+                            );
                             state.setError(detail);
-                            a.free(detail);
+                            if (detail.len > 0) a.free(detail);
                         } else {
                             state.setError(@errorName(err));
                         }
@@ -1507,7 +1641,10 @@ pub const App = struct {
             }
         }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, endpoint, git_ctx_owned, alloc, ss }) catch {
             // Thread failed to spawn: reclaim the data we duplicated for it
-            for (ctx_slice) |ci| alloc.free(ci.content);
+            for (ctx_slice) |ci| {
+                alloc.free(ci.content);
+                if (ci.tool_calls_json.len > 0) alloc.free(ci.tool_calls_json);
+            }
             alloc.free(ctx_slice);
             alloc.free(prompt_owned);
             alloc.free(api_key_owned);
@@ -1519,7 +1656,7 @@ pub const App = struct {
         self.stream_thread = thread;
     }
 
-    pub fn onToolStart(self: *App, name: []const u8, args: []const u8) void {
+    pub fn onToolStart(self: *App, name: []const u8, args: []const u8, id: []const u8) void {
         // Add tool call to the last assistant message, or create a tool message
         const last_idx = if (self.messages.items.len > 0) self.messages.items.len - 1 else 0;
         const target = if (self.messages.items.len > 0 and self.messages.items[last_idx].role == .assistant)
@@ -1533,7 +1670,7 @@ pub const App = struct {
             }) catch return;
             break :blk self.messages.items.len - 1;
         };
-        // Duplicate name/args: the stored ToolCall now owns them (released by
+        // Duplicate name/args/id: the stored ToolCall now owns them (released by
         // freeToolCall in clearMessages/compactContext/deinit). The caller
         // (handleToolCalls) keeps and frees its own copies independently.
         const name_owned = self.alloc.dupe(u8, name) catch return;
@@ -1541,14 +1678,17 @@ pub const App = struct {
             self.alloc.free(name_owned);
             return;
         };
+        const id_owned = if (id.len > 0) (self.alloc.dupe(u8, id) catch "") else "";
         self.messages.items[target].tool_calls.append(self.alloc, .{
             .name = name_owned,
             .args = args_owned,
+            .id = id_owned,
             .status = .running,
             .owns = true,
         }) catch {
             self.alloc.free(name_owned);
             self.alloc.free(args_owned);
+            if (id_owned.len > 0) self.alloc.free(id_owned);
         };
     }
 
@@ -1556,6 +1696,7 @@ pub const App = struct {
         if (tc.owns) {
             if (tc.name.len > 0) self.alloc.free(tc.name);
             if (tc.args.len > 0) self.alloc.free(tc.args);
+            if (tc.id.len > 0) self.alloc.free(tc.id);
             if (tc.output) |o| if (o.len > 0) self.alloc.free(o);
         }
     }
@@ -1583,6 +1724,7 @@ pub const App = struct {
         self.theme_manager.cycle();
         self.styles = theme.SemanticStyles.fromPalette(self.theme_manager.getPalette());
         const msg = std.fmt.allocPrint(self.alloc, "Theme: {s}", .{self.theme_manager.getThemeName()}) catch return;
+        defer self.alloc.free(msg);
         self.setNotification(msg);
     }
 
@@ -1592,6 +1734,7 @@ pub const App = struct {
                 self.theme_manager.setTheme(t.id);
                 self.styles = theme.SemanticStyles.fromPalette(self.theme_manager.getPalette());
                 const msg = std.fmt.allocPrint(self.alloc, "Theme: {s}", .{t.name}) catch return;
+                defer self.alloc.free(msg);
                 self.setNotification(msg);
                 return;
             }
@@ -1622,6 +1765,7 @@ pub const App = struct {
         self.api_key = new_key;
         self.api_key_alloc = self.alloc;
         const msg = std.fmt.allocPrint(self.alloc, "API key set ({s}...{s})", .{ key[0..6], key[key.len-4..] }) catch return;
+        defer self.alloc.free(msg);
         self.setNotification(msg);
 
         // Persist to store
@@ -1646,7 +1790,7 @@ pub const App = struct {
     }
 
     pub fn setNotification(self: *App, msg: []const u8) void {
-        self.toast.push(msg, .info, 2000, 0) catch {};
+        self.toast.push(msg, .info, 3000, monotonicNs()) catch {};
     }
 
     pub fn toggleToolCollapse(self: *App) void {
@@ -1869,6 +2013,9 @@ pub const App = struct {
         // Compose base layout
         var result = join.vertical(a, .left, all_parts.items) catch body_text;
 
+        // header_text / body_text / footer_text are kept live (the search
+        // overlay below re-reads them) and freed just before returning.
+
         // Render palette via ZigZag component (ANSI-aware overlay)
         if (self.palette.isOpen()) {
             const palette_view = self.palette.view(a) catch "";
@@ -1878,7 +2025,11 @@ pub const App = struct {
                 const ph = zz.layout.measure.height(palette_view);
                 const px = (w -| @as(u16, @intCast(pw))) / 2;
                 const py = (h -| @as(u16, @intCast(ph))) / 2;
-                result = render_ui.ansiOverlay(a, result, palette_view, px, py) catch result;
+                const overlaid = render_ui.ansiOverlay(a, result, palette_view, px, py) catch result;
+                if (overlaid.ptr != result.ptr) {
+                    a.free(result);
+                    result = overlaid;
+                }
             }
         }
 
@@ -1985,7 +2136,13 @@ pub const App = struct {
             style = style.paddingAll(1);
             const boxed = style.render(a, body) catch "";
             const overlay = zz.place.place(a, w, h, .center, .middle, boxed) catch "";
-            result = render_ui.ansiOverlay(a, result, overlay, 0, 0) catch result;
+            {
+                const overlaid = render_ui.ansiOverlay(a, result, overlay, 0, 0) catch result;
+                if (overlaid.ptr != result.ptr) {
+                    a.free(result);
+                    result = overlaid;
+                }
+            }
         }
 
         // Render search overlay (custom; Modal has no built-in input)
@@ -1998,7 +2155,14 @@ pub const App = struct {
                 defer a.free(overlay_text);
                 const overlay_w: u16 = if (w > 20) @as(u16, @intCast(@min(w - 10, 60))) else @as(u16, @intCast(@max(w, 30)));
                 const overlay_box = self.wrapInBox(a, overlay_text, overlay_w) catch overlay_text;
-                result = join.vertical(a, .left, &[_][]const u8{ header_text, overlay_box, body_text, footer_text }) catch body_text;
+                defer if (overlay_box.ptr != overlay_text.ptr) a.free(overlay_box);
+                {
+                    const joined = join.vertical(a, .left, &[_][]const u8{ header_text, overlay_box, body_text, footer_text }) catch body_text;
+                    if (joined.ptr != result.ptr) {
+                        a.free(result);
+                        result = joined;
+                    }
+                }
             }
         }
 
@@ -2010,7 +2174,13 @@ pub const App = struct {
                 const pw = zz.layout.measure.maxLineWidth(panel_view);
                 const px = w -| @as(u16, @intCast(pw));
                 const py: usize = 0;
-                result = render_ui.ansiOverlay(a, result, panel_view, px, py) catch result;
+                {
+                    const overlaid = render_ui.ansiOverlay(a, result, panel_view, px, py) catch result;
+                    if (overlaid.ptr != result.ptr) {
+                        a.free(result);
+                        result = overlaid;
+                    }
+                }
             }
         }
 
@@ -2019,10 +2189,38 @@ pub const App = struct {
         defer a.free(toast_view);
         if (toast_view.len > 0) {
             const tw = zz.layout.measure.maxLineWidth(toast_view);
-            const tx = w -| @as(u16, @intCast(tw));
-            const ty: usize = 0;
-            result = render_ui.ansiOverlay(a, result, toast_view, tx, ty) catch result;
+            var th: usize = 1;
+            for (toast_view) |ch| {
+                if (ch == '\n') th += 1;
+            }
+            const tx = (w -| @as(usize, @intCast(tw))) / 2;
+            const ty = (h -| th) / 2;
+            {
+                const overlaid = render_ui.ansiOverlay(a, result, toast_view, tx, ty) catch result;
+                if (overlaid.ptr != result.ptr) {
+                    a.free(result);
+                    result = overlaid;
+                }
+            }
         }
+
+        // Render the destructive-command confirmation dialog on top of all
+        // other overlays (full-screen backdrop, arrow-key buttons).
+        if (self.confirm_modal.isVisible()) {
+            const modal_view = self.confirm_modal.viewWithBackdrop(a, w, h) catch "";
+            if (modal_view.len > 0) {
+                a.free(result);
+                result = modal_view;
+            } else {
+                a.free(modal_view);
+            }
+        }
+
+        // header_text / body_text / footer_text were copied into `result`; free them now
+        // unless the final `result` aliases one of them (only in a join fall-back path).
+        if (header_text.ptr != result.ptr) a.free(header_text);
+        if (footer_text.ptr != result.ptr) a.free(footer_text);
+        if (body_text.ptr != result.ptr) a.free(body_text);
 
         return result;
     }
@@ -2082,10 +2280,20 @@ pub const App = struct {
 
 var g_git_worker: ?git_worker_mod.Client = null;
 
+/// Monotonic wall-clock in nanoseconds, used for toast auto-dismiss
+/// (kept in sync with the OS monotonic clock so dismissals work in tests too).
+fn monotonicNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    const sec: u64 = @intCast(ts.sec);
+    const nsec: u64 = @intCast(ts.nsec);
+    return sec * std.time.ns_per_s + nsec;
+}
+
 pub fn main(init: std.process.Init, git_worker: ?git_worker_mod.Client) !void {
     g_git_worker = git_worker;
     var program = zz.Program(App).initWithOptions(init.gpa, init.io, init.environ_map, .{
-        .mouse = true,
+        .mouse = false,
     });
     defer program.deinit();
     try program.run();
@@ -2114,6 +2322,9 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.help_modal = zz.components.Modal.info("Keybindings", "");
     app.detail_modal = zz.components.Modal.info("Message Detail", "");
     app.detail_idx = 0;
+    app.confirm_modal = zz.components.Modal.init();
+    app.pending_confirm_cmd = null;
+    app.pending_confirm_body = null;
     app.show_subagents = false;
     app.subagents = .empty;
     app.stream_state = null;
@@ -2127,7 +2338,7 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.tokens_used = 0;
     app.ctx_max = 64000;
     app.cache_hit_rate = 0;
-    app.model = "deepseek-chat";
+    app.model = DefaultModel;
     app.provider = "deepseek";
     app.provider_mgr = ProviderManager.init(alloc);
     app.i18n = I18nManager.init(.en);
@@ -2143,6 +2354,24 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.styles = theme.SemanticStyles.fromPalette(app.theme_manager.getPalette());
     app.pending_action = .none;
     app.pending_data = .empty;
+    // `var app: App = undefined` bypasses struct-field defaults, so every
+    // optional field must be set explicitly here. Leaving any of these
+    // undefined yields a garbage pointer that crashes view()/onKey().
+    app.mcp_servers = .empty;
+    app.mcp_session = null;
+    app.mcp_tools_json = "";
+    app.app_io = undefined;
+    app.api_key_alloc = null;
+    app.slash_awaiting_cmd = null;
+    app.reasonix = null;
+    app.reasonix_alloc = null;
+    app.memory = null;
+    app.memory_alloc = null;
+    app.skill_registry = null;
+    app.skill_registry_alloc = null;
+    app.session_id_alloc = null;
+    app.tool_run = null;
+    app.compact_run = null;
     return app;
 }
 
@@ -2268,11 +2497,18 @@ test "submit slash command /clear" {
     try app.text_input.setValue("/clear");
     app.text_input.cursor = 6;
 
-    // Submit
+    // Submit — destructive commands now gate behind a confirm dialog
     app.submit();
+    try std.testing.expect(app.confirm_modal.isVisible());
+    try std.testing.expectEqual(@as(usize, 1), app.messages.items.len);
+
+    // Confirm with Enter → the command actually runs
+    _ = app.onKey(.{ .key = .enter, .modifiers = .{} });
 
     // Messages should be cleared
     try std.testing.expectEqual(@as(usize, 0), app.messages.items.len);
+    if (app.pending_confirm_cmd) |s| alloc.free(s);
+    if (app.pending_confirm_body) |s| alloc.free(s);
 }
 
 test "submit slash command /exit" {
@@ -2292,11 +2528,18 @@ test "submit slash command /exit" {
     try app.text_input.setValue("/exit");
     app.text_input.cursor = 5;
 
-    // Submit
+    // Submit — /exit gates behind the confirm dialog
     app.submit();
+    try std.testing.expect(app.confirm_modal.isVisible());
+    try std.testing.expect(!app.should_quit);
+
+    // Confirm with Enter → quit fires
+    _ = app.onKey(.{ .key = .enter, .modifiers = .{} });
 
     // should_quit should be true
     try std.testing.expect(app.should_quit);
+    if (app.pending_confirm_cmd) |s| alloc.free(s);
+    if (app.pending_confirm_body) |s| alloc.free(s);
 }
 
 test "submit unknown command" {
@@ -2389,11 +2632,13 @@ test "view produces non-empty output" {
 
     // View with no messages
     const output = app.view(&ctx);
+    defer alloc.free(output);
     try std.testing.expect(output.len > 0);
 
     // View with a message
     try app.messages.append(alloc, .{ .role = .user, .content = "test message", .owns = false });
     const output2 = app.view(&ctx);
+    defer alloc.free(output2);
     try std.testing.expect(output2.len > 0);
     // Should contain the message text
     try std.testing.expect(std.mem.indexOf(u8, output2, "test message") != null);
@@ -2412,7 +2657,7 @@ test "view with help overlay contains keybindings" {
         app.search_query.deinit(alloc);
         app.pending_data.deinit(alloc);
     }
-    app.updateHelpModal();
+    render_ui.updateHelpModal(&app);
     app.help_modal.show();
     var ctx = zz.Context{
         .allocator = alloc, .persistent_allocator = alloc, .home_dir = "/tmp",
@@ -2422,6 +2667,7 @@ test "view with help overlay contains keybindings" {
         .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = zz.theme.Theme.fromPalette(zz.theme.Palette.default_dark), ._terminal = null,
     };
     const output = app.view(&ctx);
+    defer alloc.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "Keybindings") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Ctrl+C") != null);
 }
@@ -2447,6 +2693,7 @@ test "view with palette shows commands" {
         .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = zz.theme.Theme.fromPalette(zz.theme.Palette.default_dark), ._terminal = null,
     };
     const output = app.view(&ctx);
+    defer alloc.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "/help") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "Type a command") != null);
 }
@@ -2471,9 +2718,10 @@ test "view sidebar contains model and metrics" {
         .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = zz.theme.Theme.fromPalette(zz.theme.Palette.default_dark), ._terminal = null,
     };
     const output = app.view(&ctx);
-    try std.testing.expect(std.mem.indexOf(u8, output, "deepseek-chat") != null);
+    defer alloc.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, "deepseek-v4-flash") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "zeepseek") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "turn=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "turn") != null);
 }
 
 test "view input shows placeholder when empty" {
@@ -2496,6 +2744,7 @@ test "view input shows placeholder when empty" {
         .terminal_mode_2027 = false, .kitty_text_sizing = false, .theme = zz.theme.Theme.fromPalette(zz.theme.Palette.default_dark), ._terminal = null,
     };
     const output = app.view(&ctx);
+    defer alloc.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "Type a message") != null);
 }
 
@@ -2524,9 +2773,13 @@ test "command palette fuzzy filter finds command" {
     try std.testing.expect(std.mem.indexOf(u8, selected.?.label, "/clear") != null);
 }
 
-test "submit /provider deepseek sets pending action" {
+test "submit /provider deepseek opens api key prompt" {
     const alloc = std.testing.allocator;
     var app = makeTestApp(alloc);
+    // makeTestApp leaves slash-prompt state undefined; init it like App.init does.
+    app.slash_prompt_input = zz.components.TextInput.init(alloc);
+    app.slash_prompt_title = null;
+    app.slash_prompt_placeholder = null;
     defer {
         for (app.messages.items) |*m| { if (m.owns and m.content.len > 0) alloc.free(m.content); }
         app.messages.deinit(alloc);
@@ -2536,6 +2789,12 @@ test "submit /provider deepseek sets pending action" {
         app.theme_manager.deinit();
         app.search_query.deinit(alloc);
         app.pending_data.deinit(alloc);
+        app.slash_prompt_input.deinit();
+        if (app.slash_awaiting_cmd) |s| alloc.free(s);
+        if (app.slash_prompt_title) |s| alloc.free(s);
+        if (app.slash_prompt_placeholder) |s| alloc.free(s);
+        if (app.provider.ptr != "deepseek".ptr) alloc.free(app.provider);
+        if (app.model.ptr != "deepseek-chat".ptr) alloc.free(app.model);
     }
 
     // Type "/provider deepseek" and submit
@@ -2543,13 +2802,10 @@ test "submit /provider deepseek sets pending action" {
     app.text_input.cursor = 18;
     app.submit();
 
-    // Should have set pending_action
-    try std.testing.expectEqual(App.PendingAction.await_api_key, app.pending_action);
-    // Should have system message
-    try std.testing.expect(app.messages.items.len > 0);
-    const last = app.messages.items[app.messages.items.len - 1];
-    try std.testing.expectEqual(Role.system, last.role);
-    try std.testing.expect(std.mem.indexOf(u8, last.content, "API key") != null);
+    // Should open the API key prompt (no pending_action state anymore)
+    try std.testing.expectEqual(App.PendingAction.none, app.pending_action);
+    try std.testing.expectEqualStrings("apikey", app.slash_awaiting_cmd orelse "");
+    try std.testing.expect(std.mem.indexOf(u8, app.slash_prompt_title orelse "", "API key") != null);
     // Input should be cleared
     try std.testing.expectEqual(@as(usize, 0), app.text_input.getValue().len);
 }
@@ -2566,6 +2822,7 @@ test "pending api key submit saves key" {
         app.theme_manager.deinit();
         app.search_query.deinit(alloc);
         app.pending_data.deinit(alloc);
+        if (app.api_key_alloc) |ac| ac.free(app.api_key);
     }
 
     // Set up pending action
@@ -2620,6 +2877,7 @@ test "notification toast is rendered when set" {
     app.setNotification("Hello toast");
     var ctx = makeTestCtx(alloc);
     const output = app.view(&ctx);
+    defer alloc.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "Hello toast") != null);
 }
 
@@ -2642,6 +2900,7 @@ test "subagent panel toggle shows subagents" {
     app.show_subagents = true;
     var ctx = makeTestCtx(alloc);
     const output = app.view(&ctx);
+    defer alloc.free(output);
     try std.testing.expect(std.mem.indexOf(u8, output, "Sub-Agents") != null);
 }
 

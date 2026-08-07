@@ -1,5 +1,6 @@
 const std = @import("std");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
+const theme = @import("theme.zig");
 const Sandbox = @import("../utils/sandbox.zig").Sandbox;
 
 pub const CommandKind = enum {
@@ -46,6 +47,21 @@ pub const ListData = struct {
     items: []const []const u8,
 };
 
+/// One entry in a second-level ("二级") command menu. `action` is a slash line
+/// (e.g. "/model deepseek-v4-pro") that the app routes after the user selects.
+pub const SubItem = struct {
+    label: []const u8,
+    desc: []const u8,
+    action: []const u8,
+};
+
+/// A second-level menu rendered as a selectable palette. All strings are owned
+/// by the request allocator and freed once the palette has cloned them.
+pub const SubMenu = struct {
+    title: []const u8,
+    items: []const SubItem,
+};
+
 pub const Result = union(enum) {
     none,
     set_input: []const u8,
@@ -64,6 +80,7 @@ pub const Result = union(enum) {
     prompt: Prompt,
     show_table: TableData,
     show_list: ListData,
+    submenu: SubMenu,
     set_model: []const u8,
     set_provider: []const u8,
     set_apikey: []const u8,
@@ -105,6 +122,16 @@ pub const Dispatcher = struct {
         return &commands_table;
     }
 
+    /// Commands whose side effects are destructive enough to warrant an
+    /// explicit confirmation dialog before running.
+    pub fn needsConfirm(id: []const u8) bool {
+        return std.mem.eql(u8, id, "clear") or
+            std.mem.eql(u8, id, "new") or
+            std.mem.eql(u8, id, "save") or
+            std.mem.eql(u8, id, "compact") or
+            std.mem.eql(u8, id, "exit");
+    }
+
     pub fn execute(ctx: CommandContext, id: []const u8, args: []const u8)
         error{ UnknownCommand, InvalidArgs, OutOfMemory }!Result
     {
@@ -122,20 +149,14 @@ pub const Dispatcher = struct {
 
         if (std.mem.eql(u8, id, "model")) {
             if (args.len == 0) {
-                return .{ .prompt = .{
-                    .title = try ctx.allocator.dupe(u8, "Switch model"),
-                    .placeholder = try ctx.allocator.dupe(u8, "e.g. deepseek-chat"),
-                } };
+                return menuModels(ctx);
             }
             return .{ .set_model = try ctx.allocator.dupe(u8, args) };
         }
 
         if (std.mem.eql(u8, id, "theme")) {
             if (args.len == 0) {
-                return .{ .prompt = .{
-                    .title = try ctx.allocator.dupe(u8, "Switch theme"),
-                    .placeholder = try ctx.allocator.dupe(u8, "e.g. tokyo_night"),
-                } };
+                return menuThemes(ctx);
             }
             return .{ .set_theme = try ctx.allocator.dupe(u8, args) };
         }
@@ -150,24 +171,25 @@ pub const Dispatcher = struct {
 
         if (std.mem.eql(u8, id, "provider")) {
             if (args.len == 0) {
-                return .{ .prompt = .{
-                    .title = try ctx.allocator.dupe(u8, "Switch provider"),
-                    .placeholder = try ctx.allocator.dupe(u8, "deepseek, openai, groq, ollama..."),
-                } };
+                return menuProviders(ctx);
             }
             return .{ .set_provider = try ctx.allocator.dupe(u8, args) };
         }
 
         if (std.mem.eql(u8, id, "status") or std.mem.eql(u8, id, "context")) return try handleStatus(ctx);
         if (std.mem.eql(u8, id, "workspace")) return try handleWorkspace(ctx);
-        if (std.mem.eql(u8, id, "sessions")) return try handleSessions(ctx);
-        if (std.mem.eql(u8, id, "models")) return handleModels(ctx);
-        if (std.mem.eql(u8, id, "providers")) return try handleProviders(ctx);
-        if (std.mem.eql(u8, id, "skills")) return handleSkills(ctx);
+        if (std.mem.eql(u8, id, "sessions")) return menuSessions(ctx);
+        if (std.mem.eql(u8, id, "models")) return menuModels(ctx);
+        if (std.mem.eql(u8, id, "providers")) return menuProviders(ctx);
+        if (std.mem.eql(u8, id, "skills")) return menuSkills(ctx);
         if (std.mem.eql(u8, id, "sandbox")) return try handleSandbox(ctx);
 
-        if (std.mem.eql(u8, id, "note")) return .{ .set_input = try ctx.allocator.dupe(u8, "/note ") };
-        if (std.mem.eql(u8, id, "memory")) return .{ .set_input = try ctx.allocator.dupe(u8, "/memory ") };
+        if (std.mem.eql(u8, id, "load")) {
+            if (args.len == 0) return menuSessions(ctx);
+            return .load_session;
+        }
+        if (std.mem.eql(u8, id, "note")) return menuNotes(ctx);
+        if (std.mem.eql(u8, id, "memory")) return menuMemory(ctx);
 
         return error.UnknownCommand;
     }
@@ -241,40 +263,166 @@ fn handleWorkspace(ctx: CommandContext) !Result {
     } };
 }
 
-fn handleModels(ctx: CommandContext) !Result {
-    var rows: std.ArrayList([]const []const u8) = .empty;
-    defer {
-        for (rows.items) |row| freeRow(ctx.allocator, row);
-        rows.deinit(ctx.allocator);
-    }
-
-    try rows.append(ctx.allocator, try dupeRow(ctx.allocator, &.{ "deepseek-chat", "V4 Flash (default)" }));
-    try rows.append(ctx.allocator, try dupeRow(ctx.allocator, &.{ "deepseek-v4-pro", "V4 Pro" }));
-    try rows.append(ctx.allocator, try dupeRow(ctx.allocator, &.{ "deepseek-reasoner", "Reasoning model" }));
-
-    return .{ .show_table = .{
-        .title = "Available models",
-        .headers = &.{ "Model", "Description" },
-        .rows = try rows.toOwnedSlice(ctx.allocator),
-    } };
+fn menuModels(ctx: CommandContext) !Result {
+    const items = [_]SubItem{
+        .{ .label = "DeepSeek V4 Flash", .desc = "Fast, default model", .action = "/model deepseek-v4-flash" },
+        .{ .label = "DeepSeek V4 Pro", .desc = "High quality, larger context", .action = "/model deepseek-v4-pro" },
+        .{ .label = "DeepSeek Reasoner", .desc = "Reasoning model", .action = "/model deepseek-reasoner" },
+    };
+    return .{ .submenu = try buildSubMenu(ctx.allocator, "Switch model", &items) };
 }
 
-fn handleSkills(ctx: CommandContext) !Result {
-    var items: std.ArrayList([]const u8) = .empty;
+fn menuSkills(ctx: CommandContext) !Result {
+    const items = [_]SubItem{
+        .{ .label = "health", .desc = "Run the code-quality dashboard skill", .action = "/skill health" },
+        .{ .label = "investigate", .desc = "Root-cause debugging skill", .action = "/skill investigate" },
+        .{ .label = "design-review", .desc = "Visual QA skill", .action = "/skill design-review" },
+    };
+    return .{ .submenu = try buildSubMenu(ctx.allocator, "Available skills", &items) };
+}
+
+fn menuNotes(ctx: CommandContext) !Result {
+    const items = [_]SubItem{
+        .{ .label = "Add a note", .desc = "Type note text after the prefix", .action = "/note add " },
+        .{ .label = "List notes", .desc = "Show all saved notes", .action = "/note list" },
+        .{ .label = "Clear notes", .desc = "Delete all notes", .action = "/note clear" },
+    };
+    return .{ .submenu = try buildSubMenu(ctx.allocator, "Notes", &items) };
+}
+
+fn menuMemory(ctx: CommandContext) !Result {
+    const items = [_]SubItem{
+        .{ .label = "Save a fact", .desc = "Type the fact after the prefix", .action = "/memory " },
+        .{ .label = "Recall", .desc = "Query stored memory", .action = "/memory recall " },
+    };
+    return .{ .submenu = try buildSubMenu(ctx.allocator, "Agent memory", &items) };
+}
+
+fn buildSubMenu(allocator: std.mem.Allocator, title: []const u8, src: []const SubItem) !SubMenu {
+    const items = try allocator.alloc(SubItem, src.len);
+    var n: usize = 0;
     errdefer {
-        for (items.items) |it| ctx.allocator.free(it);
-        items.deinit(ctx.allocator);
+        for (items[0..n]) |it| {
+            allocator.free(it.label);
+            allocator.free(it.desc);
+            allocator.free(it.action);
+        }
+        allocator.free(items);
+    }
+    for (src) |s| {
+        items[n] = .{
+            .label = try allocator.dupe(u8, s.label),
+            .desc = try allocator.dupe(u8, s.desc),
+            .action = try allocator.dupe(u8, s.action),
+        };
+        n += 1;
+    }
+    return .{ .title = try allocator.dupe(u8, title), .items = items };
+}
+
+pub fn freeSubMenu(allocator: std.mem.Allocator, menu: SubMenu) void {
+    for (menu.items) |it| {
+        allocator.free(it.label);
+        allocator.free(it.desc);
+        allocator.free(it.action);
+    }
+    allocator.free(menu.items);
+    allocator.free(menu.title);
+}
+
+fn menuThemes(ctx: CommandContext) !Result {
+    var temp: std.ArrayList(SubItem) = .empty;
+    defer {
+        for (temp.items) |it| {
+            ctx.allocator.free(it.label);
+            ctx.allocator.free(it.action);
+        }
+        temp.deinit(ctx.allocator);
     }
 
-    const names = [_][]const u8{ "health", "investigate", "design-review" };
-    for (names) |name| {
-        try items.append(ctx.allocator, try ctx.allocator.dupe(u8, name));
+    for (theme.themes) |t| {
+        const label = try ctx.allocator.dupe(u8, t.name);
+        const action = try std.fmt.allocPrint(ctx.allocator, "/theme {s}", .{@tagName(t.id)});
+        try temp.append(ctx.allocator, .{ .label = label, .desc = "Switch to this theme", .action = action });
     }
 
-    return .{ .show_list = .{
-        .title = "Registered skills",
-        .items = try items.toOwnedSlice(ctx.allocator),
-    } };
+    const menu = try buildSubMenu(ctx.allocator, "Switch theme", temp.items);
+    return .{ .submenu = menu };
+}
+
+fn menuProviders(ctx: CommandContext) !Result {
+    var list: std.ArrayList(SubItem) = .empty;
+    defer {
+        for (list.items) |it| {
+            ctx.allocator.free(it.label);
+            ctx.allocator.free(it.action);
+        }
+        list.deinit(ctx.allocator);
+    }
+
+    if (ctx.subsystems_initialized) {
+        const active = ctx.provider_mgr.active;
+        const ids = try ctx.provider_mgr.listProviders();
+        for (ids) |pid| {
+            const resolved = ctx.provider_mgr.resolveModel(pid);
+            const label = try std.fmt.allocPrint(ctx.allocator, "{s} ({s})", .{ pid, resolved });
+            const action = try std.fmt.allocPrint(ctx.allocator, "/provider {s}", .{pid});
+            const current = std.mem.eql(u8, pid, active);
+            try list.append(ctx.allocator, .{
+                .label = label,
+                .desc = if (current) "Currently active provider" else "Activate this provider",
+                .action = action,
+            });
+        }
+    } else {
+        try list.append(ctx.allocator, .{
+            .label = try ctx.allocator.dupe(u8, "DeepSeek (default)"),
+            .desc = "Activate this provider",
+            .action = try ctx.allocator.dupe(u8, "/provider deepseek"),
+        });
+    }
+
+    const menu = try buildSubMenu(ctx.allocator, "Switch provider", list.items);
+    return .{ .submenu = menu };
+}
+
+fn menuSessions(ctx: CommandContext) !Result {
+    const home_ptr = std.c.getenv("HOME") orelse {
+        return .{ .notify = try ctx.allocator.dupe(u8, "HOME not set") };
+    };
+    const home = std.mem.sliceTo(home_ptr, 0);
+    const dir_path = try std.fmt.allocPrint(ctx.allocator, "{s}/.zeepseek/sessions", .{home});
+    defer ctx.allocator.free(dir_path);
+
+    var list: std.ArrayList(SubItem) = .empty;
+    defer {
+        for (list.items) |it| {
+            ctx.allocator.free(it.label);
+            ctx.allocator.free(it.action);
+        }
+        list.deinit(ctx.allocator);
+    }
+
+    var dir = std.Io.Dir.cwd().openDir(ctx.io, dir_path, .{ .iterate = true }) catch {
+        return .{ .submenu = try buildSubMenu(ctx.allocator, "Saved sessions", &.{}) };
+    };
+    defer dir.close(ctx.io);
+
+    var it = dir.iterate();
+    while (it.next(ctx.io) catch null) |entry| {
+        if (entry.kind == .file or entry.kind == .unknown) {
+            const label = try ctx.allocator.dupe(u8, entry.name);
+            const action = try std.fmt.allocPrint(ctx.allocator, "/load {s}", .{entry.name});
+            try list.append(ctx.allocator, .{
+                .label = label,
+                .desc = "Load this session",
+                .action = action,
+            });
+        }
+    }
+
+    const menu = try buildSubMenu(ctx.allocator, "Saved sessions", list.items);
+    return .{ .submenu = menu };
 }
 
 fn handleSandbox(ctx: CommandContext) !Result {
@@ -295,66 +443,6 @@ fn handleSandbox(ctx: CommandContext) !Result {
         .title = "Sandbox",
         .headers = &.{ "Policy", "Mode" },
         .rows = try rows.toOwnedSlice(ctx.allocator),
-    } };
-}
-
-fn handleProviders(ctx: CommandContext) !Result {
-    var items: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (items.items) |it| ctx.allocator.free(it);
-        items.deinit(ctx.allocator);
-    }
-
-    if (ctx.subsystems_initialized) {
-        const active = ctx.provider_mgr.active;
-        const list = try ctx.provider_mgr.listProviders();
-        for (list) |pid| {
-            const marker: []const u8 = if (std.mem.eql(u8, pid, active)) "◄ " else "  ";
-            const line = try std.fmt.allocPrint(ctx.allocator, "{s}{s}", .{ marker, pid });
-            try items.append(ctx.allocator, line);
-        }
-    } else {
-        try items.append(ctx.allocator, try ctx.allocator.dupe(u8, "deepseek (default)"));
-    }
-
-    return .{ .show_list = .{
-        .title = "Providers",
-        .items = try items.toOwnedSlice(ctx.allocator),
-    } };
-}
-
-fn handleSessions(ctx: CommandContext) !Result {
-    const home_ptr = std.c.getenv("HOME") orelse {
-        return .{ .notify = try ctx.allocator.dupe(u8, "HOME not set") };
-    };
-    const home = std.mem.sliceTo(home_ptr, 0);
-    const dir_path = try std.fmt.allocPrint(ctx.allocator, "{s}/.zeepseek/sessions", .{home});
-    defer ctx.allocator.free(dir_path);
-
-    var items: std.ArrayList([]const u8) = .empty;
-    errdefer {
-        for (items.items) |it| ctx.allocator.free(it);
-        items.deinit(ctx.allocator);
-    }
-
-    var dir = std.Io.Dir.cwd().openDir(ctx.io, dir_path, .{ .iterate = true }) catch {
-        return .{ .show_list = .{
-            .title = "Saved sessions",
-            .items = try items.toOwnedSlice(ctx.allocator),
-        } };
-    };
-    defer dir.close(ctx.io);
-
-    var it = dir.iterate();
-    while (it.next(ctx.io) catch null) |entry| {
-        if (entry.kind == .file or entry.kind == .unknown) {
-            try items.append(ctx.allocator, try ctx.allocator.dupe(u8, entry.name));
-        }
-    }
-
-    return .{ .show_list = .{
-        .title = "Saved sessions",
-        .items = try items.toOwnedSlice(ctx.allocator),
     } };
 }
 
@@ -406,7 +494,7 @@ test "model with args returns set_model" {
     alloc.free(result.set_model);
 }
 
-test "model without args returns prompt" {
+test "model without args returns submenu" {
     const alloc = std.testing.allocator;
     var pm = ProviderManager.init(alloc);
     defer pm.deinit();
@@ -426,13 +514,14 @@ test "model without args returns prompt" {
     };
 
     const result = try Dispatcher.execute(ctx, "model", "");
-    try std.testing.expectEqualStrings("Switch model", result.prompt.title);
-    try std.testing.expectEqualStrings("e.g. deepseek-chat", result.prompt.placeholder);
-    alloc.free(result.prompt.title);
-    alloc.free(result.prompt.placeholder);
+    try std.testing.expectEqual(.submenu, std.meta.activeTag(result));
+    try std.testing.expectEqualStrings("Switch model", result.submenu.title);
+    try std.testing.expect(result.submenu.items.len > 0);
+    try std.testing.expectEqualStrings("/model deepseek-v4-flash", result.submenu.items[0].action);
+    freeSubMenu(alloc, result.submenu);
 }
 
-test "provider without args returns prompt" {
+test "provider without args returns submenu" {
     const alloc = std.testing.allocator;
     var pm = ProviderManager.init(alloc);
     defer pm.deinit();
@@ -452,10 +541,11 @@ test "provider without args returns prompt" {
     };
 
     const result = try Dispatcher.execute(ctx, "provider", "");
-    try std.testing.expectEqualStrings("Switch provider", result.prompt.title);
-    try std.testing.expectEqualStrings("deepseek, openai, groq, ollama...", result.prompt.placeholder);
-    alloc.free(result.prompt.title);
-    alloc.free(result.prompt.placeholder);
+    try std.testing.expectEqual(.submenu, std.meta.activeTag(result));
+    try std.testing.expectEqualStrings("Switch provider", result.submenu.title);
+    try std.testing.expect(result.submenu.items.len > 0);
+    try std.testing.expectEqualStrings("/provider deepseek", result.submenu.items[0].action);
+    freeSubMenu(alloc, result.submenu);
 }
 
 test "provider with args returns set_provider" {

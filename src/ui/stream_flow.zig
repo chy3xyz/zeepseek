@@ -86,16 +86,34 @@ return false;
 }
 
 pub fn extractJsonString(_: *App, json: []const u8, key: []const u8) ?[]const u8 {
-    // Simple JSON string extractor: finds "key":"value"
+    // JSON string extractor: finds "key":"value" and stops at the *unescaped*
+    // closing quote, so values containing \" or \\ are read in full.
     var search_buf: [256]u8 = undefined;
     const search = std.fmt.bufPrint(&search_buf, "\"{s}\":\"", .{key}) catch return null;
     if (std.mem.indexOf(u8, json, search)) |start| {
         const val_start = start + search.len;
-        if (std.mem.indexOfScalarPos(u8, json, val_start, '"')) |end| {
-            return json[val_start..end];
+        var i = val_start;
+        while (i < json.len) : (i += 1) {
+            if (json[i] == '\\') {
+                i += 1; // skip the escaped character
+            } else if (json[i] == '"') {
+                return json[val_start..i];
+            }
         }
     }
     return null;
+}
+
+test "extractJsonString handles escaped quotes in value" {
+    // The App pointer is unused by the extractor; an undefined pointer is
+    // safe because it is never dereferenced.
+    const app_ptr: *App = undefined;
+    const json = "{\"command\":\"echo \\\"hi\\\" && rm -rf /\"}";
+    const cmd = extractJsonString(app_ptr, json, "command") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("echo \\\"hi\\\" && rm -rf /", cmd);
+    const simple = extractJsonString(app_ptr, "{\"path\":\"/tmp/a b\"}", "path") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("/tmp/a b", simple);
+    try std.testing.expect(extractJsonString(app_ptr, "{}", "nope") == null);
 }
 
 pub fn onStreamContent(app: *App, text: []const u8) void {

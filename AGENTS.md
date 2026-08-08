@@ -275,6 +275,9 @@ These are slash commands available in the TUI input area:
 | `/save` | Save current session to disk |
 | `/load` | Load a saved session |
 | `/status` | Show context usage and budget |
+| `/mcp` | (Re)load MCP servers from `~/.zeepseek/mcp.json` and expose their tools |
+| `/skill <name>` | Activate a skill (prompt injection) |
+| `/skill install <owner>/<repo>` | Clone + register a GitHub-hosted skill |
 | `/new` | Start a fresh session |
 
 ---

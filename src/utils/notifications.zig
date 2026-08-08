@@ -51,23 +51,24 @@ pub const NotificationManager = struct {
     }
 
     pub fn notify(self: *Self, _: anytype, notif: Notification) !void {
+        if (self.enabled and @intFromEnum(notif.level) < @intFromEnum(self.minimum_level)) return;
         self.setActive(notif.title, notif.body, notif.level);
     }
 
-    pub fn info(self: *Self, _: anytype, title: []const u8, body: []const u8) !void {
-        self.setActive(title, body, .info);
+    pub fn info(self: *Self, w: anytype, title: []const u8, body: []const u8) !void {
+        try self.notify(w, .{ .title = title, .body = body, .level = .info });
     }
 
-    pub fn success(self: *Self, _: anytype, title: []const u8, body: []const u8) !void {
-        self.setActive(title, body, .success);
+    pub fn success(self: *Self, w: anytype, title: []const u8, body: []const u8) !void {
+        try self.notify(w, .{ .title = title, .body = body, .level = .success });
     }
 
-    pub fn warning(self: *Self, _: anytype, title: []const u8, body: []const u8) !void {
-        self.setActive(title, body, .warning);
+    pub fn warning(self: *Self, w: anytype, title: []const u8, body: []const u8) !void {
+        try self.notify(w, .{ .title = title, .body = body, .level = .warning });
     }
 
-    pub fn notifyError(self: *Self, _: anytype, title: []const u8, body: []const u8) !void {
-        self.setActive(title, body, .err);
+    pub fn notifyError(self: *Self, w: anytype, title: []const u8, body: []const u8) !void {
+        try self.notify(w, .{ .title = title, .body = body, .level = .err });
     }
 
     fn setActive(self: *Self, title: []const u8, body: []const u8, level: NotificationLevel) void {
@@ -113,3 +114,56 @@ pub const NotificationManager = struct {
         self.enabled = false;
     }
 };
+
+const NullWriter = struct {
+    pub fn writeAll(_: *const @This(), _: []const u8) !void {}
+};
+
+test "notify records active notification when disabled" {
+    var mgr = NotificationManager.init();
+    try mgr.notify(NullWriter{}, .{ .title = "t", .body = "b", .level = .success });
+
+    const active = mgr.getActive().?;
+    try std.testing.expectEqualStrings("t", active.title);
+    try std.testing.expectEqualStrings("b", active.body);
+    try std.testing.expectEqual(NotificationLevel.success, active.level);
+    try std.testing.expectEqual(NotificationLevel.info, mgr.minimum_level);
+}
+
+test "minimum_level gates sub-threshold notifications when enabled" {
+    var mgr = NotificationManager.init();
+    mgr.enable();
+    mgr.setLevel(.warning);
+
+    try mgr.info(NullWriter{}, "skipped", "no body");
+    try std.testing.expect(mgr.getActive() == null);
+
+    try mgr.warning(NullWriter{}, "kept", "yes");
+    const active = mgr.getActive().?;
+    try std.testing.expectEqualStrings("kept", active.title);
+    try std.testing.expectEqual(NotificationLevel.warning, active.level);
+}
+
+test "title and body are truncated to fixed buffers" {
+    var mgr = NotificationManager.init();
+    var long: [300]u8 = undefined;
+    @memset(long[0..], 'x');
+    try mgr.info(NullWriter{}, &long, &long);
+
+    const active = mgr.getActive().?;
+    try std.testing.expectEqual(@as(usize, 64), active.title.len);
+    try std.testing.expectEqual(@as(usize, 256), active.body.len);
+}
+
+test "clearActive and isExpired" {
+    var mgr = NotificationManager.init();
+    try mgr.success(NullWriter{}, "t", "b");
+    try std.testing.expect(!mgr.isExpired(0, 100));
+
+    mgr.clearActive();
+    try std.testing.expect(mgr.getActive() == null);
+    try std.testing.expect(mgr.isExpired(0, 100));
+
+    try mgr.info(NullWriter{}, "t", "b");
+    try std.testing.expect(mgr.isExpired(mgr.active_time + 11, 10));
+}

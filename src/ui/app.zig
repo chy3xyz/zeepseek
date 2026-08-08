@@ -939,10 +939,10 @@ pub const App = struct {
             // if the platform sandbox fails (macOS Seatbelt), tool calls
             // that mutate or execute fall back to explicit user approval
             // (requiresApproval fails closed on null sandbox).
-            // NOTE: dispatch/cache subsystems (ContextManager, CacheFirstLoop,
-            // reasonix) are experimental and not wired into the streaming
-            // path; they are intentionally left uninitialized (see
-            // docs/ARCHITECTURE.md for wiring status).
+            // Wiring note: reasonix (exact/similar-cache replay) and the
+            // ContextManager (auto-fold budget) are live in submit(); the
+            // CacheFirstLoop agent loop is constructed but not yet driven —
+            // the streaming thread calls streamMessage directly.
             for (SlashDispatcher.Dispatcher.commands()) |cmd| {
                 self.palette.addCommand(.{
                     .id = cmd.id,
@@ -1596,11 +1596,15 @@ pub const App = struct {
             return;
         };
 
+        // Snapshot the MCP tool declarations so a concurrent /mcp reload
+        // cannot free the slice while the streaming thread serializes it.
+        const mcp_tools_owned = self.alloc.dupe(u8, self.mcp_tools_json) catch "";
+
         const alloc = self.alloc;
 
         // Spawn streaming thread
         const thread = std.Thread.spawn(.{}, struct {
-            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, ep: []const u8, git_ctx: []const u8, a: std.mem.Allocator, state: *StreamState) void {
+            fn run(prompt: []const u8, ctx: []const stream_client_mod.CtxItem, api_k: []const u8, mdl: []const u8, ep: []const u8, git_ctx: []const u8, mcp_tools: []const u8, a: std.mem.Allocator, state: *StreamState) void {
                 defer {
                     for (ctx) |ci| {
                         a.free(ci.content);
@@ -1611,6 +1615,7 @@ pub const App = struct {
                     a.free(api_k);
                     a.free(mdl);
                     if (git_ctx.len > 0) a.free(git_ctx);
+                    if (mcp_tools.len > 0) a.free(mcp_tools);
                 }
                 // Dedicated Io so blocking network reads never stall the UI
                 // thread's shared std.Io (threaded-io socket hang on macOS).
@@ -1619,6 +1624,7 @@ pub const App = struct {
                 defer threaded.deinit();
                 var client = stream_client_mod.DeepSeekStreamClient.init(a, sio_own, null, null);
                 client.endpoint = ep;
+                client.extra_tools = mcp_tools;
                 defer client.deinit();
 
                 // Fast path: h2-over-TLS streaming (own TLS stack, read
@@ -1681,7 +1687,7 @@ pub const App = struct {
                 }
                 state.setDone();
             }
-        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, endpoint, git_ctx_owned, alloc, ss }) catch {
+        }.run, .{ prompt_owned, ctx_slice, api_key_owned, model_owned, endpoint, git_ctx_owned, mcp_tools_owned, alloc, ss }) catch {
             // Thread failed to spawn: reclaim the data we duplicated for it
             for (ctx_slice) |ci| {
                 alloc.free(ci.content);
@@ -1692,6 +1698,7 @@ pub const App = struct {
             alloc.free(api_key_owned);
             alloc.free(model_owned);
             if (git_ctx_owned.len > 0) alloc.free(git_ctx_owned);
+            if (mcp_tools_owned.len > 0) alloc.free(mcp_tools_owned);
             ss.setError(std.fmt.allocPrint(self.alloc, "Failed to spawn thread", .{}) catch "");
             return;
         };

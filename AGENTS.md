@@ -68,10 +68,13 @@ Utils ────────────────────────�
 ### Data Flow
 
 ```
-User Input → UI (onKey) → dispatch (cache_first_loop) →
-  cache (reasonix) → network (stream_client) → SSE stream →
-  dispatch (pollStream) → UI (onStreamContent) → Terminal
+User Input → UI (onKey) → semantic cache (reasonix replay) →
+  network (stream_client) → SSE stream →
+  UI (onStreamContent) → Terminal
 ```
+The `dispatch/cache_first_loop` agent loop is constructed at startup but not yet
+driven; `submit` calls `streamMessage` directly (auto-fold runs through the
+ContextManager first).
 
 ### Module Inventory
 

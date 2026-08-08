@@ -290,9 +290,16 @@ pub const DeepSeekStreamClient = struct {
         // the executor actually knows. Comma-joined, no outer brackets.
         const tools_json = try tool_registry.buildToolsJson(self.allocator);
         defer self.allocator.free(tools_json);
-        try body.appendSlice(self.allocator, tools_json);
-        if (self.extra_tools.len > 0) {
-            try body.appendSlice(self.allocator, ",");
+        const has_native = tools_json.len > 0;
+        const has_mcp = self.extra_tools.len > 0;
+        // Join native + MCP fragments with a comma only when both are present,
+        // so an empty native registry degrades to the MCP fragment alone
+        // instead of emitting the invalid `[, <mcp>]`.
+        if (has_native) {
+            try body.appendSlice(self.allocator, tools_json);
+            if (has_mcp) try body.appendSlice(self.allocator, ",");
+        }
+        if (has_mcp) {
             try body.appendSlice(self.allocator, self.extra_tools);
         }
         try body.appendSlice(self.allocator, "],\"tool_choice\":\"auto\"");
@@ -1282,4 +1289,30 @@ test "build body registers all tools and echoes assistant tool_calls" {
         defer alloc.free(needle);
         try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
     }
+}
+
+test "build body appends MCP tools fragment and stays valid JSON" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{ .argv0 = .empty, .environ = .empty });
+    defer threaded.deinit();
+    var client = DeepSeekStreamClient.init(alloc, threaded.io(), null, null);
+    defer client.deinit();
+
+    // Simulate the MCP tools/list → OpenAI fragment the /mcp handler builds:
+    // names/descriptions may contain quotes, and inputSchema is passed through.
+    client.extra_tools =
+        \\{"type":"function","function":{"name":"db_query","description":"run \"SQL\"","parameters":{"type":"object","properties":{"q":{"type":"string"}}}}}
+    ;
+
+    const CacheDecision = enum { none, hit, miss };
+    const ctx = [_]CtxItem{
+        .{ .role = "user", .content = "query db" },
+    };
+    const body = try client.buildRequestBody("proceed", &ctx, "deepseek-chat", CacheDecision.none, "", null, true);
+    defer alloc.free(body);
+
+    try std.testing.expect(std.mem.indexOf(u8, body, "db_query") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\\\"SQL\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"properties\"") != null);
+    try std.testing.expect(try std.json.validate(alloc, body));
 }

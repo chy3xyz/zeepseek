@@ -150,7 +150,6 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
         };
         defer app.alloc.free(resp);
         info_buf.appendSlice(app.alloc, " init ok\n") catch {};
-        defer app.alloc.free(resp);
         const tl_req = mcp_client_mod.buildToolsList(app.alloc, 2) catch return true;
         defer app.alloc.free(tl_req);
         const tl_resp = app.mcp_session.?.roundTrip(tl_req, 4000) catch |e| {
@@ -171,21 +170,29 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
                     if (tarr == .array) {
                         var first = true;
                         for (tarr.array.items) |t| {
+                            if (t != .object) continue;
                             const obj = t.object;
                             const nm = if (obj.get("name")) |v| (if (v == .string) v.string else "") else "";
-                            const desc = if (obj.get("description")) |v| (if (v == .string) v.string else "") else "";
-                            // NOTE: 0.17 std.json has no stringifyAlloc; the
-                            // schema is passed as a generic object for now.
-                            const schema: ?[]const u8 = null;
                             if (nm.len == 0) continue;
+                            const desc = if (obj.get("description")) |v| (if (v == .string) v.string else "") else "";
+                            const name_json = std.fmt.allocPrint(app.alloc, "{f}", .{std.json.fmt(nm, .{})}) catch continue;
+                            defer app.alloc.free(name_json);
+                            const desc_json = std.fmt.allocPrint(app.alloc, "{f}", .{std.json.fmt(desc, .{})}) catch continue;
+                            defer app.alloc.free(desc_json);
                             if (!first) mcp_tools.appendSlice(app.alloc, ",") catch {};
                             first = false;
-                            mcp_tools.appendSlice(app.alloc, "{\"type\":\"function\",\"function\":{\"name\":\"") catch {};
-                            mcp_tools.appendSlice(app.alloc, nm) catch {};
-                            mcp_tools.appendSlice(app.alloc, "\",\"description\":\"") catch {};
-                            mcp_tools.appendSlice(app.alloc, desc) catch {};
-                            mcp_tools.appendSlice(app.alloc, "\",\"parameters\":") catch {};
-                            mcp_tools.appendSlice(app.alloc, schema orelse "{\"type\":\"object\"}") catch {};
+                            mcp_tools.appendSlice(app.alloc, "{\"type\":\"function\",\"function\":{\"name\":") catch {};
+                            mcp_tools.appendSlice(app.alloc, name_json) catch {};
+                            mcp_tools.appendSlice(app.alloc, ",\"description\":") catch {};
+                            mcp_tools.appendSlice(app.alloc, desc_json) catch {};
+                            mcp_tools.appendSlice(app.alloc, ",\"parameters\":") catch {};
+                            if (obj.get("inputSchema")) |schema_v| {
+                                const schema_json = std.fmt.allocPrint(app.alloc, "{f}", .{std.json.fmt(schema_v, .{})}) catch continue;
+                                defer app.alloc.free(schema_json);
+                                mcp_tools.appendSlice(app.alloc, schema_json) catch {};
+                            } else {
+                                mcp_tools.appendSlice(app.alloc, "{\"type\":\"object\"}") catch {};
+                            }
                             mcp_tools.appendSlice(app.alloc, "}}") catch {};
                         }
                     }

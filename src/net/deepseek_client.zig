@@ -79,7 +79,7 @@ pub const DeepSeekClient = struct {
             .extra_headers = &headers,
         });
         try request.sendBodyComplete(body);
-        errdefer request.deinit();
+        defer request.deinit();
 
         var redirect_buf: [8192]u8 = undefined;
         var response = try request.receiveHead(&redirect_buf);

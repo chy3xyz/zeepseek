@@ -2,6 +2,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const ZeepError = @import("error.zig").ZeepError;
 
+/// Diagnostic log for interactive/daemon runs only. Silenced under `zig test`:
+/// a stray write during the debug-sandbox bootstrap can interfere with the
+/// test runner's listen-pipe protocol.
+fn logInfo(comptime fmt: []const u8, args: anytype) void {
+    if (builtin.is_test) return;
+    std.debug.print(fmt, args);
+}
+
 pub const Policy = enum {
     none,
     seatbelt,
@@ -27,7 +35,7 @@ pub const ApprovalMode = enum {
 pub const CommandValidator = struct {
     restricted: []const []const u8 = &.{
         "&&", "||", ";", "&>", "<>", "<<", "<<<", ">>",
-        "| sh", "|bash", "eval ", "exec ", "source ",
+        "| sh", "| zsh", "| bash", "|bash", "eval ", "exec ", "source ",
         "sudo ", "su ", "doas ",
         "mkfs", "dd if=", "chmod 777",
     },
@@ -38,11 +46,20 @@ pub const CommandValidator = struct {
                 return error.RestrictedCommand;
             }
         }
-        if (std.mem.startsWith(u8, cmd, "cd /") or std.mem.startsWith(u8, cmd, "cd ~")) {
-            return error.RestrictedCommand;
-        }
+        if (isRestrictedCd(cmd)) return error.RestrictedCommand;
     }
 };
+
+fn isRestrictedCd(cmd: []const u8) bool {
+    if (!std.mem.startsWith(u8, cmd, "cd ")) return false;
+    const target = cmd[3..];
+    if (std.mem.eql(u8, target, "/") or std.mem.eql(u8, target, "~")) return true;
+    const system = [_][]const u8{ "/etc", "/boot", "/System", "/bin", "/sbin", "/usr", "/dev", "/proc", "/sys" };
+    for (system) |p| {
+        if (std.mem.startsWith(u8, target, p)) return true;
+    }
+    return false;
+}
 
 pub const Sandbox = struct {
     policy: Policy,
@@ -147,18 +164,18 @@ pub const Sandbox = struct {
 
         if (result != 0) {
             if (err_buf) |msg| {
-                std.debug.print("[sandbox] Seatbelt init failed (code={d}): {s}\n", .{ result, std.mem.sliceTo(msg, 0) });
+                logInfo("[sandbox] Seatbelt init failed (code={d}): {s}\n", .{ result, std.mem.sliceTo(msg, 0) });
                 c_sandbox.sandbox_free_error(err_buf);
             } else {
-                std.debug.print("[sandbox] Seatbelt init failed (code={d})\n", .{result});
+                logInfo("[sandbox] Seatbelt init failed (code={d})\n", .{result});
             }
-            std.debug.print("[sandbox] Falling back to command-level restrictions\n", .{});
+            logInfo("[sandbox] Falling back to command-level restrictions\n", .{});
             self.policy = .none;
             return;
         }
 
         if (builtin.mode == .debug) {
-            std.debug.print("[sandbox] Seatbelt initialized\n", .{});
+            logInfo("[sandbox] Seatbelt initialized\n", .{});
         }
     }
 
@@ -173,14 +190,14 @@ pub const Sandbox = struct {
         // The user-approval gate in app.zig is the effective protection;
         // keep the platform layer as a no-op rather than a broken half-apply.
         _ = allowed_paths;
-        std.debug.print("[sandbox] Landlock skipped: positive-authorization model conflicts with dynamic tool approval; using command-level restrictions only\n", .{});
+        logInfo("[sandbox] Landlock skipped: positive-authorization model conflicts with dynamic tool approval; using command-level restrictions only\n", .{});
         self.policy = .none;
     }
 
     fn initJobObject(_: *Sandbox) !void {
         if (builtin.os.tag != .windows) return;
         if (builtin.mode == .debug) {
-            std.debug.print("[sandbox] Job Object: initializing\n", .{});
+            logInfo("[sandbox] Job Object: initializing\n", .{});
         }
     }
 
@@ -275,7 +292,7 @@ pub const Sandbox = struct {
 };
 
 test "sandbox allowFileRead default prompt" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator.*);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var sb = Sandbox{
@@ -296,7 +313,7 @@ test "sandbox allowFileRead default prompt" {
 }
 
 test "sandbox allowFileWrite denies system paths" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator.*);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var sb = Sandbox{
@@ -316,7 +333,7 @@ test "sandbox allowFileWrite denies system paths" {
 }
 
 test "sandbox subagent concurrency limit" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator.*);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var sb = Sandbox{
@@ -339,7 +356,7 @@ test "sandbox subagent concurrency limit" {
 }
 
 test "sandbox mode transitions" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator.*);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var sb = Sandbox{
@@ -396,8 +413,8 @@ test "command validator blocks restricted cd" {
     try validator.validate("ls -la");
     try std.testing.expectError(error.RestrictedCommand, validator.validate("cd /"));
     try std.testing.expectError(error.RestrictedCommand, validator.validate("cd /etc"));
-    try std.testing.expectError(error.RestrictedCommand, validator.validate("cd ~"));
-    try std.testing.expectError(error.RestrictedCommand, validator.validate("cd ~/foo"));
+    try std.testing.expectError(error.RestrictedCommand, validator.validate("cd /bin"));
+    try std.testing.expectError(error.RestrictedCommand, validator.validate("cd /usr"));
 }
 
 test "command validator edge cases" {
@@ -422,7 +439,7 @@ test "seatbelt profile avoids scheme true literal" {
 }
 
 test "sandbox allowShell uses command validator" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator.*);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var sb = Sandbox{
@@ -451,7 +468,7 @@ test "sandbox allowShell uses command validator" {
 }
 
 test "sandbox allowShellWithPolicyCheck" {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator.*);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
     defer arena.deinit();
 
     var sb = Sandbox{

@@ -42,6 +42,7 @@ const skills_builtin = @import("../skills/builtin.zig");
 const session_manager = @import("../storage/session_manager.zig");
 const ContextManager = @import("../dispatch/context_manager.zig").ContextManager;
 const ImmutablePrefix = @import("../dispatch/context_manager.zig").ImmutablePrefix;
+const foldDecisionFromReasonix = @import("../dispatch/context_manager.zig").foldDecisionFromReasonix;
 const reasonix_mod = @import("../cache/reasonix.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
 const memory_mod = @import("../cache/memory.zig");
@@ -660,6 +661,29 @@ pub const App = struct {
         self.git_worker = g_git_worker;
         self.app_io = ctx.io;
 
+        // Context manager + cache-first loop (the live context/budget authority
+        // that auto-folds history when the window fills). page_allocator storage
+        // so their internal arenas stay valid across frame resets — same pattern
+        // as reasonix / memory / skill registry above.
+        const cm = std.heap.page_allocator.create(ContextManager) catch null;
+        if (cm) |mgr| {
+            mgr.* = ContextManager.init(std.heap.page_allocator);
+            mgr.setContextMax(@intCast(@min(self.ctx_max, 256000)));
+            self.ctx_mgr = mgr;
+            if (self.reasonix) |rxr| {
+                const cl = std.heap.page_allocator.create(dispatch_loop.CacheFirstLoop) catch null;
+                if (cl) |loop| {
+                    loop.* = dispatch_loop.CacheFirstLoop.init(std.heap.page_allocator, .{
+                        .prefix = ImmutablePrefix.init(std.heap.page_allocator, "", "", ""),
+                        .context = mgr,
+                        .reasonix = rxr,
+                        .io = ctx.io,
+                    });
+                    self.cache_loop = loop;
+                }
+            }
+        }
+
         // Skill registry with built-in skills. Uses page_allocator storage
         // (stable in-app, same pattern as the semantic cache) — the app's
         // persistent allocator invalidates the arena at runtime.
@@ -832,6 +856,17 @@ pub const App = struct {
             rx.deinit();
             if (self.reasonix_alloc) |a| a.destroy(rx);
             self.reasonix = null;
+        }
+
+        if (self.cache_loop) |cl| {
+            cl.deinit();
+            std.heap.page_allocator.destroy(cl);
+            self.cache_loop = null;
+        }
+        if (self.ctx_mgr) |cmg| {
+            cmg.deinit();
+            std.heap.page_allocator.destroy(cmg);
+            self.ctx_mgr = null;
         }
 
         // Shut down the git worker: closing stdin makes it read EOF and exit.
@@ -1350,23 +1385,15 @@ pub const App = struct {
         self.scroll_offset = 0;
         self.turn += 1;
 
+        // Auto-fold the context (cache-first loop budget) before the API call.
+        self.autoFoldContext();
+
         // Start streaming if API key is available
         if (self.api_key.len > 0) {
             // Long-term memory footnote: BM25-recall facts relevant to the
             // prompt, appended as low-authority context (bounded).
             var mem_footnote: []const u8 = "";
-            if (self.active_skill.len > 0) self.alloc.free(self.active_skill);
-        if (self.skill_registry) |reg| {
-            reg.deinit();
-            if (self.skill_registry_alloc) |sa| sa.destroy(reg);
-            self.skill_registry = null;
-        }
-        if (self.memory) |mem| {
-            mem.deinit();
-            if (self.memory_alloc) |ma| ma.destroy(mem);
-            self.memory = null;
-        }
-        if (self.memory) |mem| {
+            if (self.memory) |mem| {
                 const recalled = mem.recall(text, 2, 800);
                 if (recalled.len > 0) {
                     mem_footnote = std.fmt.allocPrint(self.alloc, "\n\nRelevant long-term facts (user-provided, verify before relying):\n{s}", .{recalled}) catch "";
@@ -1817,6 +1844,85 @@ pub const App = struct {
         self.messages.clearRetainingCapacity();
         self.streaming_idx = null;
         self.turn = 0;
+        if (self.ctx_mgr) |m| m.clear();
+    }
+
+    /// Release a single message's owned buffers (content, thinking, tool calls).
+    fn freeMsg(self: *App, m: *ChatMsg) void {
+        if (m.owns and m.content.len > 0) self.alloc.free(m.content);
+        if (m.thinking) |t| self.alloc.free(t);
+        for (m.tool_calls.items) |tc| {
+            self.freeToolCall(tc);
+        }
+        m.tool_calls.deinit(self.alloc);
+    }
+
+    /// Remove the `count` oldest messages from the front of the conversation.
+    /// Returns how many were actually removed.
+    fn dropFirstMessages(self: *App, count: usize) usize {
+        var dropped: usize = 0;
+        while (dropped < count and self.messages.items.len > 0) {
+            var m = self.messages.orderedRemove(0);
+            self.freeMsg(&m);
+            dropped += 1;
+        }
+        return dropped;
+    }
+
+    /// Auto-fold: mirror the current conversation into the ContextManager and
+    /// run the cache-first loop's budget decision. When the window fills past
+    /// the fold threshold it drops the oldest non-pinned messages (and records
+    /// a real fold in the manager's history); on emergency overflow it keeps a
+    /// short tail. This is the context-preserving "automatic folding" half of
+    /// the cache-first agent loop, invoked before each genuine user turn.
+    fn autoFoldContext(self: *App) void {
+        const mgr = self.ctx_mgr orelse return;
+
+        // Rebuild the mirror from scratch each turn so it always reflects the
+        // live conversation (roles are preserved; pinned semantics mirror the
+        // manager's own auto-pin rules).
+        mgr.messages.clearAndFree(mgr.arena.allocator());
+        mgr.pinned_indices.clearAndFree(mgr.arena.allocator());
+        for (self.messages.items) |*m| {
+            const role_str: []const u8 = switch (m.role) {
+                .user => "user",
+                .assistant => "assistant",
+                .system => "system",
+                .tool => "tool",
+            };
+            mgr.addMessage(.{ .role = role_str, .content = m.content }) catch continue;
+        }
+
+        const total_tokens = mgr.totalTokens();
+        const raw = reasonix_mod.Reasonix.decideAfterUsage(total_tokens, @intCast(self.ctx_max), false);
+        const decision = foldDecisionFromReasonix(raw);
+        switch (decision) {
+            .none, .exit_with_summary => {},
+            .emergency_truncate => {
+                // Window is effectively full: keep the most recent pair.
+                mgr.clear();
+                while (self.messages.items.len > 2) {
+                    var m = self.messages.orderedRemove(0);
+                    self.freeMsg(&m);
+                }
+                self.setNotification("⚡ Context emergency-truncated to last exchange");
+            },
+            .fold_normal, .fold_aggressive => {
+                const res = mgr.foldHistory("", decision, null, null) catch return;
+                if (res.messages_removed > 0) {
+                    const dropped = self.dropFirstMessages(res.messages_removed);
+                    if (dropped > 0) {
+                        const msg = std.fmt.allocPrint(
+                            self.alloc,
+                            "⚡ Auto-folded {d} messages (saved ~{d} tokens)",
+                            .{ dropped, res.tokens_before -| res.tokens_after },
+                        ) catch return;
+                        defer self.alloc.free(msg);
+                        self.setNotification(msg);
+                    }
+                }
+            },
+        }
     }
 
     /// Compact older messages to reduce token usage.

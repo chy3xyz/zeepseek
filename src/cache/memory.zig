@@ -56,20 +56,29 @@ pub const Memory = struct {
     }
 
     fn tokenize(alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u8)) void {
-        // Lowercase ASCII words + single CJK chars.
+        // Lowercase ASCII words + single CJK chars. ASCII word tokens are
+        // delimited with the 0x1f separator so they don't merge into one blob.
         var i: usize = 0;
+        var in_word: bool = false;
         while (i < text.len) {
             const c = text[i];
             if (c >= 'a' and c <= 'z') {
                 out.append(alloc, c) catch {};
+                in_word = true;
                 i += 1;
             } else if (c >= 'A' and c <= 'Z') {
                 out.append(alloc, c + 32) catch {};
+                in_word = true;
                 i += 1;
             } else if (c >= '0' and c <= '9') {
                 out.append(alloc, c) catch {};
+                in_word = true;
                 i += 1;
             } else if (c < 0x80) {
+                if (in_word) {
+                    out.append(alloc, 0x1f) catch {}; // token boundary
+                    in_word = false;
+                }
                 i += 1; // punctuation/space: token boundary
             } else {
                 // Multi-byte char: emit as a token of 4 bytes (its bytes).
@@ -79,6 +88,7 @@ pub const Memory = struct {
                     out.append(alloc, text[i + j]) catch {};
                 }
                 out.append(alloc, 0x1f) catch {}; // separator
+                in_word = false;
                 i += end;
             }
         }
@@ -183,9 +193,17 @@ test "memory add writes the fact to the file" {
     const alloc = std.testing.allocator;
     var mem = Memory.init(alloc);
     defer mem.deinit();
-    const path = "/tmp/zz_mem_add_test.md";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &path_buf);
+    const path = try std.fs.path.joinZ(alloc, &.{ path_buf[0..dir_len], "mem_add_test.md" });
+    defer alloc.free(path);
+
     mem.add(path, "user prefers tabs");
-    const fd = std.c.open(path, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = std.c.open(path.ptr, std.c.O{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
     try std.testing.expect(fd >= 0);
     defer _ = std.c.close(fd);
     var buf: [256]u8 = undefined;

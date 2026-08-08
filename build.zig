@@ -19,8 +19,8 @@ pub fn build(b: *std.Build) void {
 
     // ── Single root module at src/main.zig ────────────────────────────
     // Lets all subdirectories (ui, dispatch, net, cache, utils, storage,
-    // tools, etc.) cross-import via relative paths; named modules below
-    // are kept for the tool-safety/session/net glue used by app.zig.
+    // tools, etc.) cross-import via relative paths. Only the two named
+    // imports actually referenced by source are registered below.
     const root_mod = b.addModule("zeepseek", .{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -29,55 +29,6 @@ pub fn build(b: *std.Build) void {
     });
     root_mod.addImport("c", c_mod);
     root_mod.addImport("zigzag", zigzag_dep.module("zigzag"));
-
-    // Tool-safety guard module used by app.zig's tool execution path
-    const dangerous_patterns_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/dangerous_patterns.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    root_mod.addImport("dangerous_patterns", dangerous_patterns_mod);
-
-    // Unified tool execution + sandbox (used by app.zig's tool calls)
-    const sandbox_mod = b.createModule(.{
-        .root_source_file = b.path("src/utils/sandbox.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    sandbox_mod.addImport("c", c_mod);
-    const tools_mod = b.createModule(.{
-        .root_source_file = b.path("src/tools/mod.zig"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    tools_mod.addImport("sandbox", sandbox_mod);
-    tools_mod.addImport("c", c_mod);
-    root_mod.addImport("tools", tools_mod);
-
-    // Session format (shared by app.zig save/load)
-    const session_format_mod = b.createModule(.{
-        .root_source_file = b.path("src/storage/session_format.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    root_mod.addImport("session_format", session_format_mod);
-
-    // Net modules for streaming integration
-    const http_client_file = b.createModule(.{
-        .root_source_file = b.path("src/net/http_client.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    root_mod.addImport("http_client", http_client_file);
-
-    const stream_client_file = b.createModule(.{
-        .root_source_file = b.path("src/net/stream_client.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    root_mod.addImport("stream_client", stream_client_file);
 
     const exe = b.addExecutable(.{
         .name = "zeepseek",
@@ -91,7 +42,7 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zeepseek TUI");
     run_step.dependOn(&run.step);
 
-    // ── Tests ─────────────────────────────────────────────────────────
+    // ── Unit tests ────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/test_runner.zig"),
         .target = target,
@@ -105,4 +56,24 @@ pub fn build(b: *std.Build) void {
     const test_run = b.addRunArtifact(test_build);
     const test_step = b.step("test", "Run all unit tests");
     test_step.dependOn(&test_run.step);
+
+    // ── Integration tests ─────────────────────────────────────────────
+    // Require external services and are intentionally NOT part of `zig build
+    // test`: http2_tests.zig expects an echo server on 127.0.0.1:18472,
+    // h2_live_test.zig needs DEEPSEEK_API_KEY (skips when absent).
+    const integration_mod = b.createModule(.{
+        .root_source_file = b.path("src/integration_runner.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    integration_mod.addImport("c", c_mod);
+
+    const integration_build = b.addTest(.{ .root_module = integration_mod });
+    const integration_run = b.addRunArtifact(integration_build);
+    const integration_step = b.step("integration-test", "Run integration tests (echo server on :18472, DEEPSEEK_API_KEY)");
+    integration_step.dependOn(&integration_run.step);
+
+    const integration_compile_step = b.step("integration-test-compile", "Compile integration tests without running (no external services required)");
+    integration_compile_step.dependOn(&integration_build.step);
 }

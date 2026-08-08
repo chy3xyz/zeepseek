@@ -183,8 +183,23 @@ pub const ManifestParser = struct {
 
     fn parseJson(self: *ManifestParser, content: []const u8) !Skill {
         var raw = ManifestRaw{};
-        try self.parseJsonValue(content, 0, &raw);
-        return try self.buildSkill(raw);
+        errdefer freeJsonRaw(self.allocator, &raw);
+        _ = try self.parseJsonValue(content, 0, &raw);
+        const skill = try self.buildSkill(raw);
+        freeJsonRaw(self.allocator, &raw);
+        return skill;
+    }
+
+    /// Free the string fields parsed from JSON. Every value produced by
+    /// parseJsonValue is a fresh allocation owned by `raw`; the Skill built
+    /// from it duplicates the ones it keeps, so the raw copies are released.
+    fn freeJsonRaw(alloc: std.mem.Allocator, raw: *ManifestRaw) void {
+        if (raw.name) |s| alloc.free(s);
+        if (raw.display_name) |s| alloc.free(s);
+        if (raw.description) |s| alloc.free(s);
+        if (raw.version) |s| alloc.free(s);
+        if (raw.author) |s| alloc.free(s);
+        if (raw.config_schema) |s| alloc.free(s);
     }
 
     fn parseJsonValue(self: *ManifestParser, content: []const u8, start: usize, raw: *ManifestRaw) !usize {
@@ -347,14 +362,8 @@ test "manifest parser yaml basic" {
         \\author: tester
     ;
 
-    const skill = try parser.parse(yaml, "test.yaml");
-    defer {
-        alloc.free(skill.name);
-        alloc.free(skill.display_name);
-        alloc.free(skill.description);
-        alloc.free(skill.version);
-        alloc.free(skill.author);
-    }
+    var skill = try parser.parse(yaml, "test.yaml");
+    defer skill.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "test-skill", skill.name);
     try std.testing.expectEqualSlices(u8, "Test Skill", skill.display_name);
@@ -368,12 +377,8 @@ test "manifest parser json basic" {
 
     const json = "{\"name\":\"json-skill\",\"display_name\":\"JSON Skill\",\"version\":\"2.0.0\"}";
 
-    const skill = try parser.parse(json, "skill.json");
-    defer {
-        alloc.free(skill.name);
-        alloc.free(skill.display_name);
-        alloc.free(skill.version);
-    }
+    var skill = try parser.parse(json, "skill.json");
+    defer skill.deinit(alloc);
 
     try std.testing.expectEqualSlices(u8, "json-skill", skill.name);
     try std.testing.expectEqualSlices(u8, "JSON Skill", skill.display_name);

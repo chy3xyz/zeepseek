@@ -110,7 +110,7 @@ pub const ContextManager = struct {
             .{ .pattern = "decided", .weight = 6 },
             .{ .pattern = "conclusion", .weight = 6 },
             .{ .pattern = "summary:", .weight = 5 },
-            .{ .pattern = "final decision", .weight = 7 },
+            .{ .pattern = "final decision", .weight = 10 },
             .{ .pattern = "important:", .weight = 9 },
             .{ .pattern = "key:", .weight = 5 },
             .{ .pattern = "architecture", .weight = 4 },
@@ -149,7 +149,7 @@ pub const ContextManager = struct {
         const pinned_list = self.pinned_indices.items;
         for (pinned_list, 0..) |pinned_idx, i| {
             if (pinned_idx == index) {
-                self.pinned_indices.orderedRemove(i);
+                _ = self.pinned_indices.orderedRemove(i);
                 return;
             }
         }
@@ -222,15 +222,8 @@ pub const ContextManager = struct {
             };
         }
 
-        const pinned_list = self.getPinnedIndices();
-        const last_pinned = if (pinned_list.len > 0) pinned_list[pinned_list.len - 1] else 0;
         const tail_count = tailMessagesToKeepCount(fold_decision);
-
-        const fold_start_idx = if (pinned_list.len > 0) last_pinned + 1 else 0;
-        const fold_end_idx = self.messages.items.len - tail_count;
-        const fold_end = @max(fold_start_idx, if (fold_end_idx > fold_start_idx) fold_end_idx else fold_start_idx);
-
-        if (fold_end <= fold_start_idx) {
+        if (tail_count >= self.messages.items.len) {
             return FoldResult{
                 .messages_removed = 0,
                 .summary_tokens = 0,
@@ -240,13 +233,30 @@ pub const ContextManager = struct {
             };
         }
 
-        const messages_to_fold = self.messages.items[fold_start_idx..fold_end];
+        const fold_end = self.messages.items.len - tail_count;
+
+        var to_remove = std.ArrayList(usize).empty;
+        defer to_remove.deinit(self.arena.allocator());
+
         var fold_token_count: usize = 0;
-        for (messages_to_fold) |msg| {
+        for (0..fold_end) |i| {
+            const msg = self.messages.items[i];
+            if (msg.pinned) continue;
             fold_token_count += tokenizer_mod.Tokenizer.count(msg.content);
             if (msg.name) |n| {
                 fold_token_count += tokenizer_mod.Tokenizer.count(n);
             }
+            to_remove.append(self.arena.allocator(), i) catch break;
+        }
+
+        if (to_remove.items.len == 0) {
+            return FoldResult{
+                .messages_removed = 0,
+                .summary_tokens = 0,
+                .tokens_before = tokens_before,
+                .tokens_after = tokens_before,
+                .savings_ratio = 0.0,
+            };
         }
 
         const savings_ratio = @as(f64, @floatFromInt(fold_token_count)) / @as(f64, @floatFromInt(tokens_before));
@@ -261,6 +271,8 @@ pub const ContextManager = struct {
             };
         }
 
+        const messages_to_fold = self.messages.items[0..fold_end];
+
         var summary_content: []const u8 = "";
         if (summary_callback) |cb| {
             if (callback_ctx) |ctx| {
@@ -270,33 +282,35 @@ pub const ContextManager = struct {
 
         const summary_tokens = tokenizer_mod.Tokenizer.count(summary_content);
 
-        const fold_messages_to_remove = fold_end - fold_start_idx;
-        var removed: usize = 0;
-        while (removed < fold_messages_to_remove) : (removed += 1) {
-            if (fold_start_idx < self.messages.items.len) {
-                _ = self.messages.orderedRemove(fold_start_idx);
-            }
+        const fold_messages_to_remove = to_remove.items.len;
+        for (0..fold_messages_to_remove) |r| {
+            const idx = to_remove.items[fold_messages_to_remove - 1 - r];
+            _ = self.messages.orderedRemove(idx);
         }
 
         if (summary_content.len > 0) {
-            try self.messages.insert(self.arena.allocator(), fold_start_idx, .{
+            try self.messages.insert(self.arena.allocator(), 0, .{
                 .role = "system",
                 .content = summary_content,
                 .pinned = true,
             });
-            try self.pinned_indices.append(self.arena.allocator(), fold_start_idx);
-            self.shiftPinnedIndicesAfter(fold_start_idx, fold_messages_to_remove - 1);
-        } else {
-            self.shiftPinnedIndicesAfter(fold_start_idx, fold_messages_to_remove);
+        }
+
+        self.pinned_indices.clearRetainingCapacity();
+        for (self.messages.items, 0..) |msg, i| {
+            if (msg.pinned) {
+                self.pinned_indices.append(self.arena.allocator(), i) catch continue;
+            }
         }
 
         const tokens_after = self.totalTokens();
-        const actual_savings_ratio = @as(f64, @floatFromInt(tokens_before - tokens_after)) /
+        const tokens_saved = tokens_before -| tokens_after;
+        const actual_savings_ratio = @as(f64, @floatFromInt(tokens_saved)) /
             @as(f64, @floatFromInt(tokens_before));
 
-        self.last_fold_tokens = tokens_before - tokens_after;
+        self.last_fold_tokens = tokens_saved;
         self.total_folds += 1;
-        self.total_saved_tokens += tokens_before - tokens_after;
+        self.total_saved_tokens += tokens_saved;
         self.version += 1;
 
         const decision_label: []const u8 = switch (fold_decision) {
@@ -327,7 +341,7 @@ pub const ContextManager = struct {
 
     fn tailMessagesToKeepCount(decision: FoldDecision) usize {
         return switch (decision) {
-            .fold_normal => |d| @min(d.tail_budget, 4),
+            .fold_normal => |d| @min(@max(d.tail_budget, 3), 4),
             .fold_aggressive => |d| @min(d.tail_budget, 2),
             else => 2,
         };
@@ -419,6 +433,9 @@ pub const ImmutablePrefix = struct {
             tools,
             few_shots,
         }) catch "";
+        defer {
+            if (all.len > 0) alloc.free(all);
+        }
 
         var hash: [32]u8 = undefined;
         if (all.len > 0) {
@@ -458,16 +475,14 @@ pub const ImmutablePrefix = struct {
             self.tools,
             self.few_shots,
         }) catch return false;
+        defer alloc.free(all);
 
         var new_hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(all, &new_hash, .{});
 
         const is_different = !std.mem.eql(u8, &self.fingerprint, &new_hash);
-        if (is_different) {
-            self.fingerprint = new_hash;
-            self.version += 1;
-        }
-
+        self.fingerprint = new_hash;
+        self.version += 1;
         return is_different;
     }
 
@@ -676,6 +691,7 @@ test "context manager fold with summary callback" {
     try ctx.addMessage(.{ .role = "user", .content = "Tell me about fish" });
     try ctx.addMessage(.{ .role = "assistant", .content = "Fish live in water." });
 
+    var dummy_ctx: u8 = 0;
     const result = try ctx.foldHistory(
         "deepseek-chat",
         .{ .fold_aggressive = .{ .tail_budget = 2 } },
@@ -684,7 +700,7 @@ test "context manager fold with summary callback" {
                 return "Conversation about animals: dogs, cats, birds, fish discussed.";
             }
         }.f,
-        @ptrFromInt(0),
+        &dummy_ctx,
     );
 
     try std.testing.expect(result.summary_tokens > 0);

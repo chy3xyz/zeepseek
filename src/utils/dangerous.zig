@@ -12,8 +12,9 @@ pub const patterns = [_]DangerousPattern{
     .{ .pattern = "mkfs", .description = "Format filesystem", .severity = .critical },
     .{ .pattern = "chmod 777", .description = "World-writable", .severity = .high },
     .{ .pattern = "DROP TABLE", .description = "SQL drop", .severity = .high },
-    .{ .pattern = "curl.*\\| sh", .description = "Pipe to shell", .severity = .critical },
-    .{ .pattern = "wget.*\\| sh", .description = "Pipe to shell", .severity = .critical },
+    .{ .pattern = "| sh", .description = "Pipe to shell", .severity = .critical },
+    .{ .pattern = "| zsh", .description = "Pipe to shell", .severity = .critical },
+    .{ .pattern = "| bash", .description = "Pipe to shell", .severity = .critical },
     .{ .pattern = "sed -i", .description = "In-place edit", .severity = .medium },
     .{ .pattern = "> /etc/", .description = "Write system dir", .severity = .high },
 };

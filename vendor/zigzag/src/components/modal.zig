@@ -381,6 +381,7 @@ pub const Modal = struct {
 
         const bd = self.backdrop orelse Backdrop{};
         const box = try self.renderBox(allocator, term_width, term_height);
+        defer allocator.free(box);
         const box_w = measure.maxLineWidth(box);
         const box_h = measure.height(box);
 
@@ -410,7 +411,9 @@ pub const Modal = struct {
                 if (mline_idx < modal_lines.len) {
                     // Left backdrop
                     if (modal_x > 0) {
-                        try writer.writeAll(try renderBackdropSegment(allocator, bd, modal_x));
+                        const left_seg = try renderBackdropSegment(allocator, bd, modal_x);
+                        defer allocator.free(left_seg);
+                        try writer.writeAll(left_seg);
                     }
                     // Modal line
                     try writer.writeAll(modal_lines[mline_idx]);
@@ -418,13 +421,19 @@ pub const Modal = struct {
                     const mline_w = measure.width(modal_lines[mline_idx]);
                     const right_start = modal_x + mline_w;
                     if (right_start < term_width) {
-                        try writer.writeAll(try renderBackdropSegment(allocator, bd, term_width - right_start));
+                        const right_seg = try renderBackdropSegment(allocator, bd, term_width - right_start);
+                        defer allocator.free(right_seg);
+                        try writer.writeAll(right_seg);
                     }
                 } else {
-                    try writer.writeAll(try renderBackdropSegment(allocator, bd, term_width));
+                    const full_seg = try renderBackdropSegment(allocator, bd, term_width);
+                    defer allocator.free(full_seg);
+                    try writer.writeAll(full_seg);
                 }
             } else {
-                try writer.writeAll(try renderBackdropSegment(allocator, bd, term_width));
+                const full_seg = try renderBackdropSegment(allocator, bd, term_width);
+                defer allocator.free(full_seg);
+                try writer.writeAll(full_seg);
             }
         }
 
@@ -457,26 +466,48 @@ pub const Modal = struct {
         const writer = &result.writer;
 
         // ── Top border ──
-        try writer.writeAll(try bdr_s.render(allocator, bc.top_left));
+        {
+            const top_left = try bdr_s.render(allocator, bc.top_left);
+            defer allocator.free(top_left);
+            try writer.writeAll(top_left);
+        }
         if (self.title.len > 0) {
             const title_w = measure.width(self.title);
             // top + space + title + space + remaining top chars
             const used: usize = 3 + title_w; // 1 top + 1 space + title + 1 space
             const remaining: usize = if (inner_w > used) inner_w - used else 0;
 
-            try writer.writeAll(try bdr_s.render(allocator, bc.horizontal));
-            try writer.writeAll(try bdr_s.render(allocator, " "));
-            try writer.writeAll(try self.title_style.inline_style(true).render(allocator, self.title));
-            try writer.writeAll(try bdr_s.render(allocator, " "));
-            try writer.writeAll(try repeatStr(allocator, bdr_s, bc.horizontal, remaining));
+            const h1 = try bdr_s.render(allocator, bc.horizontal);
+            defer allocator.free(h1);
+            try writer.writeAll(h1);
+            const sp1 = try bdr_s.render(allocator, " ");
+            defer allocator.free(sp1);
+            try writer.writeAll(sp1);
+            const title_r = try self.title_style.inline_style(true).render(allocator, self.title);
+            defer allocator.free(title_r);
+            try writer.writeAll(title_r);
+            const sp2 = try bdr_s.render(allocator, " ");
+            defer allocator.free(sp2);
+            try writer.writeAll(sp2);
+            const top_fill = try repeatStr(allocator, bdr_s, bc.horizontal, remaining);
+            defer allocator.free(top_fill);
+            try writer.writeAll(top_fill);
         } else {
-            try writer.writeAll(try repeatStr(allocator, bdr_s, bc.horizontal, inner_w));
+            const top_fill = try repeatStr(allocator, bdr_s, bc.horizontal, inner_w);
+            defer allocator.free(top_fill);
+            try writer.writeAll(top_fill);
         }
-        try writer.writeAll(try bdr_s.render(allocator, bc.top_right));
+        {
+            const top_right = try bdr_s.render(allocator, bc.top_right);
+            defer allocator.free(top_right);
+            try writer.writeAll(top_right);
+        }
 
         // Helpers for inner lines
         const styled_left = try bdr_s.render(allocator, bc.vertical);
+        defer allocator.free(styled_left);
         const styled_right = try bdr_s.render(allocator, bc.vertical);
+        defer allocator.free(styled_right);
 
         // ── Top padding ──
         for (0..self.padding.top) |_| {
@@ -495,19 +526,29 @@ pub const Modal = struct {
             try writer.writeAll(styled_left);
 
             // Left padding
-            try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, self.padding.left)));
+            const left_spaces = try nSpaces(allocator, self.padding.left);
+            defer allocator.free(left_spaces);
+            const left_pad = try pad_s.render(allocator, left_spaces);
+            defer allocator.free(left_pad);
+            try writer.writeAll(left_pad);
 
             // Body text
             var merged_body = self.body_style.inline_style(true);
             if (!self.content_bg.isNone() and merged_body.background.isNone()) {
                 merged_body = merged_body.bg(self.content_bg);
             }
-            try writer.writeAll(try merged_body.render(allocator, line));
+            const body_r = try merged_body.render(allocator, line);
+            defer allocator.free(body_r);
+            try writer.writeAll(body_r);
 
             // Right fill
             const line_w = measure.width(line);
             const fill: usize = if (content_w > line_w) content_w - line_w else 0;
-            try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, fill + self.padding.right)));
+            const right_spaces = try nSpaces(allocator, fill + self.padding.right);
+            defer allocator.free(right_spaces);
+            const right_pad = try pad_s.render(allocator, right_spaces);
+            defer allocator.free(right_pad);
+            try writer.writeAll(right_pad);
 
             try writer.writeAll(styled_right);
         }
@@ -526,17 +567,27 @@ pub const Modal = struct {
 
             try writer.writeByte('\n');
             try writer.writeAll(styled_left);
-            try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, self.padding.left)));
+            const f_left = try nSpaces(allocator, self.padding.left);
+            defer allocator.free(f_left);
+            const f_left_pad = try pad_s.render(allocator, f_left);
+            defer allocator.free(f_left_pad);
+            try writer.writeAll(f_left_pad);
 
             var merged_footer = self.footer_style.inline_style(true);
             if (!self.content_bg.isNone() and merged_footer.background.isNone()) {
                 merged_footer = merged_footer.bg(self.content_bg);
             }
-            try writer.writeAll(try merged_footer.render(allocator, footer_text));
+            const foot_r = try merged_footer.render(allocator, footer_text);
+            defer allocator.free(foot_r);
+            try writer.writeAll(foot_r);
 
             const fw = measure.width(footer_text);
             const fill: usize = if (content_w > fw) content_w - fw else 0;
-            try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, fill + self.padding.right)));
+            const f_right = try nSpaces(allocator, fill + self.padding.right);
+            defer allocator.free(f_right);
+            const f_right_pad = try pad_s.render(allocator, f_right);
+            defer allocator.free(f_right_pad);
+            try writer.writeAll(f_right_pad);
             try writer.writeAll(styled_right);
         }
 
@@ -553,18 +604,24 @@ pub const Modal = struct {
             for (self.buttons[0..self.button_count], 0..) |maybe_btn, i| {
                 if (maybe_btn) |btn| {
                     if (i > 0) {
-                        try btn_writer.writeAll(try pad_s.render(allocator, "  "));
+                        const gap = try pad_s.render(allocator, "  ");
+                        defer allocator.free(gap);
+                        try btn_writer.writeAll(gap);
                     }
                     const label = try std.fmt.allocPrint(allocator, " {s} ", .{btn.label});
+                    defer allocator.free(label);
                     var btn_style = if (i == self.selected_button) self.button_active_style else self.button_inactive_style;
                     btn_style = btn_style.inline_style(true);
                     if (!self.content_bg.isNone() and i != self.selected_button and btn_style.background.isNone()) {
                         btn_style = btn_style.bg(self.content_bg);
                     }
-                    try btn_writer.writeAll(try btn_style.render(allocator, label));
+                    const btn_r = try btn_style.render(allocator, label);
+                    defer allocator.free(btn_r);
+                    try btn_writer.writeAll(btn_r);
                 }
             }
             const btn_row = try btn_buf.toOwnedSlice();
+            defer allocator.free(btn_row);
             const btn_row_w = measure.width(btn_row);
 
             try writer.writeByte('\n');
@@ -584,9 +641,17 @@ pub const Modal = struct {
             else
                 0;
 
-            try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, left_spaces)));
+            const b_left = try nSpaces(allocator, left_spaces);
+            defer allocator.free(b_left);
+            const b_left_pad = try pad_s.render(allocator, b_left);
+            defer allocator.free(b_left_pad);
+            try writer.writeAll(b_left_pad);
             try writer.writeAll(btn_row);
-            try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, right_spaces)));
+            const b_right = try nSpaces(allocator, right_spaces);
+            defer allocator.free(b_right);
+            const b_right_pad = try pad_s.render(allocator, b_right);
+            defer allocator.free(b_right_pad);
+            try writer.writeAll(b_right_pad);
 
             try writer.writeAll(styled_right);
         }
@@ -599,9 +664,21 @@ pub const Modal = struct {
 
         // ── Bottom border ──
         try writer.writeByte('\n');
-        try writer.writeAll(try bdr_s.render(allocator, bc.bottom_left));
-        try writer.writeAll(try repeatStr(allocator, bdr_s, bc.horizontal, inner_w));
-        try writer.writeAll(try bdr_s.render(allocator, bc.bottom_right));
+        {
+            const b_left_c = try bdr_s.render(allocator, bc.bottom_left);
+            defer allocator.free(b_left_c);
+            try writer.writeAll(b_left_c);
+        }
+        {
+            const b_fill = try repeatStr(allocator, bdr_s, bc.horizontal, inner_w);
+            defer allocator.free(b_fill);
+            try writer.writeAll(b_fill);
+        }
+        {
+            const b_right_c = try bdr_s.render(allocator, bc.bottom_right);
+            defer allocator.free(b_right_c);
+            try writer.writeAll(b_right_c);
+        }
 
         return result.toOwnedSlice();
     }
@@ -619,7 +696,11 @@ pub const Modal = struct {
     ) !void {
         _ = self;
         try writer.writeAll(styled_left);
-        try writer.writeAll(try pad_s.render(allocator, try nSpaces(allocator, inner_w)));
+        const spaces = try nSpaces(allocator, inner_w);
+        defer allocator.free(spaces);
+        const pad = try pad_s.render(allocator, spaces);
+        defer allocator.free(pad);
+        try writer.writeAll(pad);
         try writer.writeAll(styled_right);
     }
 
@@ -701,6 +782,7 @@ pub const Modal = struct {
         const ch = bd.char;
         if (ch.len == 0) return try allocator.dupe(u8, "");
         const buf = try allocator.alloc(u8, ch.len * count);
+        defer allocator.free(buf);
         for (0..count) |i| {
             @memcpy(buf[i * ch.len ..][0..ch.len], ch);
         }
@@ -711,6 +793,7 @@ pub const Modal = struct {
         if (count == 0 or str.len == 0) return try allocator.dupe(u8, "");
         // Build repeated plain string, then style once
         const buf = try allocator.alloc(u8, str.len * count);
+        defer allocator.free(buf);
         for (0..count) |i| {
             @memcpy(buf[i * str.len ..][0..str.len], str);
         }

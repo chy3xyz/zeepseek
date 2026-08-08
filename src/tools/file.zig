@@ -342,7 +342,7 @@ test "file_write basic" {
 
 test "resolvePath normalizes traversal so sandbox prefix checks work (M3)" {
     const alloc = std.testing.allocator;
-    const resolved = try resolvePath(alloc, "/home/user/proj", "../../etc/passwd");
+    const resolved = try resolvePath(alloc, "/home/user/proj", "../../../etc/passwd");
     defer alloc.free(resolved);
     try std.testing.expectEqualSlices(u8, "/etc/passwd", resolved);
 

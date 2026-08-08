@@ -1,6 +1,6 @@
 const std = @import("std");
 
-/// Canonical keyspace prefixes shared by store, store_api, and mock_store.
+/// Canonical keyspace prefixes shared by store and store_api.
 pub const Keyspace = enum(u8) {
     session = 's',
     cache = 'c',

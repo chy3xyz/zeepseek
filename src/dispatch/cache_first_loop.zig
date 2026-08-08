@@ -137,7 +137,7 @@ pub const CacheFirstLoop = struct {
     }
 
     pub fn steer(self: *CacheFirstLoop, message: []const u8) void {
-        if (self.auto_switch) {
+        if (self.auto_switch and !isModelSwitchDirective(message)) {
             const selection = self.selectModelForTask(message);
             self.applyModelSelection(selection);
         }
@@ -145,7 +145,9 @@ pub const CacheFirstLoop = struct {
         switch (decision) {
             .none => {},
             .fold_normal, .fold_aggressive => {
-                _ = try self.context.foldHistory(self.model_name, decision, null, null);
+                // steer() cannot propagate errors; a fold failure is
+                // non-fatal (the request proceeds on the full context).
+                _ = self.context.foldHistory(self.model_name, decision, null, null) catch {};
             },
             .exit_with_summary => {},
             .emergency_truncate => {
@@ -339,6 +341,19 @@ pub const CacheFirstLoop = struct {
         return .miss;
     }
 };
+
+fn isModelSwitchDirective(message: []const u8) bool {
+    var buf: [256]u8 = undefined;
+    const lower = std.ascii.lowerString(&buf, message);
+    defer {
+        if (lower.ptr != &buf) std.heap.page_allocator.free(lower);
+    }
+    const needles = [_][]const u8{ "switch to", "use model", "/model", "change model" };
+    for (needles) |n| {
+        if (std.mem.indexOf(u8, lower, n) != null) return true;
+    }
+    return false;
+}
 
 pub const StreamState = struct {
     iterator: stream_client.StreamIterator,

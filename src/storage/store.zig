@@ -41,7 +41,7 @@ pub const Store = struct {
         const meta_path = try std.mem.concat(alloc, u8, &.{ options.data_dir, "/meta.json" });
 
         var inner = try alloc.create(mmap_store.MmapStore);
-        inner.* = try mmap_store.MmapStore.init(alloc, store_path, options.hot_region_size, options.cold_region_size);
+        inner.* = try mmap_store.MmapStore.init(allocator, store_path, options.hot_region_size, options.cold_region_size);
         errdefer inner.deinit();
 
         if (options.wal_enabled) {
@@ -135,7 +135,7 @@ test "store basic" {
     const val2 = store.get("test:key2");
     try std.testing.expectEqualSlices(u8, "world", val2.?);
 
-    store.delete("test:key1");
+    try store.delete("test:key1");
     try std.testing.expect(store.get("test:key1") == null);
 }
 

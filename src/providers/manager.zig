@@ -2,6 +2,9 @@ const std = @import("std");
 const Provider = @import("mod.zig").Provider;
 const Model = @import("models.zig").Model;
 
+/// Default model used when no explicit model is selected.
+pub const DefaultModel: []const u8 = "deepseek-v4-flash";
+
 pub const ProviderConfig = struct {
     provider_id: []const u8,
     api_key: []const u8,
@@ -120,7 +123,7 @@ pub const ProviderManager = struct {
         if (self.configs.get(provider_id)) |cfg| {
             return cfg.default_model;
         }
-        return "deepseek-chat";
+        return DefaultModel;
     }
 };
 

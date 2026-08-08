@@ -61,14 +61,13 @@ pub const MmapStore = struct {
         errdefer std.Io.File.close(hot_file, io);
 
         const hot_path = try std.mem.concat(allocator, u8, &.{ data_dir_path, "/cold.mdb" });
-        errdefer allocator.free(hot_path);
+        defer allocator.free(hot_path);
 
         const cold_file = try std.Io.Dir.createFileAbsolute(io, hot_path, .{
             .truncate = true,
             .read = true,
         });
         errdefer std.Io.File.close(cold_file, io);
-        allocator.free(hot_path);
 
         try std.Io.File.setLength(hot_file, io, @intCast(hot_size));
         try std.Io.File.setLength(cold_file, io, @intCast(cold_size));

@@ -35,7 +35,7 @@ User input ──► App.update(.key) ──► onKey ──► submit()
 |---|---|
 | **Wired & used** | `net/stream_client` + `net/h2_client` (+ vendor TLS/HPACK), `net/http_client2`, `tools/` (shell/file/git/web), `utils/sandbox`, `utils/dangerous_patterns`, `storage/session_format`, `providers/manager`, `cache/reasonix` (context folding in `startStreaming` + exact-prompt semantic cache), `ui/` (app, slash dispatcher, theme) |
 | **Half-wired (init only)** | `dispatch/cache_first_loop`, `dispatch/context_manager` (not invoked by the streaming path), `i18n/manager` (only one string used) |
-| **Isolated / experimental** | `agent/subagent` scheduler (app uses its own threads), `skills/` (registry exists; `/skills` hardcodes 3 names), `acp/` (Agent Client Protocol, test-only), `rlm/` (long-term memory, **zero imports**), `storage/session_manager` + `mmap_store` + `store*` (TurboDB not wired), `providers/mod` + `models` (test-only) |
+| **Isolated / experimental** | `agent/subagent` scheduler (app uses its own threads), `skills/` (registry exists; `/skills` hardcodes 3 names), `acp/` (Agent Client Protocol, test-only), `storage/session_manager` + `mmap_store` + `store*` (TurboDB not wired), `providers/mod` + `models` (test-only) |
 
 These isolated modules compile and have unit tests but do **not** affect
 runtime behavior. Treat them as experimental until wired.

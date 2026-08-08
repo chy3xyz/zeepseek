@@ -193,12 +193,14 @@ pub fn ansiOverlay(a: std.mem.Allocator, base: []const u8, content: []const u8, 
 
 pub fn appendIntFn(out: *std.ArrayList(u8), a: std.mem.Allocator, val: anytype) void {
     if (std.fmt.allocPrint(a, "{d}", .{val})) |s| {
+        defer a.free(s);
         out.appendSlice(a, s) catch {};
     } else |_| {}
 }
 
 pub fn appendFmtFn(out: *std.ArrayList(u8), a: std.mem.Allocator, comptime fmt: []const u8, args: anytype) void {
     if (std.fmt.allocPrint(a, fmt, args)) |s| {
+        defer a.free(s);
         out.appendSlice(a, s) catch {};
     } else |_| {}
 }
@@ -312,6 +314,7 @@ pub fn renderClaudeHeader(app: *const App, out: *std.ArrayList(u8), a: std.mem.A
         right_buf.appendSlice(a, R) catch {};
     }
     const right_text = right_buf.toOwnedSlice(a) catch "";
+    defer if (right_text.len > 0) a.free(right_text);
     const right_len = zz.layout.measure.width(right_text);
 
     const left_text = " zeepseek ";
@@ -393,19 +396,15 @@ pub fn renderClaudeInput(app: *App, out: *std.ArrayList(u8), a: std.mem.Allocato
         app.text_input.setPlaceholder("Type a message, or / for commands");
     }
 
+    // The caret is rendered by the TextInput component itself at the correct
+    // cursor position; drive its blink gate each frame (set before view()).
+    app.text_input.cursor_visible = app.cursor_visible;
     const input_view = app.text_input.view(a) catch "Error";
     defer if (input_view.ptr != "Error".ptr) a.free(input_view);
     const input_vis = zz.layout.measure.width(input_view);
     const max_input = if (w > 4) w - 4 else 0;
-    const input_with_cursor = blk: {
-        if (app.cursor_visible) {
-            break :blk std.fmt.allocPrint(a, "{s}|", .{input_view}) catch input_view;
-        }
-        break :blk input_view;
-    };
-    defer if (input_with_cursor.ptr != input_view.ptr and input_with_cursor.len > 0) a.free(input_with_cursor);
     const display_input = if (input_vis > max_input)
-        (ansiClip(a, input_with_cursor, max_input) catch input_with_cursor)
+        (ansiClip(a, input_view, max_input) catch input_view)
     else
         input_view;
     defer if (display_input.ptr != input_view.ptr) a.free(display_input);
@@ -745,9 +744,13 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
     const panel_w: u16 = @min(w, 48);
     var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(a);
+    var owned = std.ArrayList([]const u8).empty;
+    defer owned.deinit(a);
+    defer for (owned.items) |s| if (s.len > 0) a.free(s);
 
     const bo = Pal.fg_dim;
     const title = std.fmt.allocPrint(a, "{s}┌─ Sub-Agents {s}", .{ bo, R }) catch "";
+    owned.append(a, title) catch {};
     lines.append(a, title) catch {};
     const top_pad = panel_w -| 15;
     var top_line = std.ArrayList(u8).empty;
@@ -756,10 +759,14 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
     while (i < top_pad) : (i += 1) { top_line.appendSlice(a, "─") catch {}; }
     top_line.appendSlice(a, "┐") catch {};
     top_line.appendSlice(a, R) catch {};
-    lines.items[0] = top_line.toOwnedSlice(a) catch title;
+    const top = top_line.toOwnedSlice(a) catch title;
+    owned.append(a, top) catch {};
+    lines.items[0] = top;
 
     if (app.subagents.items.len == 0) {
-        lines.append(a, std.fmt.allocPrint(a, "{s}│{s}  No active sub-agents  {s}│{s}", .{ bo, R, bo, R }) catch "") catch {};
+        const no_sub = std.fmt.allocPrint(a, "{s}│{s}  No active sub-agents  {s}│{s}", .{ bo, R, bo, R }) catch "";
+        owned.append(a, no_sub) catch {};
+        lines.append(a, no_sub) catch {};
     } else {
         for (app.subagents.items) |sa| {
             const status_icon: []const u8 = switch (sa.status) {
@@ -773,10 +780,13 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
             const line = std.fmt.allocPrint(a, "{s}│{s} {s} {s}: {s}{s}│{s}", .{
                 bo, R, status_icon, sa.id, role_name, bo, R,
             }) catch "";
+            owned.append(a, line) catch {};
             lines.append(a, line) catch {};
         }
     }
-    lines.append(a, std.fmt.allocPrint(a, "{s}└──────────────────────────────────────┘{s}", .{ bo, R }) catch "") catch {};
+    const bottom = std.fmt.allocPrint(a, "{s}└──────────────────────────────────────┘{s}", .{ bo, R }) catch "";
+    owned.append(a, bottom) catch {};
+    lines.append(a, bottom) catch {};
 
     return join.vertical(a, .left, lines.items) catch "";
 }

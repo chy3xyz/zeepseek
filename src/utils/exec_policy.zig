@@ -1,4 +1,5 @@
 const std = @import("std");
+const array_list = std.array_list;
 const ZeepError = @import("error.zig").ZeepError;
 const dangerous_patterns = @import("dangerous_patterns.zig");
 
@@ -43,9 +44,12 @@ pub const ExecPolicy = struct {
         var policy = try a.create(ExecPolicy);
         policy.* = .{
             .arena = arena,
-            .permissions = std.StringHashMap(ToolPermission).init(a),
-            .config_entries = std.StringHashMap(ApprovalMode).init(a),
+            .permissions = undefined,
+            .config_entries = undefined,
         };
+        const stable = policy.arena.allocator();
+        policy.permissions = std.StringHashMap(ToolPermission).init(stable);
+        policy.config_entries = std.StringHashMap(ApprovalMode).init(stable);
 
         try policy.initDefaults();
 
@@ -152,21 +156,28 @@ pub const ExecPolicy = struct {
     }
 
     pub fn persistToConfig(self: *ExecPolicy, alloc: std.mem.Allocator) ![]const u8 {
-        var buf = std.ArrayList(u8).init(alloc);
-        defer buf.deinit();
-        const w = buf.writer();
-
-        try w.writeAll("# Tool execution policies\n");
+        var content = std.ArrayList(u8).empty;
+        defer content.deinit(alloc);
+        try content.appendSlice(alloc, "# Tool execution policies\n");
         var iter = self.config_entries.iterator();
         while (iter.next()) |entry| {
-            try w.print("tool.{s}.mode={s}\n", .{ entry.key_ptr.*, entry.value_ptr.toString() });
+            const line = try std.fmt.allocPrint(alloc, "tool.{s}.mode={s}\n", .{ entry.key_ptr.*, entry.value_ptr.toString() });
+            defer alloc.free(line);
+            try content.appendSlice(alloc, line);
         }
 
-        return try buf.toOwnedSlice();
+        return content.toOwnedSlice(alloc);
     }
 
     pub fn listPermissions(self: *const ExecPolicy) []const ToolPermission {
-        return self.permissions.values();
+        const a = self.arena.allocator();
+        var list = std.ArrayList(ToolPermission).empty;
+        defer list.deinit(a);
+        var it = self.permissions.iterator();
+        while (it.next()) |entry| {
+            list.append(a, entry.value_ptr.*) catch break;
+        }
+        return list.toOwnedSlice(a) catch return &.{};
     }
 
     pub fn checkDangerous(self: *ExecPolicy, command: []const u8) ?dangerous_patterns.DangerousPattern {

@@ -78,7 +78,7 @@ User Input → UI (onKey) → dispatch (cache_first_loop) →
 | Directory | Key Files | Purpose |
 |-----------|-----------|---------|
 | `src/ui/` | `app.zig` (2359 LOC), `layout.zig`, `chat_panel.zig`, `input_area.zig`, `command_palette.zig`, `markdown.zig`, `theme.zig` | Full TUI implementation |
-| `src/net/` | `stream_client.zig`, `http_client.zig`, `deepseek_client.zig`, `sse_parser.zig`, `sse.zig`, `rate_limiter.zig`, `circuit_breaker.zig` | API communication, streaming, resilience |
+| `src/net/` | `stream_client.zig`, `http_client.zig`, `deepseek_client.zig` | API communication, streaming, resilience (SSE parsing, rate limiting and circuit breaking live inline in `stream_client.zig`/`http_client.zig`) |
 | `src/cache/` | `reasonix.zig` | Semantic cache with LIRS eviction, 3-tier TTL, similarity matching |
 | `src/dispatch/` | `cache_first_loop.zig`, `context_manager.zig` | Orchestrates cache → API → stream, context budget tracking |
 | `src/storage/` | `store.zig`, `mmap_store.zig`, `session_manager.zig`, `recovery.zig`, `migrations.zig`, `keyspace.zig` | Persistent storage |
@@ -89,7 +89,6 @@ User Input → UI (onKey) → dispatch (cache_first_loop) →
 | `src/i18n/` | `manager.zig`, `strings.zig` | Internationalization (en, ja, zh-Hans, pt-BR) |
 | `src/utils/` | `config.zig`, `sandbox.zig`, `tokenizer.zig`, `validation.zig`, `error.zig`, `exec_policy.zig`, `idle_optimizer.zig`, `notifications.zig`, `dangerous.zig`, `dangerous_patterns.zig`, `tool_registry.zig` | Shared infrastructure |
 | `src/acp/` | `mod.zig`, `zed_adapter.zig` | ACP / Zed adapter |
-| `src/rlm/` | `mod.zig` | RLM session management |
 | `src/workspace/` | `side_git.zig` | Lightweight workspace snapshot system using git |
 | `src/` | `serve_http.zig` | Optional embedded HTTP server |
 
@@ -171,13 +170,15 @@ comptime {
 
 ### Adding New Tests
 
-When you create a new module with tests, add the import to `src/test_runner.zig`:
+When you create a new module with tests, add the import to the `comptime` block in `src/test_runner.zig`:
 
 ```zig
-const _my_module = @import("path/to/my_module.zig");
+comptime {
+    _ = @import("path/to/my_module.zig");
+}
 ```
 
-The underscore prefix suppresses the unused-import warning while still registering the tests.
+> **Zig 0.17 gotcha (verified):** a plain top-level `const _m = @import("path.zig");` does **NOT** register the module's tests in this compiler build — `zig build test` then runs zero of them silently. The import must appear inside a `comptime` block (or be referenced) for test collection to see it. A regression in this area shows up as `All 0 tests passed.`
 
 ### Test Patterns
 

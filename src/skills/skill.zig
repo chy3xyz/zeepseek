@@ -104,6 +104,34 @@ pub const Skill = struct {
     pub fn formatCommand(_: *const Skill, cmd: *const Command) []const u8 {
         return std.fmt.comptimePrint("/{s}", .{cmd.name});
     }
+
+    /// Free all strings/slices owned by this skill. `source` paths are not
+    /// freed here (they may reference owned or borrowed storage depending on
+    /// how the skill was constructed).
+    pub fn deinit(self: *Skill, alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.display_name);
+        alloc.free(self.description);
+        alloc.free(self.version);
+        alloc.free(self.author);
+        for (self.commands) |*cmd| {
+            alloc.free(cmd.name);
+            alloc.free(cmd.description);
+            alloc.free(cmd.usage);
+            alloc.free(cmd.handler);
+        }
+        alloc.free(self.commands);
+        for (self.tools) |t| alloc.free(t);
+        alloc.free(self.tools);
+        if (self.config_schema) |cs| {
+            alloc.free(cs);
+        }
+        for (self.prompts) |*prompt| {
+            alloc.free(prompt.name);
+            alloc.free(prompt.template);
+        }
+        alloc.free(self.prompts);
+    }
 };
 
 pub const ManifestRaw = struct {

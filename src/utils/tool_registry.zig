@@ -208,12 +208,17 @@ pub const ToolRegistry = struct {
         return self.tools.get(name);
     }
 
-    pub fn listTools(self: *const ToolRegistry) []const ToolDefinition {
-        return self.tools.values();
+    pub fn listTools(self: *ToolRegistry) []const ToolDefinition {
+        const a = self.arena.allocator();
+        var out = std.ArrayList(ToolDefinition).empty;
+        defer out.deinit(a);
+        var it = self.tools.iterator();
+        while (it.next()) |entry| out.append(a, entry.value_ptr.*) catch {};
+        return out.toOwnedSlice(a) catch &.{};
     }
 
-    pub fn listForPrompt(self: *const ToolRegistry) []const ToolDefinition {
-        return self.tools.values();
+    pub fn listForPrompt(self: *ToolRegistry) []const ToolDefinition {
+        return self.listTools();
     }
 
     pub fn checkSandbox(self: *const ToolRegistry, name: []const u8, sb: *sandbox_mod.Sandbox) bool {
@@ -244,6 +249,86 @@ pub const ToolRegistry = struct {
     }
 };
 
+/// Serialize every registered tool into the OpenAI `tools` array item format.
+/// Each item is `{"type":"function","function":{"name":...,"description":...,"parameters":<input_schema>}}`.
+/// Returns a comma-joined fragment with NO surrounding brackets, so callers can
+/// strip it inside an existing `[ ... ]` and append MCP tools afterward.
+/// Emitted in deterministic (sorted-by-name) order for reproducible requests.
+pub fn buildToolsJson(allocator: std.mem.Allocator) ![]u8 {
+    var registry = try ToolRegistry.init(allocator);
+    defer registry.deinit();
+
+    var names = std.ArrayList([]const u8).empty;
+    defer names.deinit(allocator);
+    var it = registry.tools.iterator();
+    while (it.next()) |entry| {
+        try names.append(allocator, entry.key_ptr.*);
+    }
+    if (names.items.len == 0) return allocator.dupe(u8, "");
+    std.mem.sort([]const u8, names.items, {}, lessThanName);
+
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (names.items, 0..) |name, i| {
+        const t = registry.tools.get(name) orelse continue;
+        if (i > 0) try out.append(allocator, ',');
+        try out.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":\"");
+        try out.appendSlice(allocator, t.name);
+        try out.appendSlice(allocator, "\",\"description\":\"");
+        try escapeJson(allocator, &out, t.description);
+        try out.appendSlice(allocator, "\",\"parameters\":");
+        try out.appendSlice(allocator, t.input_schema);
+        try out.appendSlice(allocator, "}}");
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn lessThanName(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
+fn escapeJson(allocator: std.mem.Allocator, out: *std.ArrayList(u8), input: []const u8) !void {
+    for (input) |c| {
+        switch (c) {
+            '"' => try out.appendSlice(allocator, "\\\""),
+            '\\' => try out.appendSlice(allocator, "\\\\"),
+            '\n' => try out.appendSlice(allocator, "\\n"),
+            '\r' => try out.appendSlice(allocator, "\\r"),
+            '\t' => try out.appendSlice(allocator, "\\t"),
+            else => try out.append(allocator, c),
+        }
+    }
+}
+
+test "buildToolsJson covers all registered tools" {
+    const alloc = std.testing.allocator;
+    const json = try buildToolsJson(alloc);
+    defer alloc.free(json);
+
+    // Every registered builtin name must appear as a function declaration.
+    const names = [_][]const u8{
+        "shell",     "file_read", "file_write", "file_edit", "git_status", "git_log",
+        "git_diff",  "git_commit", "glob",       "grep",      "web_search", "web_scrape",
+    };
+    var count: usize = 0;
+    var needle_buf: [128]u8 = undefined;
+    for (names) |n| {
+        const needle = std.fmt.bufPrint(&needle_buf, "\"name\":\"{s}\"", .{n}) catch unreachable;
+        if (std.mem.indexOf(u8, json, needle) != null) count += 1;
+    }
+    try std.testing.expectEqual(names.len, count);
+
+    // Deterministic ordering: sorted by name.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"file_edit\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"git_commit\"") != null);
+    const f = std.mem.indexOf(u8, json, "\"name\":\"file_").?;
+    const g = std.mem.indexOf(u8, json, "\"name\":\"git_").?;
+    try std.testing.expect(f < g);
+
+    // Each item embeds a valid JSON object schema.
+    try std.testing.expect(std.mem.startsWith(u8, json, "{\"type\":\"function\""));
+}
+
 test "tool registry init has builtins" {
     const alloc = std.testing.allocator;
     var registry = try ToolRegistry.init(alloc);
@@ -253,6 +338,8 @@ test "tool registry init has builtins" {
     try std.testing.expect(registry.get("file_read") != null);
     try std.testing.expect(registry.get("file_write") != null);
     try std.testing.expect(registry.get("git_status") != null);
+    try std.testing.expect(registry.get("git_log") != null);
+    try std.testing.expect(registry.get("git_diff") != null);
     try std.testing.expect(registry.get("git_commit") != null);
     try std.testing.expect(registry.get("glob") != null);
     try std.testing.expect(registry.get("grep") != null);

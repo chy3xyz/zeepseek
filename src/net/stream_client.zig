@@ -6,6 +6,7 @@ const CircuitBreaker = @import("http_client.zig").CircuitBreaker;
 const CacheConfig = @import("http_client.zig").CacheConfig;
 const http2 = @import("http_client2.zig");
 const h2_client = @import("h2_client.zig");
+const tool_registry = @import("../utils/tool_registry.zig");
 
 fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8, output: *std.ArrayList(u8)) !void {
     for (input) |c| {
@@ -20,7 +21,7 @@ fn escapeJsonString(allocator: std.mem.Allocator, input: []const u8, output: *st
     }
 }
 
-pub const CtxItem = struct { role: []const u8, content: []const u8, tool_call_id: []const u8 = "" };
+pub const CtxItem = struct { role: []const u8, content: []const u8, tool_call_id: []const u8 = "", tool_calls_json: []const u8 = "" };
 
 pub const ThinkingConfig = struct {
     enabled: bool = true,
@@ -51,6 +52,55 @@ fn unescapeJsonString(allocator: std.mem.Allocator, input: []const u8) ![]const 
         }
         return result.toOwnedSlice(allocator);
     }
+/// Parse an OpenAI/DeepSeek API error body (JSON) into a concise
+/// human-readable detail string. Falls back to the raw body if the JSON
+/// does not contain an expected message field or cannot be parsed.
+pub fn formatHttpErrorDetail(allocator: std.mem.Allocator, status: u16, body: []const u8) []const u8 {
+    if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
+        defer parsed.deinit();
+        const root = parsed.value;
+        var msg: ?[]const u8 = null;
+        if (root == .object) {
+            const o = root.object;
+            if (o.get("error")) |e| {
+                if (e == .object) {
+                    if (e.object.get("message")) |m| {
+                        msg = switch (m) {
+                            .string => |s| s,
+                            else => null,
+                        };
+                    }
+                }
+            }
+            if (msg == null) {
+                if (o.get("message")) |m| {
+                    msg = switch (m) {
+                        .string => |s| s,
+                        else => null,
+                    };
+                }
+            }
+            if (msg == null) {
+                if (o.get("detail")) |d| {
+                    msg = switch (d) {
+                        .string => |s| s,
+                        else => null,
+                    };
+                }
+            }
+        }
+        if (msg) |m| {
+            const trimmed = std.mem.trim(u8, m, " \t\r\n");
+            if (trimmed.len > 0) {
+                return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status, trimmed }) catch "";
+            }
+        }
+    } else |_| {}
+
+    // No parseable JSON message — surface the raw payload so the cause is visible.
+    return std.fmt.allocPrint(allocator, "HTTP {d}: {s}", .{ status, body }) catch "";
+}
+
 pub const DeepSeekStreamClient = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -210,11 +260,21 @@ pub const DeepSeekStreamClient = struct {
                 try body.appendSlice(self.allocator, "\",\"tool_call_id\":\"");
                 try escapeJsonString(self.allocator, ctx.tool_call_id, &body);
                 try body.appendSlice(self.allocator, "\",\"content\":\"");
+                try escapeJsonString(self.allocator, ctx.content, &body);
+                try body.appendSlice(self.allocator, "\"}");
+            } else if (ctx.tool_calls_json.len > 0) {
+                // Assistant message that requested tool calls: echo the
+                // tool_calls array (and null content) so the API accepts the
+                // subsequent tool `role` results. Without this the native
+                // function-calling loop is rejected.
+                try body.appendSlice(self.allocator, "\",\"content\":null,\"tool_calls\":");
+                try body.appendSlice(self.allocator, ctx.tool_calls_json);
+                try body.appendSlice(self.allocator, "}");
             } else {
                 try body.appendSlice(self.allocator, "\",\"content\":\"");
+                try escapeJsonString(self.allocator, ctx.content, &body);
+                try body.appendSlice(self.allocator, "\"}");
             }
-            try escapeJsonString(self.allocator, ctx.content, &body);
-            try body.appendSlice(self.allocator, "\"}");
         }
 
         if (body.items.len > 0 and body.items[body.items.len - 1] != '[') {
@@ -225,22 +285,12 @@ pub const DeepSeekStreamClient = struct {
         try body.appendSlice(self.allocator, "\"}");
 
         try body.appendSlice(self.allocator, "],\"tools\":[");
-        // Shell tool
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"shell\",\"description\":\"Execute a shell command. Returns stdout/stderr.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"Shell command to execute\"}},\"required\":[\"command\"]}}},");
-        // File read
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"file_read\",\"description\":\"Read contents of a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\",\"description\":\"File path\"}},\"required\":[\"path\"]}}},");
-        // File write
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"file_write\",\"description\":\"Write content to a file.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"content\":{\"type\":\"string\"}},\"required\":[\"path\",\"content\"]}}},");
-        // File edit
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"file_edit\",\"description\":\"Edit a file by replacing oldString with newString.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"path\":{\"type\":\"string\"},\"oldString\":{\"type\":\"string\"},\"newString\":{\"type\":\"string\"}},\"required\":[\"path\",\"oldString\",\"newString\"]}}},");
-        // Git status
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"git_status\",\"description\":\"Show git repository status.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"repo\":{\"type\":\"string\"}},\"required\":[]}}},");
-        // Git commit
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"git_commit\",\"description\":\"Create a git commit.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"message\":{\"type\":\"string\"},\"all\":{\"type\":\"boolean\"}},\"required\":[\"message\"]}}},");
-        // Web search
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_search\",\"description\":\"Search the web.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"query\":{\"type\":\"string\"},\"limit\":{\"type\":\"integer\"}},\"required\":[\"query\"]}}},");
-        // Web scrape
-        try body.appendSlice(self.allocator, "{\"type\":\"function\",\"function\":{\"name\":\"web_scrape\",\"description\":\"Fetch and extract content from a URL.\",\"parameters\":{\"type\":\"object\",\"properties\":{\"url\":{\"type\":\"string\"}},\"required\":[\"url\"]}}}");
+        // Native function-calling declarations generated from the single source
+        // of truth (ToolRegistry) so request schemas can never drift from what
+        // the executor actually knows. Comma-joined, no outer brackets.
+        const tools_json = try tool_registry.buildToolsJson(self.allocator);
+        defer self.allocator.free(tools_json);
+        try body.appendSlice(self.allocator, tools_json);
         if (self.extra_tools.len > 0) {
             try body.appendSlice(self.allocator, ",");
             try body.appendSlice(self.allocator, self.extra_tools);
@@ -600,6 +650,7 @@ pub const ToolCallRepairPipeline = struct {
             if (i + 5 <= json_data.len and std.mem.eql(u8, json_data[i..i+5], "\"tool")) {
                 const tc_result = try self.parseToolCallsFromDelta(json_data, &i);
                 if (tc_result) |calls| {
+                    defer self.allocator.free(calls);
                     for (calls) |call| {
                         try extracted_calls.append(self.allocator, call);
                     }
@@ -856,6 +907,15 @@ pub const ToolCallRepairPipeline = struct {
     }
 };
 
+fn freeToolCalls(alloc: std.mem.Allocator, calls: []const ToolCallRepairPipeline.ToolCallExtracted) void {
+    for (calls) |call| {
+        if (call.id.len > 0) alloc.free(call.id);
+        if (call.name.len > 0) alloc.free(call.name);
+        if (call.arguments.len > 0) alloc.free(call.arguments);
+        if (call.signature.len > 0) alloc.free(call.signature);
+    }
+}
+
 test "tool call repair pipeline init and deinit" {
     var pipeline = ToolCallRepairPipeline.init(std.testing.allocator);
     defer pipeline.deinit();
@@ -869,6 +929,7 @@ test "tool call repair pipeline basic parse" {
     const json = "{\"tool_calls\":[{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]}";
     const result = try pipeline.processChunk(json);
     defer std.testing.allocator.free(result.calls);
+    defer freeToolCalls(std.testing.allocator, result.calls);
 
     try std.testing.expect(result.calls.len == 1);
     try std.testing.expectEqualSlices(u8, "bash", result.calls[0].name);
@@ -886,10 +947,13 @@ test "tool call repair pipeline suppress repeats" {
 
     const result1 = try pipeline.processChunk(json1);
     defer std.testing.allocator.free(result1.calls);
+    defer freeToolCalls(std.testing.allocator, result1.calls);
     const result2 = try pipeline.processChunk(json2);
     defer std.testing.allocator.free(result2.calls);
+    defer freeToolCalls(std.testing.allocator, result2.calls);
     const result3 = try pipeline.processChunk(json3);
     defer std.testing.allocator.free(result3.calls);
+    defer freeToolCalls(std.testing.allocator, result3.calls);
 
     try std.testing.expectEqual(@as(usize, 1), result1.calls.len);
     try std.testing.expectEqual(@as(usize, 1), result2.calls.len);
@@ -916,10 +980,11 @@ test "tool call repair pipeline extract single call" {
 
     const obj = "{\"index\":2,\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\\\"a.txt\\\"}\"}}";
     const extracted = try pipeline.extractSingleToolCall(obj);
-    try std.testing.expect(extracted != null);
-    try std.testing.expectEqual(@as(usize, 2), extracted.?.index);
-    try std.testing.expectEqualSlices(u8, "read_file", extracted.?.name);
-    try std.testing.expectEqualSlices(u8, "{\"path\":\"a.txt\"}", extracted.?.arguments);
+    const call = extracted orelse return error.TestUnexpectedResult;
+    defer freeToolCalls(std.testing.allocator, &.{call});
+    try std.testing.expectEqual(@as(usize, 2), call.index);
+    try std.testing.expectEqualSlices(u8, "read_file", call.name);
+    try std.testing.expectEqualSlices(u8, "{\"path\":\"a.txt\"}", call.arguments);
 }
 
 test "tool call repair pipeline repair and parse" {
@@ -928,8 +993,9 @@ test "tool call repair pipeline repair and parse" {
 
     const truncated = "{\"index\":0,\"type\":\"function\",\"function\":{\"name\":\"bash\",\"arguments\":\"{\\\"command";
     const result = try pipeline.repairAndParse(truncated);
-    try std.testing.expect(result != null);
-    try std.testing.expectEqualSlices(u8, "bash", result.?.name);
+    const call = result orelse return error.TestUnexpectedResult;
+    defer freeToolCalls(std.testing.allocator, &.{call});
+    try std.testing.expectEqualSlices(u8, "bash", call.name);
 }
 
 
@@ -1185,4 +1251,35 @@ pub fn streamMessageH2(
     var resp = try h2c.request(host, port, path, &headers, body, &h2sink);
     defer resp.deinit();
     if (resp.status < 200 or resp.status >= 300) return error.HttpError;
+}
+
+test "build body registers all tools and echoes assistant tool_calls" {
+    const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{ .argv0 = .empty, .environ = .empty });
+    defer threaded.deinit();
+    var client = DeepSeekStreamClient.init(alloc, threaded.io(), null, null);
+    defer client.deinit();
+
+    const CacheDecision = enum { none, hit, miss };
+    const ctx = [_]CtxItem{
+        .{ .role = "user", .content = "do it" },
+        .{ .role = "assistant", .content = "", .tool_calls_json = "[{\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"command\\\":\\\"ls\\\"}\"}}]" },
+        .{ .role = "tool", .content = "ok", .tool_call_id = "call_1" },
+    };
+    const body = try client.buildRequestBody("proceed", &ctx, "deepseek-chat", CacheDecision.none, "", null, true);
+    defer alloc.free(body);
+
+    // Native tool_calls are echoed so the following tool result is valid.
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"content\":null") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"tool_calls\":[{\"id\":\"call_1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, "\"role\":\"tool\",\"tool_call_id\":\"call_1\"") != null);
+
+    // Tool declarations come from the single source of truth (registry), so
+    // every registered tool is visible to the model.
+    const tools = [_][]const u8{ "shell", "file_read", "file_write", "file_edit", "git_status", "git_log", "git_diff", "git_commit", "glob", "grep", "web_search", "web_scrape" };
+    for (tools) |t| {
+        const needle = std.fmt.allocPrint(alloc, "\"name\":\"{s}\"", .{t}) catch return;
+        defer alloc.free(needle);
+        try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
+    }
 }

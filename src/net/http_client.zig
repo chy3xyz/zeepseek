@@ -1,8 +1,5 @@
 const std = @import("std");
 
-pub const DeepSeekClient = @import("deepseek_client.zig").DeepSeekClient;
-pub const SSEStream = @import("sse.zig").SseStream;
-
 pub const AIMessage = struct {
     role: []const u8,
     content: []const u8,

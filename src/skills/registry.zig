@@ -314,6 +314,12 @@ test "skill registry register builtin skills" {
 
     var builtin_skills = @import("builtin.zig").BuiltinSkills{};
     const skills = try builtin_skills.loadAll(alloc);
+    defer {
+        for (skills) |*skill| {
+            skill.deinit(alloc);
+        }
+        alloc.free(skills);
+    }
     for (skills) |*skill| {
         try registry.registerSkill(skill);
     }

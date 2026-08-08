@@ -157,7 +157,7 @@ pub fn validateUrl(url: []const u8) ValidationError!void {
     if (std.mem.indexOf(u8, lower, "metadata") != null) return error.BlockedHost;
     if (std.mem.indexOf(u8, lower, "internal") != null) return error.BlockedHost;
 
-    if (std.IpAddress.parseIp4(hostname, 0)) |_| {
+    if (std.Io.net.IpAddress.parseIp4(hostname, 0)) |_| {
         if (isPrivateIpv4(hostname)) return error.BlockedHost;
     } else |_| {}
 

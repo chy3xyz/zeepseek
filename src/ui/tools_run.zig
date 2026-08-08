@@ -5,14 +5,20 @@ const App = @import("app.zig").App;
 const tools_mod = @import("../tools/mod.zig");
 const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_client_mod = @import("../net/mcp_client.zig");
-const dangerous_patterns = @import("dangerous_patterns");
+const dangerous_patterns = @import("../utils/dangerous_patterns.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
 const extractJsonString = @import("stream_flow.zig").extractJsonString;
 const isSensitivePath = @import("stream_flow.zig").isSensitivePath;
 const ToolRunState = @import("app.zig").ToolRunState;
+const kToolMaxTurns = @import("app.zig").kToolMaxTurns;
 
 fn isBuiltinToolName(name: []const u8) bool {
-    const builtin = [_][]const u8{ "shell", "file_read", "file_write", "file_edit", "git_status", "git_commit", "web_search", "web_scrape" };
+    // Must mirror ToolRegistry's builtin set so MCP routing never hijacks a
+    // real built-in (and vice versa).
+    const builtin = [_][]const u8{
+        "shell",       "file_read", "file_write", "file_edit", "git_status", "git_log",
+        "git_diff",    "git_commit", "glob",       "grep",      "web_search", "web_scrape",
+    };
     for (builtin) |b| {
         if (std.mem.eql(u8, name, b)) return true;
     }
@@ -100,7 +106,7 @@ pub fn processNextTool(app: *App) void {
         return;
     }
     const call = tr.calls.items[tr.idx];
-    app.onToolStart(call.name, call.arguments);
+    app.onToolStart(call.name, call.arguments, call.id);
 
     const approval_needed = switch (app.run_mode) {
         .auto => tools_mod.requiresApproval(app.sandbox, call),
@@ -209,6 +215,15 @@ pub fn handleToolCalls(app: *App, tc_json: []const u8) void {
     }
 
     if (parse_result.calls.len == 0) return;
+
+    // Hard iteration cap on the tool loop: the model may re-request tools
+    // every turn, and an unbounded cycle would burn tokens forever. The counter
+    // resets on each real user message (see App.startStreaming).
+    if (app.tool_turn_count >= kToolMaxTurns) {
+        app.setNotification("Tool loop reached its cap — stopping to avoid an endless cycle");
+        return;
+    }
+    app.tool_turn_count += 1;
 
     // Duplicate calls into a run state that survives approval pauses.
     const tr = app.alloc.create(ToolRunState) catch return;

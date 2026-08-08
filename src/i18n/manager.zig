@@ -58,11 +58,10 @@ pub const I18nManager = struct {
 };
 
 fn localeFromName(name: []const u8) Locale {
-    const lower = std.ascii.toLowerString(name);
-    if (std.mem.eql(u8, lower, "en") or std.mem.eql(u8, lower, "english")) return .en;
-    if (std.mem.eql(u8, lower, "ja") or std.mem.eql(u8, lower, "japanese") or std.mem.eql(u8, lower, "日本語")) return .ja;
-    if (std.mem.eql(u8, lower, "zh") or std.mem.eql(u8, lower, "zh-hans") or std.mem.eql(u8, lower, "zh_hans") or std.mem.eql(u8, lower, "chinese") or std.mem.eql(u8, lower, "简体中文")) return .zh_Hans;
-    if (std.mem.eql(u8, lower, "pt") or std.mem.eql(u8, lower, "pt-br") or std.mem.eql(u8, lower, "pt_br") or std.mem.eql(u8, lower, "portuguese") or std.mem.eql(u8, lower, "português")) return .pt_BR;
+    if (std.ascii.eqlIgnoreCase(name, "en") or std.ascii.eqlIgnoreCase(name, "english")) return .en;
+    if (std.ascii.eqlIgnoreCase(name, "ja") or std.ascii.eqlIgnoreCase(name, "japanese") or std.mem.eql(u8, name, "日本語")) return .ja;
+    if (std.ascii.eqlIgnoreCase(name, "zh") or std.ascii.eqlIgnoreCase(name, "zh-hans") or std.ascii.eqlIgnoreCase(name, "zh_hans") or std.ascii.eqlIgnoreCase(name, "chinese") or std.mem.eql(u8, name, "简体中文")) return .zh_Hans;
+    if (std.ascii.eqlIgnoreCase(name, "pt") or std.ascii.eqlIgnoreCase(name, "pt-br") or std.ascii.eqlIgnoreCase(name, "pt_br") or std.ascii.eqlIgnoreCase(name, "portuguese") or std.mem.eql(u8, name, "português")) return .pt_BR;
     return .en;
 }
 

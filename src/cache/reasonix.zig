@@ -211,7 +211,6 @@ pub const Reasonix = struct {
             if (self.isExpired(entry)) {
                 self.evictEntry(entry, true);
                 self.hot_stats.misses += 1;
-                self.cold_stats.misses += 1;
                 return null;
             }
             self.lirsAccessHot(key);
@@ -223,7 +222,6 @@ pub const Reasonix = struct {
         if (self.cold.get(key)) |entry| {
             if (self.isExpired(entry)) {
                 self.evictEntry(entry, false);
-                self.hot_stats.misses += 1;
                 self.cold_stats.misses += 1;
                 return null;
             }
@@ -234,7 +232,6 @@ pub const Reasonix = struct {
         }
 
         self.hot_stats.misses += 1;
-        self.cold_stats.misses += 1;
         return null;
     }
 
@@ -561,7 +558,8 @@ pub const Reasonix = struct {
             @as(f64, @floatFromInt(shared)) / @as(f64, @floatFromInt(union_size));
 
         const max_tokens = @max(tokens_a, tokens_b);
-        const token_sim = 1.0 - (@as(f64, @floatFromInt(@abs(tokens_a - tokens_b))) / @as(f64, @floatFromInt(max_tokens)));
+        const token_diff = if (tokens_a >= tokens_b) tokens_a - tokens_b else tokens_b - tokens_a;
+        const token_sim = 1.0 - (@as(f64, @floatFromInt(token_diff)) / @as(f64, @floatFromInt(max_tokens)));
 
         return (token_sim * 0.6 + char_sim * 0.4);
     }
@@ -603,10 +601,10 @@ pub const Reasonix = struct {
     ) FoldDecision {
         if (already_folded) return .none;
         const ratio = @as(f64, @floatFromInt(prompt_tokens)) / @as(f64, @floatFromInt(ctx_max));
-        if (ratio >= config.fold_emergency) return .{ .emergency_truncate = .{ .target_tokens = @intFromFloat(@as(f64, @floatFromInt(ctx_max)) * 0.7) } };
-        if (ratio >= config.fold_exit) return .exit_with_summary;
-        if (ratio >= config.fold_aggressive) return .{ .fold_aggressive = .{ .tail_budget = @intFromFloat(@as(f64, @floatFromInt(ctx_max)) * 0.1) } };
-        if (ratio >= config.fold_warn) return .{ .fold_normal = .{ .tail_budget = @intFromFloat(@as(f64, @floatFromInt(ctx_max)) * 0.2) } };
+        if (ratio > config.fold_emergency) return .{ .emergency_truncate = .{ .target_tokens = @intFromFloat(@as(f64, @floatFromInt(ctx_max)) * 0.7) } };
+        if (ratio > config.fold_exit) return .exit_with_summary;
+        if (ratio > config.fold_aggressive) return .{ .fold_aggressive = .{ .tail_budget = @intFromFloat(@as(f64, @floatFromInt(ctx_max)) * 0.1) } };
+        if (ratio > config.fold_warn) return .{ .fold_normal = .{ .tail_budget = @intFromFloat(@as(f64, @floatFromInt(ctx_max)) * 0.2) } };
         return .none;
     }
 
@@ -670,7 +668,7 @@ test "reasonix put with ttl" {
     try std.testing.expect(result != null);
 
     reasonix.clock += 2;
-    _ = reasonix.putWithTTL("clocked", "value", 1);
+    reasonix.putWithTTL("clocked", "value", 1) catch unreachable;
 
     const clocked_result = reasonix.get("clocked");
     try std.testing.expect(clocked_result != null);
@@ -824,7 +822,7 @@ test "reasonix cleanup expired" {
     try reasonix.put("permanent", "value");
 
     reasonix.clock += 10;
-    _ = reasonix.putWithTTL("clock_expired", "value", 1);
+    reasonix.putWithTTL("clock_expired", "value", 1) catch unreachable;
 
     const result = reasonix.get("expired");
     _ = result;
@@ -857,7 +855,7 @@ test "reasonix stats total hit rate" {
     _ = reasonix.get("missing");
 
     const stats2 = reasonix.getStats();
-    try std.testing.expectEqual(@as(f64, 0.666), stats2.totalHitRate());
+    try std.testing.expectApproxEqAbs(@as(f64, 0.666), stats2.totalHitRate(), 0.001);
 }
 
 test "reasonix cold tier tracking" {

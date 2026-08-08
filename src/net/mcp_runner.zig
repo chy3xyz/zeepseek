@@ -72,7 +72,7 @@ pub const McpSession = struct {
             polls_left -= 1;
             var pollfd = [1]posix.pollfd{.{ .fd = self.stdout_fd, .events = posix.POLL.IN, .revents = 0 }};
             const pr = try posix.poll(pollfd[0..], 100);
-            if (pr == 0) return error.Timeout;
+            if (pr == 0) continue;
             const r = try posix.read(self.stdout_fd, buf[total..]);
             if (r == 0) return error.TransportClosed;
             total += r;
@@ -105,12 +105,16 @@ pub const McpSession = struct {
 
 test "roundTrip handshake against a local demo server" {
     // Requires /tmp/zz_mcp_demo.py (a tiny stdio MCP server) to exist.
-    if (std.fs.cwd().access("/tmp/zz_mcp_demo.py", .{})) |_| {
-        // fallthrough
-    } else |_| return error.SkipZigTest;
+    var path_buf: [512:0]u8 = undefined;
+    const demo_path = "/tmp/zz_mcp_demo.py";
+    @memcpy(path_buf[0..demo_path.len], demo_path);
+    path_buf[demo_path.len] = 0;
+    if (std.c.access(&path_buf, std.posix.F_OK) != 0) return error.SkipZigTest;
     const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{ .argv0 = .empty, .environ = .empty });
+    defer threaded.deinit();
     const srv = McpServer{ .cfg_name = "demo", .command = "/usr/bin/python3", .args = &.{"/tmp/zz_mcp_demo.py"} };
-    var sess = try McpSession.spawn(std.Io{ .userdata = undefined, .vtable = &std.Io.default_vtable }, alloc, srv);
+    var sess = try McpSession.spawn(threaded.io(), alloc, srv);
     defer sess.deinit();
     const init = try std.fmt.allocPrint(alloc, "{{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{{}}}}", .{});
     defer alloc.free(init);
@@ -132,8 +136,10 @@ test "roundTrip handshake against a local demo server" {
 
 test "spawn fails cleanly for missing command" {
     const alloc = std.testing.allocator;
+    var threaded = std.Io.Threaded.init(alloc, .{ .argv0 = .empty, .environ = .empty });
+    defer threaded.deinit();
     const srv = McpServer{ .cfg_name = "missing", .command = "/nonexistent/mcp-server-xyz", .args = &.{} };
-    _ = McpSession.spawn(std.Io{ .userdata = undefined, .vtable = &std.Io.default_vtable }, alloc, srv) catch |e| {
+    _ = McpSession.spawn(threaded.io(), alloc, srv) catch |e| {
         try std.testing.expect(e == error.FileNotFound);
         return;
     };

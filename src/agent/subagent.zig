@@ -436,6 +436,11 @@ pub const SubAgentScheduler = struct {
         var all_risks: std.ArrayList(Risk) = .{ .items = &.{}, .capacity = 0 };
         var all_blockers: std.ArrayList(Blocker) = .{ .items = &.{}, .capacity = 0 };
         var summary_parts: std.ArrayList([]const u8) = .{ .items = &.{}, .capacity = 0 };
+        defer all_changes.deinit(self.merge_allocator);
+        defer all_evidence.deinit(self.merge_allocator);
+        defer all_risks.deinit(self.merge_allocator);
+        defer all_blockers.deinit(self.merge_allocator);
+        defer summary_parts.deinit(self.merge_allocator);
         var total_duration: u64 = 0;
 
         for (completed) |agent| {
@@ -449,7 +454,12 @@ pub const SubAgentScheduler = struct {
                     summary_parts.append(self.merge_allocator, res.summary) catch {};
                 }
                 for (res.changes) |ch| {
-                    all_changes.append(self.merge_allocator, .{ .path = ch, .description = "", .lines_added = 0, .lines_removed = 0 }) catch {};
+                    all_changes.append(self.merge_allocator, .{
+                        .path = self.merge_allocator.dupe(u8, ch) catch ch,
+                        .description = self.merge_allocator.dupe(u8, "") catch "",
+                        .lines_added = 0,
+                        .lines_removed = 0,
+                    }) catch {};
                 }
                 for (res.evidence) |ev| {
                     if (ev.len > 0) {
@@ -459,7 +469,7 @@ pub const SubAgentScheduler = struct {
                 }
                 for (res.risks) |r| {
                     const sev = inferSeverity(r, self.merge_allocator);
-                    all_risks.append(self.merge_allocator, .{ .severity = sev, .description = r }) catch {};
+                    all_risks.append(self.merge_allocator, .{ .severity = sev, .description = self.merge_allocator.dupe(u8, r) catch r }) catch {};
                 }
                 for (res.blockers) |bl| {
                     const parsed = parseBlocker(bl, self.merge_allocator);
@@ -468,7 +478,7 @@ pub const SubAgentScheduler = struct {
             }
         }
 
-        const merged_changes = try deduplicateChanges(all_changes.items, self.merge_allocator);
+        const merged_changes = deduplicateChanges(all_changes.items, self.merge_allocator);
         const merged_evidence = deduplicateEvidence(all_evidence.items, self.merge_allocator);
         const merged_risks = deduplicateRisks(all_risks.items, self.merge_allocator);
         const merged_blockers = deduplicateBlockers(all_blockers.items, self.merge_allocator);
@@ -601,63 +611,100 @@ fn parseBlocker(bl: []const u8, alloc: std.mem.Allocator) Blocker {
 
 fn inferSeverity(risk: []const u8, alloc: std.mem.Allocator) Severity {
     const lower = alloc.dupe(u8, risk) catch risk;
-    defer if (!std.mem.eql(u8, lower, risk)) alloc.free(lower);
+    defer if (lower.ptr != risk.ptr) alloc.free(lower);
     if (std.mem.indexOf(u8, lower, "critical") != null) return .critical;
     if (std.mem.indexOf(u8, lower, "high") != null) return .high;
     if (std.mem.indexOf(u8, lower, "medium") != null) return .medium;
     return .low;
 }
 
-fn deduplicateChanges(changes: []const Change, alloc: std.mem.Allocator) ![]Change {
-    var seen = std.StringHashMap(void).init(alloc);
-    defer seen.deinit();
-    var result = try alloc.alloc(Change, changes.len);
-    var count: usize = 0;
+fn deduplicateChanges(changes: []const Change, alloc: std.mem.Allocator) []Change {
+    var result: std.ArrayList(Change) = .empty;
+    defer result.deinit(alloc);
     for (changes) |ch| {
-        if (seen.get(ch.path) == null) {
-            seen.put(alloc.dupe(u8, ch.path) catch ch.path, {}) catch {};
-            result[count] = ch;
-            count += 1;
+        var dup = false;
+        for (result.items) |existing| {
+            if (std.mem.eql(u8, existing.path, ch.path)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            alloc.free(ch.path);
+            alloc.free(ch.description);
+        } else {
+            result.append(alloc, ch) catch {
+                alloc.free(ch.path);
+                alloc.free(ch.description);
+            };
         }
     }
-    return result[0..count];
+    return result.toOwnedSlice(alloc) catch &.{};
 }
 
 fn deduplicateEvidence(evidence: []const Evidence, alloc: std.mem.Allocator) []Evidence {
-    var seen = std.StringHashMap(void).init(alloc);
-    defer seen.deinit();
     var result: std.ArrayList(Evidence) = .empty;
+    defer result.deinit(alloc);
     for (evidence) |ev| {
-        const key = std.fmt.allocPrint(alloc, "{s}:{}", .{ ev.path, ev.line }) catch ev.path;
-        if (seen.get(key) == null) {
-            seen.put(key, {}) catch {};
-            result.append(alloc, ev) catch {};
+        var dup = false;
+        for (result.items) |existing| {
+            if (existing.line == ev.line and std.mem.eql(u8, existing.path, ev.path)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            alloc.free(ev.path);
+            alloc.free(ev.snippet);
+        } else {
+            result.append(alloc, ev) catch {
+                alloc.free(ev.path);
+                alloc.free(ev.snippet);
+            };
         }
     }
     return result.toOwnedSlice(alloc) catch &.{};
 }
 
 fn deduplicateRisks(risks: []const Risk, alloc: std.mem.Allocator) []Risk {
-    var seen = std.StringHashMap(void).init(alloc);
-    defer seen.deinit();
     var result: std.ArrayList(Risk) = .empty;
+    defer result.deinit(alloc);
     for (risks) |r| {
-        if (seen.get(r.description) == null) {
-            seen.put(alloc.dupe(u8, r.description) catch r.description, {}) catch {};
-            result.append(alloc, r) catch {};
+        var dup = false;
+        for (result.items) |existing| {
+            if (std.mem.eql(u8, existing.description, r.description)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            alloc.free(r.description);
+        } else {
+            result.append(alloc, r) catch alloc.free(r.description);
         }
     }
     return result.toOwnedSlice(alloc) catch &.{};
 }
 
 fn deduplicateBlockers(blockers: []const Blocker, alloc: std.mem.Allocator) []Blocker {
-    var seen = std.StringHashMap(void).init(alloc);
-    defer seen.deinit();
     var result: std.ArrayList(Blocker) = .empty;
+    defer result.deinit(alloc);
     for (blockers) |bl| {
-        if (seen.get(bl.dependency) == null) {
-            seen.put(alloc.dupe(u8, bl.dependency) catch bl.dependency, {}) catch {};
-            result.append(alloc, bl) catch {};
+        var dup = false;
+        for (result.items) |existing| {
+            if (std.mem.eql(u8, existing.dependency, bl.dependency)) {
+                dup = true;
+                break;
+            }
+        }
+        if (dup) {
+            alloc.free(bl.description);
+            alloc.free(bl.dependency);
+        } else {
+            result.append(alloc, bl) catch {
+                alloc.free(bl.description);
+                alloc.free(bl.dependency);
+            };
         }
     }
     return result.toOwnedSlice(alloc) catch &.{};
@@ -858,8 +905,7 @@ test "subagent state parsing" {
 }
 
 test "role system prompts non-empty" {
-    inline for (@typeInfo(SubAgentRole).Enum.fields) |field| {
-        const role: SubAgentRole = @enumFromInt(field.value);
+    inline for (std.enums.values(SubAgentRole)) |role| {
         try std.testing.expect(getRoleSystemPrompt(role).len > 0);
         try std.testing.expect(getRoleOutputContract(role).len > 0);
     }
@@ -888,7 +934,7 @@ test "merge results aggregates correctly" {
         .blockers = &.{"needs auth module -> auth.zig"},
     });
 
-    const merged = try scheduler.mergeResults();
+    var merged = try scheduler.mergeResults();
     defer merged.deinit(alloc);
 
     try std.testing.expect(merged.summary.len > 0);

@@ -207,10 +207,9 @@ pub fn getStrings(locale: Locale) Strings {
 }
 
 pub fn localeFromEnvlang(env_lang: []const u8) Locale {
-    const lower = std.ascii.toLowerString(env_lang);
-    if (std.mem.startsWith(u8, lower, "ja")) return .ja;
-    if (std.mem.startsWith(u8, lower, "zh")) return .zh_Hans;
-    if (std.mem.startsWith(u8, lower, "pt")) return .pt_BR;
+    if (std.ascii.eqlIgnoreCase(env_lang, "ja") or std.mem.startsWith(u8, env_lang, "ja")) return .ja;
+    if (std.ascii.eqlIgnoreCase(env_lang, "zh") or std.mem.startsWith(u8, env_lang, "zh")) return .zh_Hans;
+    if (std.ascii.eqlIgnoreCase(env_lang, "pt") or std.mem.startsWith(u8, env_lang, "pt")) return .pt_BR;
     return .en;
 }
 

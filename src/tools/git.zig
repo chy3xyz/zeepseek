@@ -106,9 +106,12 @@ pub fn executeCommit(alloc: std.mem.Allocator, sandbox: ?*Sandbox, cwd: []const 
 test "git status reports untracked files in a temp repository" {
     const alloc = std.testing.allocator;
 
-    var rnd: [8]u8 = undefined;
-    std.crypto.random.bytes(&rnd);
-    const dir_name = try std.fmt.allocPrint(alloc, "/tmp/zz-git-{s}", .{std.fmt.fmtSliceHexLower(&rnd)});
+    // Unique temp dir from a wall-clock timestamp (avoids std.crypto.random,
+    // which was removed in Zig 0.17). Matches the repo's timestamp idiom.
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.REALTIME, &ts);
+    const now = @as(i64, ts.sec) * 1_000_000_000 + @as(i64, ts.nsec);
+    const dir_name = try std.fmt.allocPrint(alloc, "/tmp/zz-git-{d}", .{now});
     defer alloc.free(dir_name);
     defer {
         _ = process_mod.runArgv(alloc, "/tmp", &.{ "rm", "-rf", dir_name }) catch {};
@@ -126,7 +129,7 @@ test "git status reports untracked files in a temp repository" {
     defer alloc.free(file_path);
     const file_z = try alloc.dupeSentinel(u8, file_path, 0);
     defer alloc.free(file_z);
-    const fd = std.c.open(file_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, 0o644);
+    const fd = std.c.open(file_z.ptr, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true }, @as(std.c.mode_t, 0o644));
     if (fd < 0) return error.SkipZigTest;
     _ = std.c.write(fd, "hello", 5);
     _ = std.c.close(fd);

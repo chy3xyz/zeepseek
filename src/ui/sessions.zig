@@ -3,7 +3,7 @@
 const std = @import("std");
 const App = @import("app.zig").App;
 const Role = @import("app.zig").Role;
-const session_format = @import("session_format");
+const session_format = @import("../storage/session_format.zig");
 
 pub fn saveSession(app: *App, name: []const u8) void {
     if (!isValidSessionName(name)) {

@@ -5,6 +5,13 @@ const array_list = std.array_list;
 const error_mod = @import("error.zig");
 const ZeepError = error_mod.ZeepError;
 
+/// Source-level default DeepSeek API key. Resolution order:
+/// 1. `/apikey` command (persisted to ~/.zeepseek/apikey)
+/// 2. DEEPSEEK_API_KEY environment variable
+/// 3. ~/.zeepseek/apikey file
+/// 4. This constant (final fallback so the app works out of the box)
+pub const DEFAULT_DEEPSEEK_API_KEY: []const u8 = "sk-bcca3074de084ebea039e08b2ec0a09b";
+
 pub const ModelType = enum {
     deepseek_chat,
     deepseek_coder,
@@ -196,7 +203,7 @@ pub fn resolveApiKey() error_mod.ZeepError![]const u8 {
     if (std.c.getenv("GOOGLE_API_KEY")) |key| {
         return std.mem.sliceTo(key, 0);
     }
-    return error_mod.ZeepError.ApiKeyMissing;
+    return DEFAULT_DEEPSEEK_API_KEY;
 }
 
 pub fn resolveApiKeyForProvider(provider_id: []const u8) error_mod.ZeepError![]const u8 {
@@ -300,15 +307,21 @@ pub fn saveConfig(alloc: std.mem.Allocator, config: *const Config) !void {
         \\
     );
 
-    try content.writer().print("fold_threshold={d}\n", .{config.cache.fold_threshold});
-    try content.writer().print("fold_aggressive_threshold={d}\n", .{config.cache.fold_aggressive_threshold});
-    try content.writer().print("rpm_limit={d}\n", .{config.network.rpm_limit});
-    try content.writer().print("max_concurrent={d}\n", .{config.agents.max_concurrent});
+    try appendConfigLine(alloc, &content, .{ .key = "fold_threshold", .value = config.cache.fold_threshold });
+    try appendConfigLine(alloc, &content, .{ .key = "fold_aggressive_threshold", .value = config.cache.fold_aggressive_threshold });
+    try appendConfigLine(alloc, &content, .{ .key = "rpm_limit", .value = config.network.rpm_limit });
+    try appendConfigLine(alloc, &content, .{ .key = "max_concurrent", .value = config.agents.max_concurrent });
 
     const file = try std.fs.createFileAbsolute(config_path, .{});
     defer file.close();
 
     try file.writeAll(content.items);
+}
+
+fn appendConfigLine(alloc: std.mem.Allocator, content: *array_list.AlignedManaged(u8, null), key: []const u8, value: anytype) !void {
+    const formatted = try std.fmt.allocPrint(alloc, "{s}={d}\n", .{ key, value });
+    defer alloc.free(formatted);
+    try content.appendSlice(formatted);
 }
 
 test "model type api name" {

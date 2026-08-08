@@ -208,7 +208,42 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
     }
 
     if (std.mem.startsWith(u8, text_slice, "/skill ")) {
-        const name = app.alloc.dupe(u8, std.mem.trim(u8, text_slice["/skill ".len..], " ")) catch null;
+        const arg_slice = std.mem.trim(u8, text_slice["/skill ".len..], " ");
+        // /skill install <owner>/<repo>: clone + register a GitHub-hosted skill.
+        if (std.mem.startsWith(u8, arg_slice, "install ")) {
+            const spec = std.mem.trim(u8, arg_slice["install ".len..], " ");
+            app.text_input.setValue("") catch {};
+            app.text_input.cursor = 0;
+            const sep = std.mem.indexOfScalar(u8, spec, '/') orelse {
+                app.setNotification("Usage: /skill install <owner>/<repo>");
+                return true;
+            };
+            if (sep == 0 or sep + 1 >= spec.len) {
+                app.setNotification("Usage: /skill install <owner>/<repo>");
+                return true;
+            }
+            const owner = spec[0..sep];
+            const repo = spec[sep + 1 ..];
+            const reg = app.skill_registry orelse {
+                app.setNotification("Skill registry unavailable");
+                return true;
+            };
+            const gw: ?*git_worker_mod.Client = if (app.git_worker) |_| &app.git_worker.? else null;
+            const installed = reg.installFromGithub(
+                gw,
+                app.app_io,
+                owner,
+                repo,
+                "",
+            ) catch |e| {
+                app.setNotification(std.fmt.allocPrint(app.alloc, "Skill install failed: {s}", .{@errorName(e)}) catch "");
+                return true;
+            };
+            defer app.alloc.free(installed);
+            app.setNotification(std.fmt.allocPrint(app.alloc, "Installed skill: {s}", .{installed}) catch "");
+            return true;
+        }
+        const name = app.alloc.dupe(u8, arg_slice) catch null;
         defer if (name) |n| app.alloc.free(n);
         app.text_input.setValue("") catch {};
         app.text_input.cursor = 0;

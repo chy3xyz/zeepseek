@@ -14,7 +14,7 @@ const ToolRunState = @import("app.zig").ToolRunState;
 const kToolMaxTurns = @import("app.zig").kToolMaxTurns;
 
 fn isBuiltinToolName(name: []const u8) bool {
-    for (tool_registry.builtinNames) |b| {
+    for (tool_registry_mod.builtinNames) |b| {
         if (std.mem.eql(u8, name, b)) return true;
     }
     return false;

@@ -31,6 +31,7 @@ comptime {
     _ = @import("tools/file.zig");
     _ = @import("tools/shell.zig");
     _ = @import("skills/manifest.zig");
+    _ = @import("skills/installer.zig");
     _ = @import("skills/registry.zig");
     _ = @import("utils/tokenizer.zig");
     _ = @import("utils/validation.zig");

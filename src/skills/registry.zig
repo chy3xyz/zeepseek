@@ -7,6 +7,7 @@ const Source = skill_mod.Source;
 const SkillError = skill_mod.SkillError;
 const installer_mod = @import("installer.zig");
 const Installer = installer_mod.Installer;
+const git_worker_mod = @import("../utils/git_worker.zig");
 const manifest_mod = @import("manifest.zig");
 const ManifestParser = manifest_mod.ManifestParser;
 
@@ -84,7 +85,14 @@ pub const SkillRegistry = struct {
         return null;
     }
 
-    pub fn installFromGithub(self: *SkillRegistry, owner: []const u8, repo: []const u8, skill_path: []const u8) ![]const u8 {
+    pub fn installFromGithub(
+        self: *SkillRegistry,
+        git_worker: ?*git_worker_mod.Client,
+        io: std.Io,
+        owner: []const u8,
+        repo: []const u8,
+        skill_path: []const u8,
+    ) ![]const u8 {
         const a = self.arena.allocator();
         var installer = try Installer.init(a);
         defer installer.deinit();
@@ -92,7 +100,7 @@ pub const SkillRegistry = struct {
         const dest = try installer.getSkillPath("github-placeholder");
         defer a.free(dest);
 
-        try installer.cloneFromGithub(owner, repo, dest);
+        try installer.cloneFromGithub(git_worker, io, owner, repo, dest);
 
         _ = skill_path;
         return try self.installFromLocal(dest);

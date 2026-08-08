@@ -64,9 +64,24 @@ pub fn buildToolsList(alloc: std.mem.Allocator, id: u64) ![]const u8 {
 }
 
 pub fn buildToolsCall(alloc: std.mem.Allocator, id: u64, name: []const u8, args: []const u8) ![]const u8 {
-    const params = try std.fmt.allocPrint(alloc, "{{\"name\":\"{s}\",\"arguments\":{s}}}", .{ name, args });
+    // name is escaped so a hostile/odd tool name cannot break the JSON;
+    // args is already a JSON object fragment from the model's tool_calls.
+    const name_json = std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(name, .{})}) catch {
+        return error.OutOfMemory;
+    };
+    defer alloc.free(name_json);
+    const params = try std.fmt.allocPrint(alloc, "{{\"name\":{s},\"arguments\":{s}}}", .{ name_json, args });
     defer alloc.free(params);
     return buildRequest(alloc, id, "tools/call", params);
+}
+
+test "buildToolsCall JSON escapes the tool name" {
+    const alloc = std.testing.allocator;
+    const r = try buildToolsCall(alloc, 3, "calc\"schwe;</script>", "{\"a\":1}");
+    defer alloc.free(r);
+    try std.testing.expect(try std.json.validate(alloc, r));
+    try std.testing.expect(std.mem.indexOf(u8, r, "\\\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r, "\"arguments\":{\"a\":1}") != null);
 }
 
 test "buildRequest formats JSON-RPC" {

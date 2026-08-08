@@ -380,20 +380,20 @@ pub fn renderClaudeInput(app: *App, out: *std.ArrayList(u8), a: std.mem.Allocato
     if (app.pending_tool != null) {
         app.text_input.setEchoMode(.normal);
         app.text_input.setPrompt("⚠ ");
-        app.text_input.setPlaceholder("Tool awaiting approval — Enter allow / Esc deny");
+        app.text_input.setPlaceholder(app.i18n.t().prompt_tool_approval);
     } else if (app.pending_action == .await_api_key) {
         app.text_input.setEchoMode(.password);
         app.text_input.setPrompt("🔑 ");
-        app.text_input.setPlaceholder("Enter API key...");
+        app.text_input.setPlaceholder(app.i18n.t().prompt_api_key);
     } else if (app.streaming_idx != null) {
         app.text_input.setEchoMode(.normal);
         app.text_input.setPrompt("▸ ");
         // Input stays active during streaming; submissions are queued.
-        app.text_input.setPlaceholder("Type to queue… (auto-sends when done)");
+        app.text_input.setPlaceholder(app.i18n.t().prompt_queue);
     } else {
         app.text_input.setEchoMode(.normal);
         app.text_input.setPrompt("▸ ");
-        app.text_input.setPlaceholder("Type a message, or / for commands");
+        app.text_input.setPlaceholder(app.i18n.t().prompt_placeholder);
     }
 
     // The caret is rendered by the TextInput component itself at the correct

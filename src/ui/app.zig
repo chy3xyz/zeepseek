@@ -916,8 +916,6 @@ pub const App = struct {
         if (!self.subsystems_initialized) {
             self.subsystems_initialized = true;
             self.text_input.setPrompt("> ");
-            self.text_input.setPlaceholder("Type a message, or / for commands");
-            self.text_input.setWidth(self.width - 6);
             // Detect the interface language from the environment (LANG /
             // LC_ALL / LC_MESSAGES) so the UI respects the locale out of the
             // box; /lang overrides it at any time.
@@ -928,6 +926,8 @@ pub const App = struct {
             } else if (std.c.getenv("LC_MESSAGES")) |lang_z| {
                 self.i18n.setLocale(i18n_strings.localeFromEnvlang(std.mem.sliceTo(lang_z, 0)));
             }
+            self.text_input.setPlaceholder(self.i18n.t().prompt_placeholder);
+            self.text_input.setWidth(self.width - 6);
             self.provider_mgr = ProviderManager.init(ctx.persistent_allocator);
             // Register default deepseek provider
             self.provider_mgr.addProvider(.{

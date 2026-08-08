@@ -80,8 +80,8 @@ ContextManager first).
 
 | Directory | Key Files | Purpose |
 |-----------|-----------|---------|
-| `src/ui/` | `app.zig` (2359 LOC), `layout.zig`, `chat_panel.zig`, `input_area.zig`, `command_palette.zig`, `markdown.zig`, `theme.zig` | Full TUI implementation |
-| `src/net/` | `stream_client.zig`, `http_client.zig`, `deepseek_client.zig` | API communication, streaming, resilience (SSE parsing, rate limiting and circuit breaking live inline in `stream_client.zig`/`http_client.zig`) |
+| `src/ui/` | `app.zig` (main entry + App struct), `agent_flow.zig`, `render_text.zig`, `render_ui.zig`, `sessions.zig`, `slash_command_dispatcher.zig`, `slash_commands.zig`, `stream_flow.zig`, `tools_run.zig`, `theme.zig` | Full TUI implementation |
+| `src/net/` | `stream_client.zig`, `http_client.zig`, `http_client2.zig`, `h2_client.zig`, `mcp_client.zig` + `mcp_runner.zig`, `deepseek_client.zig` | API communication, streaming, resilience (SSE parsing, rate limiting and circuit breaking live inline in `stream_client.zig`/`http_client.zig`), MCP JSON-RPC over stdio |
 | `src/cache/` | `reasonix.zig` | Semantic cache with LIRS eviction, 3-tier TTL, similarity matching |
 | `src/dispatch/` | `cache_first_loop.zig`, `context_manager.zig` | Orchestrates cache → API → stream, context budget tracking |
 | `src/storage/` | `store.zig`, `mmap_store.zig`, `session_manager.zig`, `recovery.zig`, `migrations.zig`, `keyspace.zig` | Persistent storage |
@@ -90,7 +90,7 @@ ContextManager first).
 | `src/tools/` | `shell.zig`, `file.zig`, `git.zig`, `web.zig`, `process.zig`, `mod.zig` | Tool execution for the LLM |
 | `src/skills/` | `manifest.zig`, `registry.zig`, `installer.zig`, `builtin.zig`, `skill.zig` | Skill system with YAML/JSON manifest parsing |
 | `src/i18n/` | `manager.zig`, `strings.zig` | Internationalization (en, ja, zh-Hans, pt-BR) |
-| `src/utils/` | `config.zig`, `sandbox.zig`, `tokenizer.zig`, `validation.zig`, `error.zig`, `exec_policy.zig`, `idle_optimizer.zig`, `notifications.zig`, `dangerous.zig`, `dangerous_patterns.zig`, `tool_registry.zig` | Shared infrastructure |
+| `src/utils/` | `config.zig`, `sandbox.zig`, `tokenizer.zig`, `validation.zig`, `error.zig`, `exec_policy.zig`, `git_worker.zig`, `notifications.zig`, `dangerous.zig`, `dangerous_patterns.zig`, `tool_registry.zig` | Shared infrastructure |
 | `src/acp/` | `mod.zig`, `zed_adapter.zig` | ACP / Zed adapter (compiles + tests; not yet spawned by the runtime) |
 | `src/integration_runner.zig` | `integration_runner.zig` | Offline acceptance sweep used by CI (see `.github/workflows/ci.yml`) |
 

@@ -3,6 +3,7 @@
 const std = @import("std");
 const App = @import("app.zig").App;
 const tools_mod = @import("../tools/mod.zig");
+const tool_registry_mod = @import("../utils/tool_registry.zig");
 const stream_client_mod = @import("../net/stream_client.zig");
 const mcp_client_mod = @import("../net/mcp_client.zig");
 const dangerous_patterns = @import("../utils/dangerous_patterns.zig");
@@ -13,13 +14,7 @@ const ToolRunState = @import("app.zig").ToolRunState;
 const kToolMaxTurns = @import("app.zig").kToolMaxTurns;
 
 fn isBuiltinToolName(name: []const u8) bool {
-    // Must mirror ToolRegistry's builtin set so MCP routing never hijacks a
-    // real built-in (and vice versa).
-    const builtin = [_][]const u8{
-        "shell",       "file_read", "file_write", "file_edit", "git_status", "git_log",
-        "git_diff",    "git_commit", "glob",       "grep",      "web_search", "web_scrape",
-    };
-    for (builtin) |b| {
+    for (tool_registry.builtinNames) |b| {
         if (std.mem.eql(u8, name, b)) return true;
     }
     return false;

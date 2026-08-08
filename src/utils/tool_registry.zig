@@ -21,6 +21,14 @@ pub const SandboxKind = enum {
     network,
 };
 
+/// Canonical list of built-in tool names, in registry insertion order.
+/// Single source of truth: /mcp routing (tools_run) and the buildToolsJson
+/// coverage test both reference this so the set can never drift.
+pub const builtinNames = [_][]const u8{
+    "shell",     "file_read", "file_write", "file_edit", "git_status", "git_log",
+    "git_diff",  "git_commit", "glob",       "grep",      "web_search", "web_scrape",
+};
+
 pub const ToolDefinition = struct {
     name: []const u8,
     description: []const u8,
@@ -306,10 +314,7 @@ test "buildToolsJson covers all registered tools" {
     defer alloc.free(json);
 
     // Every registered builtin name must appear as a function declaration.
-    const names = [_][]const u8{
-        "shell",     "file_read", "file_write", "file_edit", "git_status", "git_log",
-        "git_diff",  "git_commit", "glob",       "grep",      "web_search", "web_scrape",
-    };
+    const names = builtinNames;
     var count: usize = 0;
     var needle_buf: [128]u8 = undefined;
     for (names) |n| {

@@ -122,6 +122,13 @@ pub const Installer = struct {
     pub fn getSkillPath(self: *Installer, name: []const u8) ![]const u8 {
         const skills_dir = try self.getSkillsDir();
         defer self.allocator.free(skills_dir);
+        // Reject path separators and dot-dot segments so a hostile name can
+        // never escape the skills directory.
+        if (std.mem.indexOfAny(u8, name, "/\\") != null or
+            std.mem.eql(u8, name, "..") or std.mem.eql(u8, name, "."))
+        {
+            return error.InvalidSkillName;
+        }
         return try std.fs.path.join(self.allocator, &.{ skills_dir, name });
     }
 

@@ -97,7 +97,7 @@ pub const SkillRegistry = struct {
         var installer = try Installer.init(a);
         defer installer.deinit();
 
-        const dest = try installer.getSkillPath("github-placeholder");
+        const dest = try installer.getSkillPath(repo);
         defer a.free(dest);
 
         try installer.cloneFromGithub(git_worker, io, owner, repo, dest);

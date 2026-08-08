@@ -47,6 +47,7 @@ const reasonix_mod = @import("../cache/reasonix.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
 const memory_mod = @import("../cache/memory.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
+const i18n_strings = @import("../i18n/strings.zig");
 
 const join = zz.join;
 
@@ -917,6 +918,16 @@ pub const App = struct {
             self.text_input.setPrompt("> ");
             self.text_input.setPlaceholder("Type a message, or / for commands");
             self.text_input.setWidth(self.width - 6);
+            // Detect the interface language from the environment (LANG /
+            // LC_ALL / LC_MESSAGES) so the UI respects the locale out of the
+            // box; /lang overrides it at any time.
+            if (std.c.getenv("LANG")) |lang_z| {
+                self.i18n.setLocale(i18n_strings.localeFromEnvlang(std.mem.sliceTo(lang_z, 0)));
+            } else if (std.c.getenv("LC_ALL")) |lang_z| {
+                self.i18n.setLocale(i18n_strings.localeFromEnvlang(std.mem.sliceTo(lang_z, 0)));
+            } else if (std.c.getenv("LC_MESSAGES")) |lang_z| {
+                self.i18n.setLocale(i18n_strings.localeFromEnvlang(std.mem.sliceTo(lang_z, 0)));
+            }
             self.provider_mgr = ProviderManager.init(ctx.persistent_allocator);
             // Register default deepseek provider
             self.provider_mgr.addProvider(.{
@@ -2392,7 +2403,7 @@ var g_git_worker: ?git_worker_mod.Client = null;
 
 /// Monotonic wall-clock in nanoseconds, used for toast auto-dismiss
 /// (kept in sync with the OS monotonic clock so dismissals work in tests too).
-fn monotonicNs() u64 {
+pub fn monotonicNs() u64 {
     var ts: std.c.timespec = undefined;
     _ = std.c.clock_gettime(.MONOTONIC, &ts);
     const sec: u64 = @intCast(ts.sec);

@@ -88,9 +88,8 @@ User Input → UI (onKey) → dispatch (cache_first_loop) →
 | `src/skills/` | `manifest.zig`, `registry.zig`, `installer.zig`, `builtin.zig`, `skill.zig` | Skill system with YAML/JSON manifest parsing |
 | `src/i18n/` | `manager.zig`, `strings.zig` | Internationalization (en, ja, zh-Hans, pt-BR) |
 | `src/utils/` | `config.zig`, `sandbox.zig`, `tokenizer.zig`, `validation.zig`, `error.zig`, `exec_policy.zig`, `idle_optimizer.zig`, `notifications.zig`, `dangerous.zig`, `dangerous_patterns.zig`, `tool_registry.zig` | Shared infrastructure |
-| `src/acp/` | `mod.zig`, `zed_adapter.zig` | ACP / Zed adapter |
-| `src/workspace/` | `side_git.zig` | Lightweight workspace snapshot system using git |
-| `src/` | `serve_http.zig` | Optional embedded HTTP server |
+| `src/acp/` | `mod.zig`, `zed_adapter.zig` | ACP / Zed adapter (compiles + tests; not yet spawned by the runtime) |
+| `src/integration_runner.zig` | `integration_runner.zig` | Offline acceptance sweep used by CI (see `.github/workflows/ci.yml`) |
 
 ---
 
@@ -247,7 +246,16 @@ Defaults:
 
 ### SideGit (`src/workspace/side_git.zig`)
 
-Before destructive tool operations, the workspace is snapshotted in a hidden git repository (if git is available). This enables rollback if a tool call corrupts the workspace.
+> **Not present in this codebase.** The workspace snapshot rollback described here
+> is not implemented. The actual safety model is:
+> 1. **Approval gates** (ABOVE): every shell/file-write/file-edit/git-commit call
+>    runs through a per-call user-confirmation overlay by default, and fails
+>    closed if the platform sandbox is unavailable.
+> 2. **Dangerous-command rejection** (`src/utils/dangerous.zig` +
+>    `src/utils/dangerous_patterns.zig`): blacklisted shell operators/commands are
+>    rejected before execution.
+> 3. **Platform sandbox** (`src/utils/sandbox.zig`): Seatbelt (macOS), Landlock
+>    (Linux), Job Objects (Windows) with a workspace allow-list.
 
 ---
 

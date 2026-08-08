@@ -30,6 +30,12 @@ pub const I18nManager = struct {
         self.strings = getStrings(locale);
     }
 
+    /// Set the locale from a friendly name ("en", "ja", "zh", "pt", ...).
+    /// Falls back to English for unknown names.
+    pub fn setLocaleByName(self: *I18nManager, name: []const u8) void {
+        self.setLocale(localeFromName(name));
+    }
+
     pub fn detectLocale(self: *I18nManager, env_map: *const std.process.Environ.Map) void {
         if (env_map.get("LANG")) |lang| {
             self.locale = localeFromEnvlang(lang);
@@ -84,6 +90,17 @@ test "i18n locale name" {
     try std.testing.expectEqualStrings("English", mgr.localeName());
     mgr.setLocale(.ja);
     try std.testing.expectEqualStrings("日本語", mgr.localeName());
+}
+
+test "i18n set locale by name" {
+    var mgr = I18nManager.init(.en);
+    defer mgr.deinit();
+    mgr.setLocaleByName("zh");
+    try std.testing.expectEqualStrings("简体中文", mgr.localeName());
+    mgr.setLocaleByName("pt-BR");
+    try std.testing.expectEqualStrings("Português (Brasil)", mgr.localeName());
+    mgr.setLocaleByName("bogus");
+    try std.testing.expectEqualStrings("English", mgr.localeName());
 }
 
 test "locale from name" {

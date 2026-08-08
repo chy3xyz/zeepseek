@@ -85,6 +85,7 @@ pub const Result = union(enum) {
     set_provider: []const u8,
     set_apikey: []const u8,
     set_theme: []const u8,
+    set_lang: []const u8,
 };
 
 const commands_table = [_]Command{
@@ -115,6 +116,7 @@ const commands_table = [_]Command{
     .{ .id = "skills", .label = "/skills", .desc = "List available skills", .kind = .output },
     .{ .id = "sandbox", .label = "/sandbox", .desc = "Show sandbox status", .kind = .output },
     .{ .id = "providers", .label = "/providers", .desc = "List configured providers", .kind = .output },
+    .{ .id = "lang", .label = "/lang", .desc = "Switch interface language (en/ja/zh/pt)" },
 };
 
 pub const Dispatcher = struct {
@@ -174,6 +176,13 @@ pub const Dispatcher = struct {
                 return menuProviders(ctx);
             }
             return .{ .set_provider = try ctx.allocator.dupe(u8, args) };
+        }
+
+        if (std.mem.eql(u8, id, "lang")) {
+            if (args.len == 0) {
+                return .{ .notify = try ctx.allocator.dupe(u8, "Usage: /lang <en|ja|zh|pt>") };
+            }
+            return .{ .set_lang = try ctx.allocator.dupe(u8, args) };
         }
 
         if (std.mem.eql(u8, id, "status") or std.mem.eql(u8, id, "context")) return try handleStatus(ctx);

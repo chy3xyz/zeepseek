@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const App = @import("app.zig").App;
+const app_mod = @import("app.zig");
 const tools_run = @import("tools_run.zig");
 const tokenizer_mod = @import("../utils/tokenizer.zig");
 
@@ -113,7 +114,7 @@ pub fn onStreamContent(app: *App, text: []const u8) void {
             .role = .assistant,
             .content = duped,
             .status = .streaming,
-            .timestamp = 0, // TODO: use std.Io.Timestamp when ctx is available
+            .timestamp = @intCast(app_mod.monotonicNs()),
             .owns = true,
         }) catch return;
         app.streaming_idx = idx;

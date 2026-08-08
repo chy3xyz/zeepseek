@@ -489,6 +489,14 @@ pub fn runSlashCommand(app: *App, id: []const u8, args: []const u8) void {
             app.alloc.free(name);
         },
 
+        .set_lang => |name| {
+            app.i18n.setLocaleByName(name);
+            app.alloc.free(name);
+            const msg = std.fmt.allocPrint(app.alloc, "Language: {s}", .{app.i18n.localeName()}) catch return;
+            defer app.alloc.free(msg);
+            app.setNotification(msg);
+        },
+
         .set_apikey => |key| {
             app.setApiKey(key);
             app.alloc.free(key);

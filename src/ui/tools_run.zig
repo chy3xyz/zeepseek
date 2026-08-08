@@ -26,13 +26,43 @@ fn isBuiltinToolName(name: []const u8) bool {
 }
 
 /// Forward a tool call to the connected MCP server via tools/call.
+/// The response envelope (`result.content[].text`) is flattened into a plain
+/// string so the model receives the tool output rather than raw JSON-RPC.
 pub fn callMcpTool(app: *App, name: []const u8, arguments: []const u8) []const u8 {
     const sess = &(app.mcp_session orelse return toolErr(app, "Error: no MCP session", .{}));
     const req = mcp_client_mod.buildToolsCall(app.alloc, 1, name, arguments) catch return toolErr(app, "Error: MCP call build failed", .{});
     defer app.alloc.free(req);
     const resp = sess.roundTrip(req, 8000) catch |e| return toolErr(app, "Error: MCP call: {s}", .{@errorName(e)});
     defer app.alloc.free(resp);
-    return app.alloc.dupe(u8, resp) catch "";
+
+    var parsed = std.json.parseFromSlice(std.json.Value, app.alloc, resp, .{}) catch return app.alloc.dupe(u8, resp) catch "";
+    defer parsed.deinit();
+    const result = (parsed.value.object.get("result") orelse return app.alloc.dupe(u8, resp) catch "").object;
+    const content = result.get("content") orelse return app.alloc.dupe(u8, resp) catch "";
+    if (content != .array) return app.alloc.dupe(u8, resp) catch "";
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(app.alloc);
+    for (content.array.items) |item| {
+        if (item == .object) {
+            if (item.object.get("text")) |t| {
+                if (t == .string) {
+                    if (out.items.len > 0) out.append(app.alloc, '\n') catch {};
+                    out.appendSlice(app.alloc, t.string) catch {};
+                    continue;
+                }
+            }
+        }
+        // Non-text item (image, resource link, …): keep the raw JSON so no
+        // data is silently dropped from the model's view.
+        const raw = std.json.fmt(item, .{});
+        const frag = std.fmt.allocPrint(app.alloc, "{f}", .{raw}) catch continue;
+        defer app.alloc.free(frag);
+        if (out.items.len > 0) out.append(app.alloc, '\n') catch {};
+        out.appendSlice(app.alloc, frag) catch {};
+    }
+    if (out.items.len == 0) return app.alloc.dupe(u8, resp) catch "";
+    return out.toOwnedSlice(app.alloc) catch "";
 }
 
 pub fn runTool(app: *App, call: tools_mod.ToolCall, cwd: []const u8) []const u8 {

@@ -370,7 +370,6 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
 
     // /copy: copy the whole conversation (plain text) to the clipboard.
     if (std.mem.eql(u8, text_slice, "/copy") or std.mem.startsWith(u8, text_slice, "/copy ")) {
-        std.debug.print("[dbg] /copy triggered, gw={any}\n", .{app.git_worker != null});
         app.text_input.setValue("") catch {};
         app.text_input.cursor = 0;
         var buf = std.ArrayList(u8).empty;
@@ -385,14 +384,13 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
             buf.appendSlice(app.alloc, "\n\n") catch break;
         }
         if (app.git_worker) |*gw| {
-            std.debug.print("[dbg] copy {d} bytes\n", .{buf.items.len});
             if (gw.copy(buf.items)) {
                 app.setNotification("Conversation copied to clipboard");
             } else {
                 app.setNotification("Copy failed");
             }
         } else {
-            std.debug.print("[dbg] no worker\n", .{});
+            app.setNotification("Clipboard worker unavailable");
         }
         return true;
     }

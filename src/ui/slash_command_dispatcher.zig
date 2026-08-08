@@ -1,5 +1,7 @@
 const std = @import("std");
 const ProviderManager = @import("../providers/manager.zig").ProviderManager;
+const model_catalog = @import("../providers/models.zig").model_catalog;
+const SkillRegistry = @import("../skills/registry.zig").SkillRegistry;
 const theme = @import("theme.zig");
 const Sandbox = @import("../utils/sandbox.zig").Sandbox;
 
@@ -25,6 +27,7 @@ pub const CommandContext = struct {
     subsystems_initialized: bool,
     provider_mgr: *ProviderManager,
     sandbox: ?*Sandbox,
+    skill_registry: ?*SkillRegistry = null,
     tokens_used: usize,
     ctx_max: usize,
     cache_hit_rate: f64,
@@ -273,21 +276,69 @@ fn handleWorkspace(ctx: CommandContext) !Result {
 }
 
 fn menuModels(ctx: CommandContext) !Result {
-    const items = [_]SubItem{
-        .{ .label = "DeepSeek V4 Flash", .desc = "Fast, default model", .action = "/model deepseek-v4-flash" },
-        .{ .label = "DeepSeek V4 Pro", .desc = "High quality, larger context", .action = "/model deepseek-v4-pro" },
-        .{ .label = "DeepSeek Reasoner", .desc = "Reasoning model", .action = "/model deepseek-reasoner" },
-    };
-    return .{ .submenu = try buildSubMenu(ctx.allocator, "Switch model", &items) };
+    var temp: std.ArrayList(SubItem) = .empty;
+    defer {
+        for (temp.items) |it| {
+            ctx.allocator.free(it.label);
+            ctx.allocator.free(it.desc);
+            ctx.allocator.free(it.action);
+        }
+        temp.deinit(ctx.allocator);
+    }
+    for (model_catalog) |m| {
+        const action = std.fmt.allocPrint(ctx.allocator, "/model {s}", .{m.id}) catch continue;
+        const desc = std.fmt.allocPrint(ctx.allocator, "{s} — {d}K ctx", .{ m.provider, m.context_window / 1000 }) catch {
+            ctx.allocator.free(action);
+            continue;
+        };
+        const label = ctx.allocator.dupe(u8, m.name) catch {
+            ctx.allocator.free(action);
+            ctx.allocator.free(desc);
+            continue;
+        };
+        temp.append(ctx.allocator, .{ .label = label, .desc = desc, .action = action }) catch {
+            ctx.allocator.free(label);
+            ctx.allocator.free(action);
+            ctx.allocator.free(desc);
+            continue;
+        };
+    }
+    if (temp.items.len == 0) return .{ .notify = try ctx.allocator.dupe(u8, "No models available") };
+    return .{ .submenu = try buildSubMenu(ctx.allocator, "Switch model", temp.items) };
 }
 
 fn menuSkills(ctx: CommandContext) !Result {
-    const items = [_]SubItem{
-        .{ .label = "health", .desc = "Run the code-quality dashboard skill", .action = "/skill health" },
-        .{ .label = "investigate", .desc = "Root-cause debugging skill", .action = "/skill investigate" },
-        .{ .label = "design-review", .desc = "Visual QA skill", .action = "/skill design-review" },
-    };
-    return .{ .submenu = try buildSubMenu(ctx.allocator, "Available skills", &items) };
+    var temp: std.ArrayList(SubItem) = .empty;
+    defer {
+        for (temp.items) |it| {
+            ctx.allocator.free(it.label);
+            ctx.allocator.free(it.desc);
+            ctx.allocator.free(it.action);
+        }
+        temp.deinit(ctx.allocator);
+    }
+    if (ctx.skill_registry) |reg| {
+        for (reg.list()) |sk| {
+            const action = std.fmt.allocPrint(ctx.allocator, "/skill {s}", .{sk.name}) catch continue;
+            const desc = std.fmt.allocPrint(ctx.allocator, "{s}", .{if (sk.description.len > 0) sk.description else "Skill"}) catch {
+                ctx.allocator.free(action);
+                continue;
+            };
+            const label = ctx.allocator.dupe(u8, sk.name) catch {
+                ctx.allocator.free(action);
+                ctx.allocator.free(desc);
+                continue;
+            };
+            temp.append(ctx.allocator, .{ .label = label, .desc = desc, .action = action }) catch {
+                ctx.allocator.free(label);
+                ctx.allocator.free(action);
+                ctx.allocator.free(desc);
+                continue;
+            };
+        }
+    }
+    if (temp.items.len == 0) return .{ .notify = try ctx.allocator.dupe(u8, "No skills registered") };
+    return .{ .submenu = try buildSubMenu(ctx.allocator, "Available skills", temp.items) };
 }
 
 fn menuNotes(ctx: CommandContext) !Result {
@@ -503,7 +554,7 @@ test "model with args returns set_model" {
     alloc.free(result.set_model);
 }
 
-test "model without args returns submenu" {
+test "model without args returns submenu from catalog" {
     const alloc = std.testing.allocator;
     var pm = ProviderManager.init(alloc);
     defer pm.deinit();
@@ -526,7 +577,54 @@ test "model without args returns submenu" {
     try std.testing.expectEqual(.submenu, std.meta.activeTag(result));
     try std.testing.expectEqualStrings("Switch model", result.submenu.title);
     try std.testing.expect(result.submenu.items.len > 0);
-    try std.testing.expectEqualStrings("/model deepseek-v4-flash", result.submenu.items[0].action);
+    try std.testing.expectEqualStrings("/model deepseek-chat", result.submenu.items[0].action);
+    var found_catalog_item = false;
+    for (result.submenu.items) |it| {
+        if (std.mem.eql(u8, it.action, "/model deepseek-v4-flash")) found_catalog_item = true;
+    }
+    try std.testing.expect(found_catalog_item);
+    freeSubMenu(alloc, result.submenu);
+}
+
+test "skills submenu is built from registry" {
+    const alloc = std.testing.allocator;
+    var pm = ProviderManager.init(alloc);
+    defer pm.deinit();
+
+    var reg = try SkillRegistry.init(alloc);
+    defer reg.deinit();
+    var builtin_skills = @import("../skills/builtin.zig").BuiltinSkills{};
+    const skills = try builtin_skills.loadAll(alloc);
+    defer {
+        for (skills) |*sk| sk.deinit(alloc);
+        alloc.free(skills);
+    }
+    for (skills) |*sk| try reg.registerSkill(sk);
+
+    const ctx = CommandContext{
+        .allocator = alloc,
+        .io = undefined,
+        .provider = "deepseek",
+        .model = "deepseek-chat",
+        .subsystems_initialized = false,
+        .provider_mgr = &pm,
+        .sandbox = null,
+        .skill_registry = &reg,
+        .tokens_used = 0,
+        .ctx_max = 0,
+        .cache_hit_rate = 0,
+        .session_id = "test",
+    };
+
+    const result = try Dispatcher.execute(ctx, "skills", "");
+    try std.testing.expectEqual(.submenu, std.meta.activeTag(result));
+    try std.testing.expectEqualStrings("Available skills", result.submenu.title);
+    try std.testing.expect(result.submenu.items.len > 0);
+    var found_investigate = false;
+    for (result.submenu.items) |it| {
+        if (std.mem.eql(u8, it.action, "/skill investigate")) found_investigate = true;
+    }
+    try std.testing.expect(found_investigate);
     freeSubMenu(alloc, result.submenu);
 }
 

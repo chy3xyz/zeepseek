@@ -153,7 +153,7 @@ pub const Role = enum {
     }
 };
 
-pub const MsgStatus = enum { pending, streaming, complete, failed, truncated };
+pub const MsgStatus = enum { pending, streaming, complete, failed };
 
 pub const ToolCallStatus = enum { running, success, failed };
 
@@ -323,7 +323,7 @@ const PendingTool = struct {
 /// in a network connect when the app exits, its pages are reclaimed by the OS
 /// and never reach the GPA leak checker (which would otherwise block exit by
 /// printing a huge stack trace to a full stderr pipe).
-const SubAgentRun = struct {
+pub const SubAgentRun = struct {
     thread: std.Thread = undefined,
     /// Index into App.subagents (stable: the panel never removes entries)
     sa_index: usize,
@@ -332,11 +332,13 @@ const SubAgentRun = struct {
     failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     summary: std.ArrayList(u8) = .empty,
     locked: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Bytes of summary already mirrored into the panel (live-stream cursor)
+    shown_summary_len: usize = 0,
 
-    fn init(alloc: std.mem.Allocator, sa_index: usize) SubAgentRun {
+    pub fn init(alloc: std.mem.Allocator, sa_index: usize) SubAgentRun {
         return .{ .sa_index = sa_index, .arena = std.heap.ArenaAllocator.init(alloc) };
     }
-    fn allocator(self: *SubAgentRun) std.mem.Allocator {
+    pub fn allocator(self: *SubAgentRun) std.mem.Allocator {
         return self.arena.allocator();
     }
     fn lock(self: *SubAgentRun) void {
@@ -345,15 +347,15 @@ const SubAgentRun = struct {
     fn unlock(self: *SubAgentRun) void {
         self.locked.store(false, .release);
     }
-    fn pushSummary(self: *SubAgentRun, text: []const u8) void {
+    pub fn pushSummary(self: *SubAgentRun, text: []const u8) void {
         self.lock();
         defer self.unlock();
         self.summary.appendSlice(self.arena.allocator(), text) catch {};
     }
-    fn setDone(self: *SubAgentRun) void {
+    pub fn setDone(self: *SubAgentRun) void {
         self.done.store(true, .release);
     }
-    fn setFailed(self: *SubAgentRun) void {
+    pub fn setFailed(self: *SubAgentRun) void {
         self.failed.store(true, .release);
         self.done.store(true, .release);
     }
@@ -365,6 +367,13 @@ const SubAgentRun = struct {
         defer self.unlock();
         if (self.summary.items.len == 0) return null;
         return alloc.dupe(u8, self.summary.items) catch null;
+    }
+    /// Locked read of the accumulated summary length. Safe to call from the
+    /// UI thread while the runner thread is still pushing chunks.
+    pub fn summaryLen(self: *SubAgentRun) usize {
+        self.lock();
+        defer self.unlock();
+        return self.summary.items.len;
     }
     pub fn deinit(self: *SubAgentRun) void {
         self.summary.deinit(self.arena.allocator());
@@ -838,6 +847,16 @@ pub const App = struct {
             } else break;
         }
         self.subagent_runs.deinit(self.alloc);
+
+        // Free sub-agent panel entries: id/goal were duped on app.alloc in
+        // agent_flow.startSubAgent and the latest summary replaced the
+        // initial one via pollSubAgents.
+        for (self.subagents.items) |sa| {
+            self.alloc.free(sa.id);
+            self.alloc.free(sa.goal);
+            if (sa.summary.len > 0) self.alloc.free(sa.summary);
+        }
+        self.subagents.deinit(self.alloc);
 
         if (self.compact_run) |cr| {
             if (cr.isDone()) {
@@ -2500,6 +2519,7 @@ fn makeTestApp(alloc: std.mem.Allocator) App {
     app.session_id_alloc = null;
     app.tool_run = null;
     app.compact_run = null;
+    app.subagent_runs = .empty;
     return app;
 }
 
@@ -3032,6 +3052,46 @@ test "subagent panel toggle shows subagents" {
     try std.testing.expect(std.mem.indexOf(u8, output, "Sub-Agents") != null);
 }
 
+test "subagent panel renders goal and summary lines" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+        for (app.subagents.items) |sa| {
+            alloc.free(sa.id);
+            alloc.free(sa.goal);
+            if (sa.summary.len > 0) alloc.free(sa.summary);
+        }
+        app.subagents.deinit(alloc);
+    }
+
+    const goal = "research the zig std ArrayList API";
+    const summary = "found 3 relevant functions and 2 examples";
+    try app.subagents.append(alloc, .{
+        .id = alloc.dupe(u8, "sa-0") catch "",
+        .role = .researcher,
+        .goal = alloc.dupe(u8, goal) catch "",
+        .status = .complete,
+        .summary = alloc.dupe(u8, summary) catch "",
+    });
+
+    app.show_subagents = true;
+    var ctx = makeTestCtx(alloc);
+    const output = app.view(&ctx);
+    defer alloc.free(output);
+    try std.testing.expect(std.mem.indexOf(u8, output, goal) != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, summary) != null);
+}
+
 test "theme switch updates current theme id" {
     const alloc = std.testing.allocator;
     var app = makeTestApp(alloc);
@@ -3051,4 +3111,77 @@ test "theme switch updates current theme id" {
     const first = app.theme_manager.current;
     app.cycleTheme();
     try std.testing.expect(app.theme_manager.current != first);
+}
+
+test "subagent run arena lifecycle pushes and drains summary" {
+    var run = SubAgentRun.init(std.heap.page_allocator, 7);
+    defer run.deinit();
+
+    run.pushSummary("first ");
+    run.pushSummary("second");
+    try std.testing.expectEqual(@as(usize, 12), run.summary.items.len);
+
+    const drained = run.drainSummary(std.testing.allocator) orelse return error.NoSummary;
+    defer std.testing.allocator.free(drained);
+    try std.testing.expectEqualStrings("first second", drained);
+
+    run.setDone();
+    try std.testing.expect(run.isDone());
+    try std.testing.expect(!run.failed.load(.acquire));
+}
+
+test "pollSubAgents live-mirrors summary into the panel" {
+    const alloc = std.testing.allocator;
+    var app = makeTestApp(alloc);
+    defer {
+        for (app.messages.items) |*m| {
+            if (m.owns and m.content.len > 0) alloc.free(m.content);
+        }
+        app.messages.deinit(alloc);
+        app.text_input.deinit();
+        app.palette.deinit();
+        app.toast.deinit();
+        app.theme_manager.deinit();
+        app.search_query.deinit(alloc);
+        app.pending_data.deinit(alloc);
+        for (app.subagents.items) |sa| {
+            alloc.free(sa.id);
+            alloc.free(sa.goal);
+            if (sa.summary.len > 0) alloc.free(sa.summary);
+        }
+        app.subagents.deinit(alloc);
+        for (app.subagent_runs.items) |run| {
+            run.deinit();
+            std.heap.page_allocator.destroy(run);
+        }
+        app.subagent_runs.deinit(alloc);
+    }
+
+    // Panel entry at index 0 + a run pinned to it (no thread — the live
+    // mirror path never joins, so a bare SubAgentRun is safe here).
+    try app.subagents.append(alloc, .{
+        .id = alloc.dupe(u8, "sa-0") catch "",
+        .role = .researcher,
+        .goal = alloc.dupe(u8, "scan the zephyr protocol") catch "",
+    });
+    const run = std.heap.page_allocator.create(SubAgentRun) catch return error.Oom;
+    run.* = SubAgentRun.init(std.heap.page_allocator, 0);
+    try app.subagent_runs.append(alloc, run);
+
+    // First poll: the whole accumulated summary is mirrored into the panel.
+    run.pushSummary("alpha ");
+    run.pushSummary("beta");
+    agent_flow.pollSubAgents(&app);
+    try std.testing.expectEqual(@as(usize, 10), app.subagents.items[0].summary.len);
+    try std.testing.expectEqualStrings("alpha beta", app.subagents.items[0].summary);
+
+    // No new output: the mirror must not churn (cursor unchanged).
+    agent_flow.pollSubAgents(&app);
+    try std.testing.expectEqual(@as(usize, 10), app.subagents.items[0].summary.len);
+
+    // New output lands on the next poll.
+    run.pushSummary(" gamma");
+    agent_flow.pollSubAgents(&app);
+    try std.testing.expectEqual(@as(usize, 16), app.subagents.items[0].summary.len);
+    try std.testing.expectEqualStrings("alpha beta gamma", app.subagents.items[0].summary);
 }

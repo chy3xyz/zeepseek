@@ -35,8 +35,8 @@ User input ──► App.update(.key) ──► onKey ──► submit()
 
 | Status | Modules |
 |---|---|
-| **Wired & used** | `net/stream_client` + `net/h2_client` (+ vendor TLS/HPACK), `net/http_client2`, `tools/` (shell/file/git/web), `utils/sandbox`, `utils/dangerous_patterns`, `storage/session_format`, `providers/manager`, `cache/reasonix` (semantic cache replay + fold decisions), `dispatch/context_manager` (auto-fold inside `submit`), `ui/` (app, slash dispatcher, theme) |
-| **Partial** | `i18n/manager` (string pools for en/ja/zh-Hans/pt-BR; `/lang` + env detection wired, most UI copy still hardcoded), `dispatch/cache_first_loop` (constructed, not yet driven — streaming calls `streamMessage` directly) |
+| **Wired** | `net/stream_client` + `net/h2_client` (+ vendor TLS/HPACK), `net/http_client2`, `tools/` (shell/file/git/web), `utils/sandbox`, `utils/dangerous_patterns`, `storage/session_format`, `providers/manager`, `cache/reasonix` (semantic cache replay + fold decisions), `dispatch/context_manager` (auto-fold inside `submit`), `dispatch/cache_first_loop` (driven by `/subagent` + `agent/sub_worker`), `ui/` (app, slash dispatcher, theme) |
+| **Partial** | `i18n/manager` (string pools for en/ja/zh-Hans/pt-BR; `/lang` + env detection wired, most UI copy still hardcoded), `dispatch/cache_first_loop` (main-conversation path still calls `streamMessage` directly; the loop is driven only for sub-agents) |
 | **Isolated / experimental** | `agent/subagent` scheduler (app uses its own threads), `skills/` (registry + builtins; `/skills` lists from the registry), `acp/` (Agent Client Protocol, test-only), `storage/session_manager` + `mmap_store` + `store*` (TurboDB not wired), `providers/mod` + `models` (test-only) |
 
 These isolated modules compile and have unit tests but do **not** affect

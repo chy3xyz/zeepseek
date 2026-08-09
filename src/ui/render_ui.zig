@@ -749,9 +749,8 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
     defer for (owned.items) |s| if (s.len > 0) a.free(s);
 
     const bo = Pal.fg_dim;
-    const title = std.fmt.allocPrint(a, "{s}┌─ Sub-Agents {s}", .{ bo, R }) catch "";
-    owned.append(a, title) catch {};
-    lines.append(a, title) catch {};
+    const title_owned = std.fmt.allocPrint(a, "{s}┌─ Sub-Agents {s}", .{ bo, R });
+    const title: []const u8 = title_owned catch "";
     const top_pad = panel_w -| 15;
     var top_line = std.ArrayList(u8).empty;
     top_line.appendSlice(a, title) catch {};
@@ -759,9 +758,18 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
     while (i < top_pad) : (i += 1) { top_line.appendSlice(a, "─") catch {}; }
     top_line.appendSlice(a, "┐") catch {};
     top_line.appendSlice(a, R) catch {};
+    // top is line 0; on OOM it aliases title, so register exactly one of the
+    // two for cleanup (the reusable defer loop would otherwise free twice).
+    // A failed allocPrint leaves title as a non-freable literal "", and when
+    // top aliases title owned's cleanup frees it once as well.
     const top = top_line.toOwnedSlice(a) catch title;
     owned.append(a, top) catch {};
-    lines.items[0] = top;
+    if (title_owned) |owned_title| {
+        if (top.ptr != owned_title.ptr) {
+            a.free(owned_title);
+        }
+    } else |_| {}
+    lines.append(a, top) catch {};
 
     if (app.subagents.items.len == 0) {
         const no_sub = std.fmt.allocPrint(a, "{s}│{s}  No active sub-agents  {s}│{s}", .{ bo, R, bo, R }) catch "";
@@ -774,7 +782,6 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
                 .streaming => "◐",
                 .complete => "✓",
                 .failed => "✗",
-                .truncated => "~",
             };
             const role_name = @tagName(sa.role);
             const line = std.fmt.allocPrint(a, "{s}│{s} {s} {s}: {s}{s}│{s}", .{
@@ -782,6 +789,20 @@ pub fn renderClaudeSubAgentPanel(app: *const App, a: std.mem.Allocator, w: u16, 
             }) catch "";
             owned.append(a, line) catch {};
             lines.append(a, line) catch {};
+            // Goal line + live/accumulated summary line, truncated to the
+            // panel width so long goals don't widen the box.
+            const max_body = panel_w -| 5;
+            for ([_][]const u8{ sa.goal, sa.summary }) |body| {
+                if (body.len == 0) continue;
+                const trunc = zz.layout.measure.truncate(a, body, max_body) catch null;
+                const truncated = trunc orelse body;
+                const body_line = std.fmt.allocPrint(a, "{s}│{s}  {s}{s}│{s}", .{
+                    bo, R, truncated, bo, R,
+                }) catch "";
+                if (trunc) |t| owned.append(a, t) catch {};
+                owned.append(a, body_line) catch {};
+                lines.append(a, body_line) catch {};
+            }
         }
     }
     const bottom = std.fmt.allocPrint(a, "{s}└──────────────────────────────────────┘{s}", .{ bo, R }) catch "";

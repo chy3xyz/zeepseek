@@ -1,18 +1,10 @@
 const std = @import("std");
-const stream_client = @import("../net/stream_client.zig");
 const CacheFirstLoop = @import("../dispatch/cache_first_loop.zig").CacheFirstLoop;
-const SubAgentScheduler = @import("subagent.zig").SubAgentScheduler;
-const SubAgent = @import("subagent.zig").SubAgent;
+const LoopStreamState = @import("../dispatch/cache_first_loop.zig").StreamState;
 const SubAgentRole = @import("subagent.zig").SubAgentRole;
 const nowTimestamp = @import("subagent.zig").nowTimestamp;
 const SubAgentState = @import("subagent.zig").SubAgentState;
 const AgentResult = @import("subagent.zig").AgentResult;
-const MergedResult = @import("subagent.zig").MergedResult;
-const Change = @import("subagent.zig").Change;
-const Evidence = @import("subagent.zig").Evidence;
-const Risk = @import("subagent.zig").Risk;
-const Severity = @import("subagent.zig").Severity;
-const Blocker = @import("subagent.zig").Blocker;
 
 pub const PollResult = enum {
     pending,
@@ -29,7 +21,7 @@ pub const SubWorker = struct {
     state: SubAgentState = .pending,
     result: ?AgentResult = null,
     loop: ?*CacheFirstLoop = null,
-    stream: ?stream_client.StreamIterator = null,
+    stream: ?LoopStreamState = null,
     current_chunk: []const u8 = "",
     started_at: i64 = 0,
     timeout_ms: ?u64 = null,
@@ -58,30 +50,39 @@ pub const SubWorker = struct {
 
     pub fn poll(self: *SubWorker) !PollResult {
         if (self.state != .running) return .pending;
-        if (self.stream == null) return .done;
 
-        const chunk = try self.stream.?.nextChunk();
-        if (chunk) |c| {
-            switch (c) {
-                .content => |text| {
-                    self.current_chunk = text;
-                    self.accumulated_output.appendSlice(std.heap.page_allocator, text) catch {};
-                    return .chunk;
-                },
-                .reasoning => |text| {
-                    self.stream.?.allocator.free(text);
-                    return self.poll();
-                },
+        // Stream in-place: capture the optional payload by pointer so
+        // nextChunk() advances the real iterator stored in self.stream,
+        // not a discarded by-value copy.
+        const ss = if (self.stream) |*s| s else return .done;
+
+        // Reasoning chunks are discarded (the UI shows content only), so skip
+        // them iteratively — a reasoning-heavy stream would otherwise recurse
+        // once per chunk and risk blowing the stack.
+        while (true) {
+            const chunk = try ss.iterator.nextChunk();
+            if (chunk) |c| {
+                switch (c) {
+                    .content => |text| {
+                        self.current_chunk = text;
+                        self.accumulated_output.appendSlice(std.heap.page_allocator, text) catch {};
+                        return .chunk;
+                    },
+                    .reasoning => |text| {
+                        ss.iterator.allocator.free(text);
+                        continue;
+                    },
+                }
             }
+            return .done;
         }
-
-        return .done;
     }
 
     pub fn pollWithTimeout(self: *SubWorker, now: i64) !PollResult {
         if (self.state != .running) return .pending;
 
         if (self.timeout_ms) |timeout| {
+            if (now < self.started_at) return self.poll();
             const elapsed_s = now - self.started_at;
             const elapsed_ms = @as(u64, @intCast(elapsed_s)) * 1000;
             if (elapsed_ms >= timeout) {
@@ -96,6 +97,7 @@ pub const SubWorker = struct {
 
     pub fn shouldCheckpoint(self: *SubWorker, now: i64) bool {
         if (self.checkpoint_interval_ms == 0) return false;
+        if (now < self.last_checkpoint_at) return false;
         const elapsed = @as(u64, @intCast(now - self.last_checkpoint_at)) * 1000;
         return elapsed >= self.checkpoint_interval_ms;
     }
@@ -287,8 +289,9 @@ pub const WorkerPool = struct {
 
     pub fn complete(self: *WorkerPool, id: u32, result: AgentResult) void {
         if (id < self.workers.items.len) {
+            const was_running = self.workers.items[id].state == .running;
             self.workers.items[id].finish(result);
-            if (self.workers.items[id].state == .running) {
+            if (was_running) {
                 self.active_count -= 1;
             }
         }
@@ -296,8 +299,9 @@ pub const WorkerPool = struct {
 
     pub fn abort(self: *WorkerPool, id: u32) void {
         if (id < self.workers.items.len) {
+            const was_running = self.workers.items[id].state == .running;
             self.workers.items[id].abort();
-            if (self.workers.items[id].state == .running) {
+            if (was_running) {
                 self.active_count -= 1;
             }
         }
@@ -341,6 +345,61 @@ test "worker pool" {
 
     try std.testing.expectEqual(@as(u32, 0), pool.active_count);
     try std.testing.expectEqual(@as(u32, 5), pool.max_concurrent);
+}
+
+test "worker pool complete and abort release concurrency slots" {
+    const alloc = std.testing.allocator;
+
+    // complete: a running worker leaving via a finished result must free a slot
+    {
+        var pool = WorkerPool.init(alloc, 5, null);
+        defer pool.deinit();
+        var w = SubWorker.init(0, .explore, "task", null, 0);
+        w.state = .running;
+        try pool.workers.append(alloc, w);
+        pool.active_count = 1;
+
+        pool.complete(0, .{
+            .summary = "done",
+            .changes = &.{},
+            .evidence = &.{},
+            .risks = &.{},
+            .blockers = &.{},
+        });
+        try std.testing.expectEqual(@as(u32, 0), pool.active_count);
+    }
+
+    // abort: the same must hold for cancellation
+    {
+        var pool = WorkerPool.init(alloc, 5, null);
+        defer pool.deinit();
+        var w = SubWorker.init(0, .explore, "task", null, 0);
+        w.state = .running;
+        try pool.workers.append(alloc, w);
+        pool.active_count = 1;
+
+        pool.abort(0);
+        try std.testing.expectEqual(@as(u32, 0), pool.active_count);
+    }
+}
+
+test "timeout and checkpoint guards survive a backward clock jump" {
+    // nowTimestamp() is wall-clock (gettimeofday); if the system clock is
+    // stepped backwards, elapsed arithmetic must not underflow (a negative
+    // i64 @intCast'd to u64 traps in Debug builds).
+    var w = SubWorker.init(7, .explore, "t", 1000, 1);
+    defer w.deinit();
+    w.state = .running;
+    w.started_at = 200;
+    w.last_checkpoint_at = 200;
+
+    // now before started_at: treat as not-yet-elapsed instead of trapping.
+    try std.testing.expect(!w.shouldCheckpoint(150));
+
+    // pollWithTimeout with a backward clock must delegate to poll (no stream
+    // yet -> .done) rather than hitting the @intCast overflow.
+    const res = try w.pollWithTimeout(50);
+    try std.testing.expectEqual(PollResult.done, res);
 }
 
 test "contract output parsing" {

@@ -108,6 +108,7 @@ const commands_table = [_]Command{
     .{ .id = "note", .label = "/note", .desc = "Manage notes", .kind = .insert },
     .{ .id = "memory", .label = "/memory", .desc = "Manage agent memory", .kind = .insert },
     .{ .id = "subagents", .label = "/subagents", .desc = "Show sub-agent panel" },
+    .{ .id = "subagent", .label = "/subagent", .desc = "Spawn a research sub-agent", .kind = .insert },
     .{ .id = "theme", .label = "/theme", .desc = "Switch color theme", .kind = .prompt },
     .{ .id = "think", .label = "/think", .desc = "Toggle reasoning visibility" },
     .{ .id = "tools", .label = "/tools", .desc = "Toggle tool call visibility" },
@@ -150,6 +151,14 @@ pub const Dispatcher = struct {
         if (std.mem.eql(u8, id, "top")) return .scroll_top;
         if (std.mem.eql(u8, id, "bottom")) return .scroll_bottom;
         if (std.mem.eql(u8, id, "subagents")) return .toggle_subagents;
+        if (std.mem.eql(u8, id, "subagent")) {
+            if (args.len > 0) {
+                return .{ .set_input = try ctx.allocator.dupe(u8, args) };
+            }
+            // Palette selection: pre-fill the input with the goal prefix so
+            // the user just types the research goal and presses Enter.
+            return .{ .set_input = try ctx.allocator.dupe(u8, "/subagent ") };
+        }
         if (std.mem.eql(u8, id, "compact")) return .compact_context;
 
         if (std.mem.eql(u8, id, "model")) {
@@ -626,6 +635,37 @@ test "skills submenu is built from registry" {
     }
     try std.testing.expect(found_investigate);
     freeSubMenu(alloc, result.submenu);
+}
+
+test "subagent command fills input with the goal prefix" {
+    const alloc = std.testing.allocator;
+    var pm = ProviderManager.init(alloc);
+    defer pm.deinit();
+
+    const ctx = CommandContext{
+        .allocator = alloc,
+        .io = undefined,
+        .provider = "deepseek",
+        .model = "deepseek-chat",
+        .subsystems_initialized = false,
+        .provider_mgr = &pm,
+        .sandbox = null,
+        .tokens_used = 0,
+        .ctx_max = 0,
+        .cache_hit_rate = 0,
+        .session_id = "test",
+    };
+
+    // Palette selection (no args) pre-fills the goal prefix.
+    const result = try Dispatcher.execute(ctx, "subagent", "");
+    defer alloc.free(result.set_input);
+    try std.testing.expectEqual(.set_input, std.meta.activeTag(result));
+    try std.testing.expectEqualStrings("/subagent ", result.set_input);
+
+    // With an explicit goal, the args are forwarded as the input text.
+    const with_goal = try Dispatcher.execute(ctx, "subagent", "scan the zephyr protocol");
+    defer alloc.free(with_goal.set_input);
+    try std.testing.expectEqualStrings("scan the zephyr protocol", with_goal.set_input);
 }
 
 test "provider without args returns submenu" {

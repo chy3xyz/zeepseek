@@ -16,6 +16,7 @@ const memory_mod = @import("../cache/memory.zig");
 const git_worker_mod = @import("../utils/git_worker.zig");
 const render_ui = @import("render_ui.zig");
 const sessions = @import("sessions.zig");
+const agent_flow = @import("agent_flow.zig");
 
 /// Read a file into a caller-owned buffer (raw syscalls), or null if unreadable.
 fn readNoteFile(alloc: std.mem.Allocator, path: [:0]const u8) ?[]u8 {
@@ -418,7 +419,10 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
         defer buf.deinit(app.alloc);
         for (app.messages.items) |m| {
             const role_str: []const u8 = switch (m.role) {
-                .user => "You", .assistant => "Zeep", .system => "System", .tool => "Tool",
+                .user => "You",
+                .assistant => "Zeep",
+                .system => "System",
+                .tool => "Tool",
             };
             buf.appendSlice(app.alloc, role_str) catch break;
             buf.appendSlice(app.alloc, ": ") catch break;
@@ -437,6 +441,16 @@ pub fn handleSlashCommand(app: *App, text_slice: []const u8) bool {
         return true;
     }
 
+    // /subagent <goal>: spawn a background research sub-agent. The panel
+    // toggle is /subagents (handled by the dispatcher), so guard against
+    // intercepting both when the user types the plural form.
+    if (std.mem.eql(u8, text_slice, "/subagent") or std.mem.startsWith(u8, text_slice, "/subagent ")) {
+        const goal = std.mem.trim(u8, text_slice["/subagent".len..], " ");
+        app.text_input.setValue("") catch {};
+        app.text_input.cursor = 0;
+        agent_flow.startSubAgent(app, goal);
+        return true;
+    }
 
     return false;
 }
@@ -504,10 +518,19 @@ pub fn runSlashCommand(app: *App, id: []const u8, args: []const u8) void {
         .toggle_thinking => app.show_thinking = !app.show_thinking,
         .toggle_tools => app.toggleToolCollapse(),
         .toggle_subagents => app.show_subagents = !app.show_subagents,
-        .scroll_top => { app.scroll_offset = 0; app.auto_scroll = false; },
-        .scroll_bottom => { app.scroll_offset = 0; app.auto_scroll = true; },
+        .scroll_top => {
+            app.scroll_offset = 0;
+            app.auto_scroll = false;
+        },
+        .scroll_bottom => {
+            app.scroll_offset = 0;
+            app.auto_scroll = true;
+        },
         .compact_context => app.compactContext(),
-        .show_help => { render_ui.updateHelpModal(app); app.help_modal.show(); },
+        .show_help => {
+            render_ui.updateHelpModal(app);
+            app.help_modal.show();
+        },
 
         .set_model => |name| {
             app.model = app.alloc.dupe(u8, name) catch app.model;
@@ -744,5 +767,3 @@ pub fn closeSlashOutput(app: *App) void {
         app.slash_output_data = null;
     }
 }
-
-

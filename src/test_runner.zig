@@ -49,7 +49,6 @@ comptime {
     _ = @import("agent/subagent.zig");
     _ = @import("agent/sub_worker.zig");
     _ = @import("net/stream_client.zig");
-    _ = @import("net/deepseek_client.zig");
     _ = @import("ui/app.zig");
     _ = @import("ui/slash_command_dispatcher.zig");
     _ = @import("net/mcp_client.zig");

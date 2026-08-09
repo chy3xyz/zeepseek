@@ -81,7 +81,7 @@ ContextManager first).
 | Directory | Key Files | Purpose |
 |-----------|-----------|---------|
 | `src/ui/` | `app.zig` (main entry + App struct), `agent_flow.zig`, `render_text.zig`, `render_ui.zig`, `sessions.zig`, `slash_command_dispatcher.zig`, `slash_commands.zig`, `stream_flow.zig`, `tools_run.zig`, `theme.zig` | Full TUI implementation |
-| `src/net/` | `stream_client.zig`, `http_client.zig`, `http_client2.zig`, `h2_client.zig`, `mcp_client.zig` + `mcp_runner.zig`, `deepseek_client.zig` | API communication, streaming, resilience (SSE parsing, rate limiting and circuit breaking live inline in `stream_client.zig`/`http_client.zig`), MCP JSON-RPC over stdio |
+| `src/net/` | `stream_client.zig`, `http_client.zig`, `http_client2.zig`, `h2_client.zig`, `mcp_client.zig` + `mcp_runner.zig` | API communication, streaming, resilience (SSE parsing, rate limiting and circuit breaking live inline in `stream_client.zig`/`http_client.zig`), MCP JSON-RPC over stdio |
 | `src/cache/` | `reasonix.zig` | Semantic cache with LIRS eviction, 3-tier TTL, similarity matching |
 | `src/dispatch/` | `cache_first_loop.zig`, `context_manager.zig` | Orchestrates cache → API → stream, context budget tracking |
 | `src/storage/` | `store.zig`, `mmap_store.zig`, `session_manager.zig`, `recovery.zig`, `migrations.zig`, `keyspace.zig` | Persistent storage |

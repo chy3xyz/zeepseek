@@ -31,6 +31,14 @@ pub const ModelType = enum {
         };
     }
 
+    pub fn fromApiName(name: []const u8) ModelType {
+        if (std.mem.eql(u8, name, "deepseek-coder")) return .deepseek_coder;
+        if (std.mem.eql(u8, name, "deepseek-v4-pro")) return .deepseek_v4_pro;
+        if (std.mem.eql(u8, name, "deepseek-v4-flash")) return .deepseek_v4_flash;
+        if (std.mem.eql(u8, name, "deepseek-flash")) return .deepseek_flash;
+        return .deepseek_chat;
+    }
+
     pub fn contextWindow(self: ModelType) u32 {
         return switch (self) {
             .deepseek_chat => 64000,
@@ -112,8 +120,8 @@ pub fn selectModelForTask(task_description: []const u8, context_size_hint: usize
 
     const is_simple_question = context_size_hint < 500 and
         (std.mem.indexOf(u8, lower, "what ") != null or
-         std.mem.indexOf(u8, lower, "how ") != null or
-         std.mem.indexOf(u8, lower, "define") != null);
+            std.mem.indexOf(u8, lower, "how ") != null or
+            std.mem.indexOf(u8, lower, "define") != null);
 
     if (is_simple_question and !is_code_task) {
         return .{ .model = .deepseek_flash, .reasoning_effort = .off };
@@ -339,6 +347,15 @@ test "model type context window" {
     try std.testing.expectEqual(@as(u32, 256000), ModelType.deepseek_v4_pro.contextWindow());
     try std.testing.expectEqual(@as(u32, 256000), ModelType.deepseek_v4_flash.contextWindow());
     try std.testing.expectEqual(@as(u32, 64000), ModelType.deepseek_flash.contextWindow());
+}
+
+test "model type from api name" {
+    try std.testing.expectEqual(ModelType.deepseek_chat, ModelType.fromApiName("deepseek-chat"));
+    try std.testing.expectEqual(ModelType.deepseek_coder, ModelType.fromApiName("deepseek-coder"));
+    try std.testing.expectEqual(ModelType.deepseek_v4_pro, ModelType.fromApiName("deepseek-v4-pro"));
+    try std.testing.expectEqual(ModelType.deepseek_v4_flash, ModelType.fromApiName("deepseek-v4-flash"));
+    try std.testing.expectEqual(ModelType.deepseek_flash, ModelType.fromApiName("deepseek-flash"));
+    try std.testing.expectEqual(ModelType.deepseek_chat, ModelType.fromApiName("unknown-model"));
 }
 
 test "model type supports cache" {

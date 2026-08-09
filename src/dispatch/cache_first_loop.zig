@@ -205,8 +205,8 @@ pub const CacheFirstLoop = struct {
 
         try self.checkBudget();
 
-        const ctx = try self.arena.allocator().alloc(stream_client.CtxItem, messages.len);
-        for (messages, 0..) |msg, i| {
+        const ctx = try self.arena.allocator().alloc(stream_client.CtxItem, messages.len - 1);
+        for (messages[0 .. messages.len - 1], 0..) |msg, i| {
             ctx[i] = stream_client.CtxItem{ .role = msg.role, .content = msg.content };
         }
 
@@ -292,7 +292,7 @@ pub const CacheFirstLoop = struct {
             .system_prompt = self.prefix.system_prompt,
         };
         const ctx = try self.arena.allocator().alloc(http_client_mod.AIMessage, messages.len - 1);
-        for (messages[0..messages.len - 1], 0..) |msg, i| {
+        for (messages[0 .. messages.len - 1], 0..) |msg, i| {
             ctx[i] = .{
                 .role = msg.role,
                 .content = msg.content,
